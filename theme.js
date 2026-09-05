@@ -18,6 +18,7 @@ export const CSS = `
 .cn-scroll { padding: 2px 16px 88px; }
 .cn-content { width: 100%; max-width: 620px; margin: 0 auto; }
 .cn-screen { animation: cn-screen-in 0.26s cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+.cn-screen.has-dialog { animation: none; transform: none; }
 @keyframes cn-screen-in {
   from { opacity: 0.4; transform: translateY(5px); }
   to { opacity: 1; transform: none; }
@@ -141,6 +142,7 @@ export const CSS = `
   color: #e0426d;
   background: color-mix(in srgb, #e0426d 12%, transparent);
 }
+.cn-react:disabled { opacity: 0.46; cursor: default; transform: none; }
 /* ── Rows (conversations, people) ───────────────────────────────────────── */
 .cn-row {
   width: 100%; min-height: 74px; padding: 13px 4px; display: flex; align-items: center; gap: 13px;
@@ -274,12 +276,12 @@ export const CSS = `
 .cn-bubble-reply:hover { background: var(--surface2, var(--surface)); color: var(--text); }
 .cn-quote {
   margin: 0 0 7px; padding: 7px 9px; min-width: 0;
-  border-inline-start: 3px solid var(--accent); border-radius: 7px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border)); border-radius: 8px;
   background: color-mix(in srgb, var(--accent) 8%, var(--surface));
   color: var(--text); white-space: normal;
 }
 .cn-bubble.is-mine .cn-quote {
-  border-inline-start-color: color-mix(in srgb, var(--accent-fg) 72%, transparent);
+  border-color: color-mix(in srgb, var(--accent-fg) 32%, transparent);
   background: rgba(0, 0, 0, 0.13); color: var(--accent-fg);
 }
 .cn-bubble.has-attachment .cn-quote { margin: 3px 3px 5px; }
@@ -349,7 +351,7 @@ export const CSS = `
 .cn-reply-target {
   min-height: 62px; margin: 9px 12px 0; padding: 7px 5px 7px 12px;
   display: flex; align-items: center; gap: 10px;
-  border-inline-start: 3px solid var(--accent); border-radius: 7px 14px 14px 7px;
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--border)); border-radius: 14px;
   background: color-mix(in srgb, var(--accent) 7%, var(--surface));
 }
 .cn-reply-target-copy { min-width: 0; flex: 1; }
@@ -459,26 +461,33 @@ export const CSS = `
 .cn-fab:hover { filter: brightness(1.07); }
 .cn-fab:active { transform: scale(0.92); }
 
-/* ── Welcome / onboarding ───────────────────────────────────────────────── */
-.cn-onboard { max-width: 430px; margin: 10px auto 0; text-align: center; }
-.cn-landing {
-  width: 100%; max-width: 360px; margin: 6px auto 4px; display: block;
+/* ── First-use and community context ────────────────────────────────────── */
+.cn-welcome {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 13px;
+  margin: 14px 0 12px; padding: 16px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  border-radius: 16px; background: color-mix(in srgb, var(--accent) 7%, var(--surface));
 }
-.cn-onboard .cn-avatar { margin: 10px auto 16px; }
-.cn-onboard h2 { font-size: 27px; letter-spacing: -0.04em; margin: 0 0 10px; font-weight: 800; }
-.cn-onboard p { color: var(--muted); font-size: 14.5px; line-height: 1.58; margin: 0 0 14px; }
-.cn-privacy-note {
-  display: flex; align-items: center; gap: 9px; text-align: left;
-  margin: 14px 0 0; padding: 12px 14px; border-radius: 14px;
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
-  font-size: 13px; line-height: 1.45; color: var(--text);
+.cn-welcome-mark {
+  grid-row: 1 / span 2; display: flex; align-items: center; justify-content: center;
+  width: 42px; height: 42px; border-radius: 14px;
+  background: color-mix(in srgb, var(--accent) 17%, var(--surface)); color: var(--accent);
 }
-.cn-privacy-note svg { width: 18px; height: 18px; flex: 0 0 auto; color: var(--accent); }
-.cn-identity-card {
-  display: flex; align-items: center; gap: 13px; width: 100%;
-  margin-top: 16px; padding: 14px 15px;
-  background: var(--surface); border: 1px solid var(--border); border-radius: 17px;
+.cn-welcome-mark svg { width: 23px; height: 23px; }
+.cn-welcome-copy { min-width: 0; }
+.cn-welcome h2 {
+  margin: 1px 0 5px; font-size: 17px; font-weight: 760; letter-spacing: -0.02em;
+}
+.cn-welcome p { margin: 0; color: var(--muted); font-size: 13.5px; line-height: 1.5; }
+.cn-welcome-privacy {
+  display: block; margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 1.45;
+}
+.cn-welcome > .cn-btn, .cn-welcome-actions {
+  grid-column: 2; justify-self: start; margin-top: 11px;
+}
+.cn-welcome-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.cn-inline-error {
+  margin: -3px 0 12px; color: var(--danger); font-size: 13px; line-height: 1.45;
 }
 
 /* mobius-ui:Sheet v1 — keep in sync; library candidate. Diverge below the marker only. */
@@ -540,16 +549,25 @@ export const CSS = `
 @keyframes cn-lightbox-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes cn-lightbox-image-in { from { transform: scale(0.985); } to { transform: none; } }
 
-/* Board replies */
-.cn-reply-sheet { height: min(680px, 85vh); overflow: hidden; display: flex; flex-direction: column; }
+/* Board conversations */
+.cn-reply-sheet { height: min(720px, 85vh); overflow: hidden; display: flex; flex-direction: column; }
 .cn-reply-sheet-head {
   display: flex; align-items: flex-start; justify-content: space-between; gap: 16px;
-  flex: 0 0 auto; border-bottom: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  flex: 0 0 auto;
 }
 .cn-reply-sheet-head .cn-sheet-title { margin-bottom: 4px; font-size: 19px; }
-.cn-reply-sheet-head .cn-sheet-body { margin-bottom: 16px; }
+.cn-reply-sheet-head .cn-sheet-body { margin-bottom: 12px; }
+.cn-reply-parent {
+  flex: 0 0 auto; max-height: 210px; overflow-y: auto; margin-bottom: 10px; padding: 13px 14px;
+  background: color-mix(in srgb, var(--surface2, var(--surface)) 78%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent); border-radius: 16px;
+  overscroll-behavior: contain;
+}
+.cn-reply-parent .cn-post-copy { margin-top: 9px; font-size: 14.5px; line-height: 1.46; }
+.cn-reply-parent .cn-board-image { max-height: 150px; margin-top: 10px; border-radius: 11px; }
 .cn-reply-list {
-  flex: 1; min-height: 0; overflow-y: auto; margin: 0 -8px; padding: 8px;
+  flex: 1; min-height: 0; overflow-y: auto; margin: 0 -8px; padding: 6px 8px 8px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
   overscroll-behavior: contain;
 }
 .cn-reply-row {
@@ -581,6 +599,11 @@ export const CSS = `
 .cn-reply-composer input::placeholder { color: var(--muted); }
 .cn-reply-composer input:focus { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .cn-reply-composer input:disabled { opacity: 0.58; }
+.cn-reply-gate {
+  margin: 0; padding-top: 14px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  color: var(--muted); font-size: 13.5px; line-height: 1.5; text-align: center;
+}
 .cn-reply-send {
   width: 46px; height: 46px; flex: 0 0 auto; border: 0; border-radius: 50%;
   display: flex; align-items: center; justify-content: center; cursor: pointer;
@@ -693,6 +716,12 @@ export const CSS = `
   }
 }
 /* /mobius-ui:ReducedMotion */
+
+@media (max-width: 480px) {
+  .cn-welcome { padding: 14px; }
+  .cn-welcome > .cn-btn, .cn-welcome-actions { grid-column: 1 / -1; width: 100%; }
+  .cn-welcome-actions .cn-btn { flex: 1 1 auto; }
+}
 
 /* Member picker rows */
 .cn-member-row {
