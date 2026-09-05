@@ -1,7 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
-import { Chat, Globe, Lock, Plus, Users } from '@openai/apps-sdk-ui/components/Icon'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Chat, Globe, Plus, Users } from '@openai/apps-sdk-ui/components/Icon'
 import { CSS } from './theme.js'
-import { LANDING_DATA_URL } from './ui/landingImage.js'
 import * as api from './api.js'
 import Board, { Avatar } from './ui/Board.jsx'
 import Messages from './ui/Messages.jsx'
@@ -9,6 +8,70 @@ import Thread from './ui/Thread.jsx'
 import GroupThread from './ui/GroupThread.jsx'
 import People from './ui/People.jsx'
 import { Lightbox } from './ui/Media.jsx'
+import {
+  SHARED_COMMUNITY_HOST, isPrivateLocalCommunity, prepareCommunity,
+} from './community.js'
+
+function ParticipationNotice({ me, busy, onJoin, onConnect, onCheck, onUseShared }) {
+  if (isPrivateLocalCommunity(me)) {
+    return (
+      <section className="cn-welcome" aria-labelledby="cn-welcome-title">
+        <span className="cn-welcome-mark" aria-hidden="true"><Globe /></span>
+        <div className="cn-welcome-copy">
+          <h2 id="cn-welcome-title">Your community is private</h2>
+          <p>
+            This Möbius is hosting its own board and directory, so you’ll only see
+            people who joined it directly. Switch to Social’s shared community to
+            meet people across instances.
+          </p>
+        </div>
+        <button className="cn-btn cn-btn-primary" onClick={onUseShared} disabled={busy}>
+          {busy ? 'Switching…' : 'Use shared community'}
+        </button>
+      </section>
+    )
+  }
+
+  if (me?.joined && me?.name) return null
+
+  const connected = me?.connected
+  return (
+    <section className="cn-welcome" aria-labelledby="cn-welcome-title">
+      <span className="cn-welcome-mark" aria-hidden="true"><Globe /></span>
+      <div className="cn-welcome-copy">
+        <h2 id="cn-welcome-title">
+          {connected ? `Welcome, @${me.handle}` : 'Explore Social first'}
+        </h2>
+        <p>
+          {connected
+            ? 'Browse the shared board and people now. Join when you’re ready to post or message.'
+            : 'The shared board and directory are open to browse. Connect your Möbius profile when you want to post or message.'}
+        </p>
+        {connected && (
+          <span className="cn-welcome-privacy">
+            Joining shares your handle and profile picture. Your name and email stay private.
+          </span>
+        )}
+      </div>
+      <div className="cn-welcome-actions">
+        {connected ? (
+          <button className="cn-btn cn-btn-primary" onClick={onJoin} disabled={busy}>
+            {busy ? 'Joining…' : `Join as @${me.handle}`}
+          </button>
+        ) : (
+          <>
+            <button className="cn-btn cn-btn-primary" onClick={onConnect} disabled={!me?.identity_app_id}>
+              Connect profile
+            </button>
+            <button className="cn-btn cn-btn-ghost" onClick={onCheck} disabled={busy}>
+              Check again
+            </button>
+          </>
+        )}
+      </div>
+    </section>
+  )
+}
 
 export default function App({ appId, token }) {
   api.setToken(token)
@@ -38,26 +101,33 @@ export default function App({ appId, token }) {
     toastTimer.current = setTimeout(() => setToast(null), 2600)
   }
 
-  async function loadMe() {
+  async function loadMe({ adoptSharedDefault = true } = {}) {
     try {
-      const profile = await api.getMe()
+      const loaded = await api.getMe()
+      const profile = adoptSharedDefault
+        ? await prepareCommunity(loaded, api.saveMe)
+        : loaded
       setMe(profile)
-      setMeState(profile.joined && profile.name ? 'ready' : 'setup')
+      setMeState('ready')
+      return profile
     } catch (error) {
       window.mobius?.signal?.('error', { message: error.message, source: 'me' })
       setMeState('error')
+      return null
     }
   }
 
-  async function loadFeed() {
+  const loadFeed = useCallback(async (background = false) => {
     try {
       const result = await api.getFeed()
       setFeed(result.posts || [])
       setFeedState('ready')
+      return true
     } catch {
-      setFeedState('error')
+      if (!background) setFeedState('error')
+      return false
     }
-  }
+  }, [])
 
   async function loadConversations() {
     try {
@@ -76,8 +146,9 @@ export default function App({ appId, token }) {
   }
 
   useEffect(() => {
-    loadMe()
-    loadFeed()
+    loadMe().then((profile) => {
+      if (profile) loadFeed()
+    })
     loadConversations()
     api.getAppIcon(appId)
       .then((blob) => setAppIconUrl(URL.createObjectURL(blob)))
@@ -156,8 +227,8 @@ export default function App({ appId, token }) {
     setSaving(true)
     try {
       const result = await api.join()
-      await loadMe()
-      loadFeed()
+      await loadMe({ adoptSharedDefault: false })
+      await loadFeed()
       if (result.directory !== 'registered') {
         showToast('Joined — your community host is unreachable right now.', 'error')
       } else {
@@ -170,9 +241,29 @@ export default function App({ appId, token }) {
     }
   }
 
+  async function useSharedCommunity() {
+    setSaving(true)
+    try {
+      const result = await api.saveMe({ community_host: SHARED_COMMUNITY_HOST })
+      await loadMe({ adoptSharedDefault: false })
+      await loadFeed()
+      setTab('board')
+      if (result.directory === 'unreachable') {
+        showToast('Shared community selected, but it is unreachable right now.', 'error')
+      } else {
+        showToast('You’re now in the shared Social community.', 'success')
+      }
+    } catch (error) {
+      showToast(error.message, 'error')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const unread =
     conversations.reduce((sum, c) => sum + (c.unread || 0), 0) +
     groups.reduce((sum, g) => sum + (g.unread || 0), 0)
+  const canParticipate = Boolean(me?.joined && me?.name)
 
   // ── render ────────────────────────────────────────────────────────────────
   if (meState === 'loading') {
@@ -193,68 +284,6 @@ export default function App({ appId, token }) {
             with the next server restart — then reopen this app.
           </p>
           <button className="cn-btn cn-btn-secondary" onClick={loadMe}>Try again</button>
-        </div>
-      </div>
-    )
-  }
-
-  if (meState === 'setup') {
-    const connected = me?.connected
-    return (
-      <div className="cn-root"><style>{CSS}</style>
-        <div className="cn-scroll">
-          <div className="cn-onboard cn-screen">
-            {LANDING_DATA_URL
-              ? <img className="cn-landing" src={LANDING_DATA_URL} alt="" />
-              : <Avatar name={connected ? me.handle : '?'} host={me?.host || 'you'} size="large" />}
-            <h2>Welcome to Social</h2>
-            <p>
-              Your Möbius is your identity here. Messages travel directly from
-              your server to your friends’ servers — your words live only with
-              you and the people you talk to. The board and people search are
-              shared through a community host you choose.
-            </p>
-            {connected ? (
-              <>
-                <div className="cn-identity-card">
-                  <Avatar name={me.handle} host={me.host} />
-                  <span style={{ minWidth: 0, textAlign: 'left' }}>
-                    <span className="cn-person-name" style={{ display: 'block' }}>@{me.handle}</span>
-                  </span>
-                </div>
-                <div className="cn-privacy-note">
-                  <Lock aria-hidden="true" />
-                  <span>
-                    Your handle <strong>@{me.handle}</strong> and profile picture are shared.
-                    Your name and email never leave your Möbius. Direct messages are
-                    end-to-end encrypted when both sides support it.
-                  </span>
-                </div>
-                <button className="cn-btn cn-btn-primary cn-btn-block" style={{ marginTop: 18 }}
-                        onClick={join} disabled={saving}>
-                  {saving ? 'Joining…' : `Join as @${me.handle}`}
-                </button>
-              </>
-            ) : (
-              <>
-                <p>
-                  Social uses your Möbius profile, so friends recognize you
-                  everywhere. Connect your account first — it takes a minute.
-                </p>
-                {me?.account_error && (
-                  <p style={{ color: 'var(--danger)', fontSize: 13 }}>{me.account_error}</p>
-                )}
-                <button className="cn-btn cn-btn-primary cn-btn-block" style={{ marginTop: 6 }}
-                        onClick={openIdentityApp} disabled={!me?.identity_app_id}>
-                  Connect your Möbius profile
-                </button>
-                <button className="cn-btn cn-btn-ghost cn-btn-block" style={{ marginTop: 8 }}
-                        onClick={loadMe}>
-                  I’ve connected it — check again
-                </button>
-              </>
-            )}
-          </div>
         </div>
       </div>
     )
@@ -300,40 +329,68 @@ export default function App({ appId, token }) {
           <h1 className="cn-title">Social</h1>
         </div>
         <div className="cn-header-chip">
-          <Avatar name={me?.handle} host={me?.host} size="small" />
-          <span>@{me?.handle}</span>
+          <Avatar name={me?.handle || '?'} host={me?.host} size="small" />
+          <span>{me?.handle ? `@${me.handle}` : 'Browsing'}</span>
         </div>
       </header>
 
       <div className="cn-scroll">
+        <div className="cn-content">
+          <ParticipationNotice
+            me={me}
+            busy={saving}
+            onJoin={join}
+            onConnect={openIdentityApp}
+            onCheck={() => loadMe()}
+            onUseShared={useSharedCommunity}
+          />
+          {me?.account_error && !me?.connected && (
+            <p className="cn-inline-error" role="status">{me.account_error}</p>
+          )}
+        </div>
         {tab === 'board' && (
           <Board me={me} feed={feed} feedState={feedState} onRefresh={loadFeed}
                  composing={composing} setComposing={setComposing}
+                 canInteract={canParticipate}
                  onOpenPerson={(host) => { setProfileRequest(host); setTab('people') }} showToast={showToast}
                  onOpenImage={(url, alt) => setLightbox({ url, alt })} />
         )}
         {tab === 'messages' && (
-          <Messages me={me} conversations={conversations} groups={groups}
-                    creating={creatingGroup} setCreating={setCreatingGroup}
-                    onOpenThread={(peer) => openThread(peer)}
-                    onOpenGroup={openGroup}
-                    onFindPeople={() => setTab('people')}
-                    onGroupsChanged={openCreatedGroup}
-                    showToast={showToast} />
+          canParticipate ? (
+            <Messages me={me} conversations={conversations} groups={groups}
+                      creating={creatingGroup} setCreating={setCreatingGroup}
+                      onOpenThread={(peer) => openThread(peer)}
+                      onOpenGroup={openGroup}
+                      onFindPeople={() => setTab('people')}
+                      onGroupsChanged={openCreatedGroup}
+                      showToast={showToast} />
+          ) : (
+            <div className="cn-content cn-screen">
+              <div className="cn-empty">
+                <div className="cn-empty-mark" aria-hidden="true"><Chat /></div>
+                <div className="cn-empty-title">Join before you message</div>
+                <p className="cn-empty-text">
+                  You can browse people first. Join Social when you’re ready to start a private conversation.
+                </p>
+                <button className="cn-btn cn-btn-secondary" onClick={() => setTab('people')}>Browse people</button>
+              </div>
+            </div>
+          )
         )}
         {tab === 'people' && (
           <People me={me} onMessage={(host, name) => openThread(host, name)} showToast={showToast}
+                  canMessage={canParticipate}
                   requestedProfile={profileRequest}
                   onProfileRequestHandled={() => setProfileRequest(null)} />
         )}
       </div>
 
-      {tab === 'board' && (
+      {tab === 'board' && canParticipate && (
         <button className="cn-fab" onClick={() => setComposing(true)} aria-label="New post">
           <Plus aria-hidden="true" />
         </button>
       )}
-      {tab === 'messages' && (
+      {tab === 'messages' && canParticipate && (
         <button className="cn-fab" onClick={() => setCreatingGroup(true)} aria-label="New group">
           <Plus aria-hidden="true" />
         </button>

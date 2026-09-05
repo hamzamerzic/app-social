@@ -54,7 +54,7 @@ export const likePost = (postId) =>
 export const getReplies = (postId) =>
   call(`board/${encodeURIComponent(postId)}/replies`)
 export const postReply = (postId, text) =>
-  call('reply', { method: 'POST', body: JSON.stringify({ post_id: postId, text }) }, 'none')
+  call('reply', { method: 'POST', body: JSON.stringify({ post_id: postId, text }) })
 export const searchPeople = (q) => call(`people?q=${encodeURIComponent(q)}`)
 export const getPeer = (host) => call(`peer/${encodeURIComponent(host)}`)
 export async function getAppIcon(appId) {

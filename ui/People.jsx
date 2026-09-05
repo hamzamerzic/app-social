@@ -28,7 +28,7 @@ function appInitial(name) {
   return Array.from(String(name || '').trim())[0]?.toLocaleUpperCase() || 'A'
 }
 
-export default function People({ me, onMessage, showToast, requestedProfile, onProfileRequestHandled }) {
+export default function People({ me, canMessage, onMessage, showToast, requestedProfile, onProfileRequestHandled }) {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState(null)
   const [state, setState] = useState('loading')
@@ -177,7 +177,7 @@ export default function People({ me, onMessage, showToast, requestedProfile, onP
                 )}
                 <div className="cn-sheet-actions">
                   <button className="cn-btn cn-btn-secondary" onClick={() => setProfile(null)}>Close</button>
-                  {profile.host !== me?.host && (
+                  {canMessage && profile.host !== me?.host && (
                     <button
                       className="cn-btn cn-btn-primary"
                       onClick={() => { const p = profile; setProfile(null); onMessage(p.host, p.handle) }}
