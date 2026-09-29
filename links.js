@@ -1,18 +1,30 @@
 const URL_RE = /https?:\/\/[^\s<>"]+/gi
-const TRAILING_PUNCTUATION = /[.,!?:;'’”…]/
+const TRAILING_PUNCTUATION = /[.,!?:;…]/
 const OPENING_BRACKET = { ')': '(', ']': '[', '}': '{' }
+const CLOSING_QUOTE = { "'": "'", '‘': '’', '“': '”' }
 
 // Sentence punctuation stays outside a link, but a closing bracket the address
 // opened itself stays inside, as in Wikipedia-style `/wiki/Foo_(bar)` paths.
-function trimLink(raw) {
-  let url = raw
-  for (;;) {
-    const last = url[url.length - 1]
-    const opener = OPENING_BRACKET[last]
-    const unmatched = opener && url.split(last).length > url.split(opener).length
-    if (!unmatched && !TRAILING_PUNCTUATION.test(last)) return url
-    url = url.slice(0, -1)
+function trimLink(raw, leadingQuote) {
+  const brackets = { '(': 0, ')': 0, '[': 0, ']': 0, '{': 0, '}': 0 }
+  for (const char of raw) {
+    if (brackets[char] !== undefined) brackets[char]++
   }
+  let end = raw.length
+  let closingQuote = CLOSING_QUOTE[leadingQuote]
+  while (end) {
+    const last = raw[end - 1]
+    const opener = OPENING_BRACKET[last]
+    if (opener && brackets[last] > brackets[opener]) {
+      brackets[last]--
+    } else if (last === closingQuote) {
+      closingQuote = null
+    } else if (!TRAILING_PUNCTUATION.test(last)) {
+      break
+    }
+    end--
+  }
+  return raw.slice(0, end)
 }
 
 export function textParts(text) {
@@ -21,7 +33,7 @@ export function textParts(text) {
   let cursor = 0
   for (const match of source.matchAll(URL_RE)) {
     const raw = match[0]
-    const url = trimLink(raw)
+    const url = trimLink(raw, source[match.index - 1])
     if (match.index > cursor) parts.push({ type: 'text', value: source.slice(cursor, match.index) })
     parts.push({ type: 'link', value: url })
     const punctuation = raw.slice(url.length)
