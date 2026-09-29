@@ -99,6 +99,9 @@ test('reopening detects a saved join that never reached the directory', async ()
 test('directory outage is not misreported as missing membership', async () => {
   const { checkGlobalRegistration } = await import('../community.js')
   assert.equal(await checkGlobalRegistration({ ...fresh, joined: true }, async () => { throw Error('offline') }), 'unavailable')
+  assert.equal(await checkGlobalRegistration({ ...fresh, joined: true }, async () => {
+    throw Object.assign(Error('membership missing'), { status: 403 })
+  }), 'missing')
 })
 
 test('browsers do not check membership when unjoined', async () => {

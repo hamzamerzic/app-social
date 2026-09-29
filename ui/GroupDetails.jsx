@@ -109,7 +109,7 @@ export default function GroupDetails({ group, me, onClose, onUpdated, onDeleted 
           {notice && <p className="cn-group-status" role="status">{notice}</p>}
         </form>}
         {mode === 'delete' && <form id="cn-delete-group" onSubmit={remove}>
-          <p className="cn-sheet-body">{deleted ? 'New messages are blocked and the group will be removed from your Messages. Some deployments haven’t received the closure notice yet; older versions may not support it.' : 'This stops new messages for everyone and removes the group from your Messages. Copies already held by other members are not erased.'}</p>
+          <p className="cn-sheet-body">{deleted ? 'New messages are blocked and the group will be removed from your Chats. Some deployments haven’t received the closure notice yet; older versions may not support it.' : 'This stops new messages for everyone and removes the group from your Chats. Copies already held by other members are not erased.'}</p>
           {!deleted && <><label className="cn-field-label" htmlFor="cn-delete-name">Type “{group.name}” to confirm</label><input id="cn-delete-name" className="cn-input" value={confirmation} onChange={event => setConfirmation(event.target.value)} autoComplete="off" disabled={busy} /></>}
         </form>}
         {!!failedNotices.length && <div className="cn-directory-error" role="status"><strong>Not reached</strong><ul>{failedNotices.map(host => <li key={host}>{host}</li>)}</ul></div>}

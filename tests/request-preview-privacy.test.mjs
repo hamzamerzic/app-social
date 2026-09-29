@@ -47,8 +47,9 @@ test('pending group details keep all member avatars local and cannot open invita
   assert.match(read('GroupThread'), /<GroupDetails group=\{currentGroup\}/)
 })
 
-test('public board reply and composer avatars opt into remote loading', () => {
+test('public board reply avatars stay remote without duplicating identity in the composer', () => {
   const source = read('Board')
   assert.match(source, /<Avatar name=\{reply.handle\} host=\{reply.host\} size="small" remote \/>/)
-  assert.match(source, /<Avatar name=\{me\?\.handle\} host=\{me\?\.host\} size="small" remote \/>/)
+  const composer = source.slice(source.indexOf('className="cn-board-composer"'))
+  assert.doesNotMatch(composer, /<Avatar/)
 })

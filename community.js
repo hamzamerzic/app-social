@@ -21,7 +21,7 @@ export async function checkGlobalRegistration(profile, searchPeople) {
     const result = await searchPeople(profile.host)
     return result.users.some(user => normalized(user.host) === normalized(profile.host))
       ? 'registered' : 'missing'
-  } catch {
-    return 'unavailable'
+  } catch (error) {
+    return error.status === 403 ? 'missing' : 'unavailable'
   }
 }

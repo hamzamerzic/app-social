@@ -70,14 +70,11 @@ from pydantic import BaseModel
 
 from common_protocol import (
   CLOCK_SKEW_S,
-  COMMUNITY_HOST,
-  OUTBOUND_TIMEOUT_S,
   post_signed_envelope as _post_signed_envelope,
   peer_service_url as _peer_service_url,
   sign as _sign,
   valid_host as _valid_host,
 )
-from common_transport import federation_request
 from service_runtime import (
   Principal, get_db, get_principal, get_settings,
   require_nondelegated_owner_control, resolve_handle_hosts,
@@ -85,7 +82,9 @@ from service_runtime import (
 from service_io import atomic_write, read_capped_body
 from social_routes import (
   _load_identity,
+  _membership_confirmed,
   _own_host,
+  _search_community_members,
   _verify_peer_envelope,
 )
 
@@ -587,19 +586,12 @@ async def _resolve_invitees(address: str) -> InviteRecipient:
     )
 
   # Unlinked owners can still be found in the shared Social directory.
-  try:
-    response = await federation_request(
-      "GET", _peer_service_url(COMMUNITY_HOST, "directory"),
-      params={"q": raw}, timeout_seconds=OUTBOUND_TIMEOUT_S,
-    )
-    response.raise_for_status()
-    entries = {
-      u["host"]: u for u in response.json().get("users", []) if u.get("host")
-    }
-  except Exception as exc:
-    raise HTTPException(
-      status_code=502, detail="The directory could not be reached."
-    ) from exc
+  if not _membership_confirmed(_load_identity()):
+    raise HTTPException(status_code=403, detail="Join Social to search People.")
+  directory = await _search_community_members(raw)
+  entries = {
+    u["host"]: u for u in directory.get("users", []) if u.get("host")
+  }
   matches = [
     host for host, entry in entries.items()
     if str(entry.get("handle") or "").lower() == raw

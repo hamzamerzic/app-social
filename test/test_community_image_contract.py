@@ -41,6 +41,10 @@ def opener_with_version(version):
       return Response(200, version)
     if url.endswith("/api/common/board?limit=1"):
       return Response(200, {"posts": []})
+    if url.endswith("/api/common/directory"):
+      raise urllib.error.HTTPError(
+        url, 403, "forbidden", {}, Response(403, {"detail": "Join Social to see People."}),
+      )
     if url.endswith("/api/common/actor"):
       return Response(200, {"public_key": {"alg": "ed25519", "key_b64": "AAAA"}})
     if url.endswith("/api/common/board/delete"):

@@ -1,4 +1,5 @@
 import { useLayoutEffect } from 'react'
+import { isTouchPrimary, shouldSubmitMessageKey } from './interactionRules.js'
 
 // Matches the service limit for direct and group messages.
 const MAX_MESSAGE_CHARS = 40000
@@ -10,26 +11,29 @@ export function keepMessageFocus(event) {
   event.preventDefault()
 }
 
-// A multi-line message box that grows with its text. On a physical keyboard
-// Enter sends and Shift+Enter adds a line; touch keyboards keep Enter as a
-// newline and send with the button.
-export default function MessageInput({ inputRef, value, onChange, disabled }) {
+// A multi-line message box that grows with its text. Physical-keyboard Enter
+// sends; touch-keyboard Enter and Shift+Enter add a line. IME composition is
+// never interrupted.
+export default function MessageInput({
+  inputRef, value, onChange, disabled, className, maxLength = MAX_MESSAGE_CHARS,
+  maxHeight, placeholder = 'Message', label = placeholder,
+}) {
   useLayoutEffect(() => {
     const el = inputRef.current
+    if (!el) return
     el.style.height = 'auto'
-    el.style.height = `${el.scrollHeight}px`
-  }, [value, inputRef])
+    el.style.height = `${maxHeight ? Math.min(el.scrollHeight, maxHeight) : el.scrollHeight}px`
+  }, [value, inputRef, maxHeight])
 
   function onKeyDown(event) {
-    if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return
-    if (window.matchMedia('(pointer: coarse)').matches) return
+    if (!shouldSubmitMessageKey(event, isTouchPrimary())) return
     event.preventDefault()
     event.currentTarget.form.requestSubmit()
   }
 
   return (
-    <textarea ref={inputRef} rows={1} value={value} maxLength={MAX_MESSAGE_CHARS}
+    <textarea ref={inputRef} className={className} rows={1} value={value} maxLength={maxLength}
               onChange={(event) => onChange(event.target.value)} onKeyDown={onKeyDown}
-              disabled={disabled} placeholder="Message" autoComplete="off" aria-label="Message" />
+              disabled={disabled} placeholder={placeholder} autoComplete="off" aria-label={label} />
   )
 }

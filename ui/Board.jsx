@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  ArrowUp, Chat, EmojiAdd, Heart, ImageSquare, Trash, X,
+  ArrowUp, Chat, EmojiAdd, Heart, Paperclip, Trash, X,
 } from '@openai/apps-sdk-ui/components/Icon'
 import {
   avatarHue, deletePost, getPeer, getReplies, initials,
@@ -20,6 +20,8 @@ import {
 } from '../avatarCache.js'
 import { EMOJI_ART } from '../emoji_art.js'
 import { boardPostFitsWireLimit } from '../board_payload.js'
+import MessageInput from './MessageInput.jsx'
+import { prependedScrollTop } from './interactionRules.js'
 
 const MAX_POST_IMAGES = 4
 const GALLERY_BUDGET_BYTES = 960 * 1024
@@ -251,9 +253,8 @@ export default function Board({
   me, feed, feedState, onRefresh, onOpenPerson, onMessageUser, showToast, onOpenImage,
   hasEarlier, onLoadEarlier,
   composing, setComposing, canInteract, participationIntent, intentState,
-  participationBusy, onRetryIntent, onRequestParticipation,
+  participationBusy, onJoin, joinBusy, onRetryIntent, onRequestParticipation,
   onCompleteParticipation, onDiscardParticipation, onPostConfirmed, emojiReactions = false,
-  onThreadOpenChange,
 }) {
   const [draft, setDraft] = useState('')
   const [posting, setPosting] = useState(false)
@@ -281,9 +282,11 @@ export default function Board({
   const lastActivityAt = useRef(0)
   const restoreDeleteFocus = useRef(true)
   const fileRef = useRef(null)
-  const composeRef = useModalFocus(composing, () => {
-    if (!posting && !handoffBusy) setComposing(false)
-  })
+  const composerInputRef = useRef(null)
+  const replyInputRef = useRef(null)
+  const bottomMarkerRef = useRef(null)
+  const stickToBottom = useRef(true)
+  const initialScrollDone = useRef(false)
   const deleteRef = useModalFocus(
     Boolean(deleteTarget),
     () => setDeleteTarget(null),
@@ -292,9 +295,38 @@ export default function Board({
   replySendingRef.current = replySending
 
   useEffect(() => {
-    onThreadOpenChange?.(Boolean(replyPost))
-    return () => onThreadOpenChange?.(false)
-  }, [Boolean(replyPost), onThreadOpenChange])
+    const marker = bottomMarkerRef.current
+    const scroller = marker?.closest('.cn-scroll')
+    if (!scroller) return undefined
+    const trackPosition = () => {
+      stickToBottom.current = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 96
+    }
+    trackPosition()
+    scroller.addEventListener('scroll', trackPosition, { passive: true })
+    return () => scroller.removeEventListener('scroll', trackPosition)
+  }, [])
+
+  useEffect(() => {
+    if (!composing) return
+    composerInputRef.current?.focus()
+    const scroller = bottomMarkerRef.current?.closest('.cn-scroll')
+    if (scroller) scroller.scrollTop = scroller.scrollHeight
+    setComposing(false)
+  }, [composing, setComposing])
+
+  useEffect(() => {
+    if (feedState !== 'ready') return undefined
+    const firstReadyScroll = !initialScrollDone.current
+    if (!firstReadyScroll && !stickToBottom.current) return undefined
+    const frame = requestAnimationFrame(() => {
+      const scroller = bottomMarkerRef.current?.closest('.cn-scroll')
+      if (!scroller) return
+      scroller.scrollTop = scroller.scrollHeight
+      initialScrollDone.current = true
+      stickToBottom.current = true
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [feedState, feed.length, pending?.id])
 
   useEffect(() => {
     if (!reactionPickerFor) return undefined
@@ -321,10 +353,18 @@ export default function Board({
   async function loadEarlierPosts() {
     const before = feed.at(-1)?.created_at
     if (before === null || before === undefined || loadingEarlier) return
+    const scroller = bottomMarkerRef.current?.closest('.cn-scroll')
+    const previousHeight = scroller?.scrollHeight
+    const previousTop = scroller?.scrollTop
     setLoadingEarlier(true)
     setEarlierError('')
     try {
       await onLoadEarlier(before)
+      if (scroller && previousHeight !== undefined && previousTop !== undefined) {
+        requestAnimationFrame(() => {
+          scroller.scrollTop = prependedScrollTop(previousTop, previousHeight, scroller.scrollHeight)
+        })
+      }
     } catch {
       setEarlierError('Earlier posts couldn’t be loaded. The posts already here are unchanged.')
     } finally {
@@ -496,11 +536,7 @@ export default function Board({
     })
     const text = replyDraft.trim()
     const post = replyPost
-    if (!text || !post || replySending || handoffBusy) return
-    if (!canInteract) {
-      await continueParticipation('reply', { postId: post.id, text: replyDraft })
-      return
-    }
+    if (!canInteract || !text || !post || replySending || handoffBusy) return
 
     const localId = `local-${Date.now()}`
     const optimistic = {
@@ -663,7 +699,6 @@ export default function Board({
       showToast(error.message || 'This post couldn’t be deleted.', 'error')
       return
     }
-    showToast('Post deleted', 'success')
     onRefresh(true)
   }
 
@@ -799,7 +834,6 @@ export default function Board({
           URL.revokeObjectURL(image.previewUrl)
         }
       }
-      showToast('Posted to the board', 'success')
     } catch (error) {
       setPending(null)
       setDraft(text)
@@ -817,29 +851,18 @@ export default function Board({
     }
   }
 
-  async function submitPost() {
-    if (canInteract) return publish()
-    // Not joined yet: compress now, then save the draft to resume after joining.
-    setPosting(true)
-    let payloads
-    try {
-      payloads = await collectImagePayloads(selectedImages, draft.trim())
-    } catch (error) {
-      setPosting(false)
-      showToast(error.message || 'An image couldn’t be prepared.', 'error')
-      return
-    }
-    setPosting(false)
-    await continueParticipation('post', {
-      text: draft,
-      attachment: payloads.attachment,
-      attachments: payloads.attachments,
-      thumbnails: payloads.thumbnails,
-    })
+  async function submitPost(event) {
+    event?.preventDefault()
+    if (canInteract) await publish()
   }
 
+  const chronologicalFeed = feed
+    .filter((post) => !hiddenIds.has(post.id))
+    .slice()
+    .reverse()
+
   return (
-    <div className={`cn-content cn-screen${composing ? ' has-dialog' : ''}`}>
+    <div className="cn-content cn-screen cn-board-chat">
       {intentState === 'loading' && (
         <p className="cn-intent-status" role="status">Checking for a saved draft…</p>
       )}
@@ -853,10 +876,10 @@ export default function Board({
         </div>
       )}
       {participationIntent && (
-        <section className="cn-intent-notice" aria-label="Pending board action">
+        <section className="cn-intent-notice" aria-label="Pending community action">
           <div>
             <strong>{participationIntent.kind === 'post'
-              ? 'Your post draft is saved'
+              ? 'Your message draft is saved'
               : participationIntent.kind === 'reply'
                 ? 'Your reply draft is saved'
                 : 'Your reaction is waiting'}</strong>
@@ -890,7 +913,7 @@ export default function Board({
       )}
       {feedState === 'error' && (
         <div className="cn-empty">
-          <div className="cn-empty-title">The board is unreachable</div>
+          <div className="cn-empty-title">The community chat is unreachable</div>
           <p className="cn-empty-text">Your community host couldn’t be reached right now.</p>
           <button className="cn-btn cn-btn-secondary" onClick={() => onRefresh()}>Try again</button>
         </div>
@@ -898,75 +921,50 @@ export default function Board({
       {feedState === 'ready' && feed.length === 0 && !pending && (
         <div className="cn-empty">
           <div className="cn-empty-mark" aria-hidden="true"><Chat /></div>
-          <div className="cn-empty-title">Your board is quiet</div>
+          <div className="cn-empty-title">The community is quiet</div>
           <p className="cn-empty-text">
-            Posts from everyone on your community appear here. Share Social
-            with friends so their servers can join yours.
+            Messages from everyone in Social appear here. Say hello when
+            you’re ready to start the conversation.
           </p>
         </div>
       )}
+      {feedState === 'ready' && hasEarlier && (
+        <button className="cn-history-more" type="button" disabled={loadingEarlier}
+                onClick={loadEarlierPosts}>
+          {loadingEarlier ? 'Loading earlier messages…' : 'Load earlier messages'}
+        </button>
+      )}
+      {earlierError && <p className="cn-inline-error" role="status">{earlierError}</p>}
       <div className="cn-feed">
-        {pending && (
-          <article className="cn-post is-pending" aria-label="Posting">
-            <Avatar name={pending.handle} host={pending.host} remote />
-            <div className="cn-post-main">
-              <div className="cn-post-head">
-                <span className="cn-person">
-                  <span className="cn-person-name">
-                    {pending.handle ? `@${pending.handle}` : 'You'}
-                  </span>
-                  <span className="cn-post-dot" aria-hidden="true">·</span>
-                  <span className="cn-meta cn-pending-status">
-                    {pending.phase === 'preparing' ? 'Preparing photo…' : 'Sending…'}
-                  </span>
-                </span>
-              </div>
-              <div className="cn-post-body">
-                {pending.text && <RichText text={pending.text} className="cn-post-copy" preview />}
-                {!!pending.images?.length && (
-                  <div className={pending.images.length === 1
-                    ? 'cn-pending-image'
-                    : `cn-gallery cn-gallery-${pending.images.length} cn-pending-gallery`}>
-                    {pending.images.map((image, index) => (
-                      <div className={pending.images.length === 1 ? undefined : 'cn-gallery-item'} key={index}>
-                        <img src={image.url} alt={`Post photo ${index + 1}`} />
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-          </article>
-        )}
-        {feed.filter((post) => !hiddenIds.has(post.id)).map((post) => {
+        {chronologicalFeed.map((post) => {
           const reactions = reactionState(post, reactionOverrides[post.id])
           const visibleReactions = BOARD_REACTION_EMOJIS.filter((emoji) => (
             reactions[emoji].count > 0 || reactions[emoji].reacted
           ))
           const replyCount = countFor(post)
           const threadOpen = replyPost?.id === post.id
-          const togglePreview = () => setPreviewPost(
-            previewPost?.id === post.id ? null : { id: post.id, host: post.host },
-          )
+          const togglePreview = canInteract
+            ? () => setPreviewPost(previewPost?.id === post.id ? null : { id: post.id, host: post.host })
+            : null
           return (
             <article className={`cn-post${threadOpen ? ' has-thread' : ''}${me?.host && post.host === me.host ? ' is-mine' : ''}`} key={post.id}
                      onClick={(event) => {
-                       if (!event.target.closest('button, input, textarea, a')) openReplies(post)
+                       if (!event.target.closest('button, input, textarea, a, .cn-avatar')) openReplies(post)
                      }}>
               <Avatar name={post.handle} host={post.host} remote lazy onOpen={togglePreview} />
               <div className="cn-post-main">
                 <div className="cn-post-head">
-                  <button className="cn-person" onClick={togglePreview}>
+                  <button className="cn-person" onClick={togglePreview} disabled={!canInteract}>
                     <span className="cn-person-name">{post.handle ? `@${post.handle}` : 'Social member'}</span>
                     <span className="cn-post-dot" aria-hidden="true">·</span>
                     <span className="cn-meta">{postDateTime(post.created_at)}</span>
                   </button>
-                  {me?.host && post.host === me.host && (
+                  {canInteract && me?.host && post.host === me.host && (
                     <button
                       className="cn-post-delete"
                       onClick={() => { restoreDeleteFocus.current = true; setDeleteTarget(post) }}
-                      aria-label="Delete post"
-                      title="Delete post"
+                      aria-label="Delete message"
+                      title="Delete message"
                     >
                       <Trash aria-hidden="true" />
                     </button>
@@ -985,7 +983,7 @@ export default function Board({
                   onOpen={onOpenImage}
                   onUnavailable={(error) => showToast(
                     error?.status === 404
-                      ? 'Board photos aren’t available on this server yet.'
+                      ? 'Community photos aren’t available on this server yet.'
                       : 'This photo couldn’t be loaded.',
                     'error',
                   )}
@@ -1016,9 +1014,9 @@ export default function Board({
                             className={`cn-reaction-chip${reactions[emoji].reacted ? ' is-reacted' : ''}`}
                             onClick={() => canInteract
                               ? toggleReaction(post, emoji)
-                              : continueParticipation('like', { postId: post.id, emoji })}
+                              : onJoin()}
                             disabled={handoffBusy || participationBusy}
-                            aria-label={reactionActionLabel(reactions[emoji], emoji)}>
+                            aria-label={canInteract ? reactionActionLabel(reactions[emoji], emoji) : 'Join Social to react'}>
                       <span className="cn-reaction-visual">
                         <FlatEmoji emoji={emoji} />
                         {reactions[emoji].count > 0 && <b>{reactions[emoji].count}</b>}
@@ -1027,14 +1025,12 @@ export default function Board({
                   ))}
                   {(emojiReactions || visibleReactions.length === 0) && (
                     <button id={`cn-react-${post.id}`} className="cn-react cn-add-reaction"
-                            onClick={() => emojiReactions
+                            onClick={() => !canInteract ? onJoin() : emojiReactions
                               ? setReactionPickerFor(reactionPickerFor === post.id ? null : post.id)
-                              : (canInteract
-                                ? toggleReaction(post, '❤️')
-                                : continueParticipation('like', { postId: post.id, emoji: '❤️' }))}
+                              : toggleReaction(post, '❤️')}
                             disabled={handoffBusy || participationBusy}
                             aria-expanded={emojiReactions ? reactionPickerFor === post.id : undefined}
-                            aria-label={emojiReactions ? 'Add reaction' : 'Like'}>
+                            aria-label={!canInteract ? 'Join Social to react' : emojiReactions ? 'Add reaction' : 'Like'}>
                       {emojiReactions ? <EmojiAdd aria-hidden="true" /> : <Heart aria-hidden="true" />}
                     </button>
                   )}
@@ -1054,7 +1050,7 @@ export default function Board({
                                   className={reactions[emoji].reacted ? 'is-reacted' : ''}
                                   onClick={() => {
                                     if (canInteract) toggleReaction(post, emoji)
-                                    else continueParticipation('like', { postId: post.id, emoji })
+                                    else onJoin()
                                     dismissReactionPicker(post.id)
                                   }}
                                   aria-pressed={reactions[emoji].reacted}
@@ -1098,16 +1094,22 @@ export default function Board({
                         </article>
                       ))}
                     </div>
-                    <form className={`cn-reply-composer${canInteract ? '' : ' is-gated'}`} onSubmit={sendReply}>
-                      <input value={replyDraft} onChange={(event) => setReplyDraft(event.target.value)}
-                             placeholder="Post your reply" aria-label="Post your reply" autoComplete="off"
-                             maxLength={1000} disabled={replySending || handoffBusy || participationBusy} />
-                      <button className={canInteract ? 'cn-reply-send' : 'cn-btn cn-btn-primary cn-reply-account'}
-                              type="submit" disabled={replySending || handoffBusy || participationBusy || !replyDraft.trim()}
-                              aria-label={canInteract ? 'Send reply' : undefined}>
-                        {canInteract ? <ArrowUp aria-hidden="true" /> : participationActionLabel(participationStep(me), 'reply')}
-                      </button>
-                    </form>
+                    {canInteract ? <form className="cn-reply-composer" onSubmit={sendReply}>
+                      <div className="cn-social-pill">
+                        <div className="cn-social-input-line">
+                          <MessageInput inputRef={replyInputRef} className="cn-reply-input"
+                                        value={replyDraft} onChange={setReplyDraft} maxLength={1000} maxHeight={132}
+                                        placeholder="Post your reply"
+                                        disabled={replySending || handoffBusy || participationBusy} />
+                          <button className="cn-reply-send"
+                                  type="submit" disabled={replySending || handoffBusy || participationBusy || !replyDraft.trim()}
+                                  aria-label="Send reply">
+                            <ArrowUp aria-hidden="true" />
+                          </button>
+                        </div>
+                      </div>
+                    </form> : <button className="cn-btn cn-btn-primary cn-reply-join" type="button"
+                                      onClick={onJoin} disabled={joinBusy}>Join Social to reply</button>}
                   </section>
                 )}
                 </div>
@@ -1115,71 +1117,80 @@ export default function Board({
             </article>
           )
         })}
-      </div>
-      {feedState === 'ready' && hasEarlier && (
-        <button className="cn-history-more" type="button" disabled={loadingEarlier}
-                onClick={loadEarlierPosts}>
-          {loadingEarlier ? 'Loading earlier posts…' : 'Load earlier posts'}
-        </button>
-      )}
-      {earlierError && <p className="cn-inline-error" role="status">{earlierError}</p>}
-
-
-      {composing && (
-        <div className="cn-scrim" role="dialog" aria-modal="true" aria-label="New post"
-             onClick={posting || handoffBusy ? null : () => setComposing(false)}>
-          <div ref={composeRef} tabIndex={-1} className="cn-sheet" onClick={(e) => e.stopPropagation()}>
-            <div className="cn-grabber" aria-hidden="true" />
-            <h3 className="cn-sheet-title">New post</h3>
-            <p className="cn-sheet-body">{canInteract
-              ? 'Posting to everyone on your community board.'
-              : participationStep(me) === 'join'
-                ? 'Joining shares your handle and profile picture. You’ll still review this post before sharing it.'
-                : 'Write now, then continue in Möbius · You. Nothing will be posted automatically.'}</p>
-            <div className="cn-post-compose">
-              <Avatar name={me?.handle} host={me?.host} size="small" remote />
-              <textarea
-                className="cn-textarea"
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                placeholder="What’s happening?"
-                aria-label="Post text"
-                maxLength={4000}
-              />
+        {pending && (
+          <article className="cn-post is-pending" aria-label="Sending message">
+            <Avatar name={pending.handle} host={pending.host} remote />
+            <div className="cn-post-main">
+              <div className="cn-post-head">
+                <span className="cn-person">
+                  <span className="cn-person-name">
+                    {pending.handle ? `@${pending.handle}` : 'You'}
+                  </span>
+                  <span className="cn-post-dot" aria-hidden="true">·</span>
+                  <span className="cn-meta cn-pending-status">
+                    {pending.phase === 'preparing' ? 'Preparing photo…' : 'Sending…'}
+                  </span>
+                </span>
+              </div>
+              <div className="cn-post-body">
+                {pending.text && <RichText text={pending.text} className="cn-post-copy" preview />}
+                {!!pending.images?.length && (
+                  <div className={pending.images.length === 1
+                    ? 'cn-pending-image'
+                    : `cn-gallery cn-gallery-${pending.images.length} cn-pending-gallery`}>
+                    {pending.images.map((image, index) => (
+                      <div className={pending.images.length === 1 ? undefined : 'cn-gallery-item'} key={index}>
+                        <img src={image.url} alt={`Message photo ${index + 1}`} />
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
+          </article>
+        )}
+      </div>
+      <div ref={bottomMarkerRef} className="cn-board-bottom" aria-hidden="true" />
+      {canInteract ? <form className="cn-board-composer" onSubmit={submitPost}>
+        <div className="cn-social-input-row">
+          <input ref={fileRef} className="cn-file-input" type="file" accept="image/*" multiple
+                 onChange={chooseImage} tabIndex={-1} aria-hidden="true" />
+          <button className="cn-compose-image" type="button" onClick={() => fileRef.current?.click()}
+                  disabled={posting || selectedImages.length >= MAX_POST_IMAGES}
+                  aria-label="Attach photo"
+                  title={selectedImages.length >= MAX_POST_IMAGES ? `Up to ${MAX_POST_IMAGES} images` : 'Attach photo'}>
+            <Paperclip aria-hidden="true" />
+          </button>
+          <div className={`cn-social-pill${selectedImages.length ? ' is-with-attachments' : ''}`}>
             <SelectedImagesStrip selected={selectedImages} onRemove={removeImage} />
-            <input ref={fileRef} className="cn-file-input" type="file" accept="image/*" multiple
-                   onChange={chooseImage} tabIndex={-1} aria-hidden="true" />
-            <div className="cn-post-sheet-actions">
-              <button className="cn-compose-image" type="button" onClick={() => fileRef.current?.click()}
-                      disabled={posting || selectedImages.length >= MAX_POST_IMAGES}
-                      aria-label="Attach photo"
-                      title={selectedImages.length >= MAX_POST_IMAGES ? `Up to ${MAX_POST_IMAGES} images` : 'Attach photo'}>
-                <ImageSquare aria-hidden="true" />
-              </button>
-              <button className="cn-btn cn-btn-secondary" onClick={() => setComposing(false)} disabled={posting || handoffBusy}>
-                Cancel
-              </button>
-              <button className="cn-btn cn-btn-primary" onClick={submitPost}
-                      disabled={posting || handoffBusy || participationBusy || (!draft.trim() && !selectedImages.length)}>
-                {posting ? 'Posting…' : handoffBusy || participationBusy
-                  ? 'Please wait…'
-                  : canInteract ? 'Post' : participationActionLabel(participationStep(me), 'post')}
+            <div className="cn-social-input-line">
+              <MessageInput inputRef={composerInputRef} value={draft} onChange={setDraft}
+                            maxLength={4000} maxHeight={132} placeholder="Message everyone…"
+                            label="Message everyone"
+                            disabled={posting || handoffBusy || participationBusy} />
+              <button className="cn-board-send" type="submit"
+                      disabled={posting || handoffBusy || participationBusy || (!draft.trim() && !selectedImages.length)}
+                      aria-label="Send message">
+                <ArrowUp aria-hidden="true" />
               </button>
             </div>
           </div>
         </div>
-      )}
+      </form> : <div className="cn-board-composer cn-board-join">
+        <button className="cn-btn cn-btn-primary" type="button" onClick={onJoin}
+                disabled={joinBusy}>Join Social to message</button>
+        <p className="cn-composer-disclosure">Community is open to read. Join to message and open Chats and People.</p>
+      </div>}
 
       {deleteTarget && (
-        <div className="cn-scrim" role="dialog" aria-modal="true" aria-label="Delete post"
+        <div className="cn-scrim" role="dialog" aria-modal="true" aria-label="Delete message"
              onClick={() => setDeleteTarget(null)}>
           <div ref={deleteRef} tabIndex={-1} className="cn-sheet cn-confirm-sheet"
                onClick={(e) => e.stopPropagation()}>
             <div className="cn-grabber" aria-hidden="true" />
-            <h3 className="cn-sheet-title">Delete this post?</h3>
+            <h3 className="cn-sheet-title">Delete this message?</h3>
             <p className="cn-sheet-body">
-              This removes your post from the community board for everyone. This
+              This removes your message from the community chat for everyone. This
               can’t be undone.
             </p>
             <div className="cn-sheet-actions">

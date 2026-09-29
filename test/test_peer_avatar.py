@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -21,6 +21,11 @@ with patch.dict(os.environ, {
   "APP_STORAGE_DIR": tempfile.gettempdir(), "APP_ID": "7", "APP_SLUG": "social",
 }):
   import social_routes
+
+
+@asynccontextmanager
+async def unlocked_identity():
+  yield
 
 
 def png(width=32, height=24) -> bytes:
@@ -74,7 +79,9 @@ class PeerAvatarHardeningTests(unittest.IsolatedAsyncioTestCase):
     ), patch.object(
       social_routes, "_avatar_path", return_value=avatar,
     ), patch.object(
-      social_routes, "_load_identity", return_value={"joined_at": 1},
+      social_routes, "_load_identity", return_value={
+        "joined_at": 1, "directory_synced": {"handle": "owner"},
+      },
     ):
       response = social_routes.get_avatar()
 
@@ -136,6 +143,8 @@ class PeerAvatarHardeningTests(unittest.IsolatedAsyncioTestCase):
       "name": "Owner", "handle": "owner", "avatar_source_url": "old-url",
     }
     with patch.object(
+      social_routes, "_identity_lock", new=unlocked_identity,
+    ), patch.object(
       social_routes, "_load_identity", return_value=identity,
     ), patch.object(
       social_routes, "owner_profile",
@@ -149,6 +158,29 @@ class PeerAvatarHardeningTests(unittest.IsolatedAsyncioTestCase):
     self.assertTrue(state["avatar_updated"])
     self.assertFalse(avatar.exists())
     self.assertNotIn("avatar_source_url", identity)
+    save.assert_called_once_with(identity)
+
+  async def test_avatar_cache_failure_does_not_block_profile_refresh(self):
+    identity = {"name": "Old", "handle": "owner", "avatar_source_url": "old-url"}
+    with patch.object(
+      social_routes, "_identity_lock", new=unlocked_identity,
+    ), patch.object(
+      social_routes, "_load_identity", return_value=identity,
+    ), patch.object(
+      social_routes, "owner_profile", AsyncMock(return_value={
+        "display_name": "New", "handle": "owner", "avatar_url": "new-url",
+      }),
+    ), patch.object(
+      social_routes, "_download_avatar", AsyncMock(return_value=png()),
+    ), patch.object(
+      social_routes, "_avatar_path", return_value=self.root / "avatar.png",
+    ), patch.object(
+      social_routes, "atomic_write", side_effect=OSError("photo cache unavailable"),
+    ), patch.object(social_routes, "_save_identity") as save:
+      state = await social_routes._refresh_profile_cache(None, None)
+    self.assertEqual(state["identity"]["name"], "New")
+    self.assertEqual(state["identity"]["avatar_source_url"], "old-url")
+    self.assertFalse(state["avatar_updated"])
     save.assert_called_once_with(identity)
 
   async def test_untrusted_avatar_is_reencoded_at_the_avatar_size(self):
@@ -317,7 +349,9 @@ class PeerAvatarHardeningTests(unittest.IsolatedAsyncioTestCase):
         "avatar_url": "https://you.example/old.png", **changes,
       }
       register = AsyncMock(return_value="registered")
-      with patch.object(social_routes, "_load_identity", return_value=identity), patch.object(
+      with patch.object(social_routes, "_identity_lock", new=unlocked_identity), patch.object(
+        social_routes, "_load_identity", return_value=identity,
+      ), patch.object(
         social_routes, "owner_profile", AsyncMock(return_value=profile),
       ), patch.object(
         social_routes, "_download_avatar", AsyncMock(return_value=png()),

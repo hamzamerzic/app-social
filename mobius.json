@@ -57,12 +57,13 @@
     "ui/Media.jsx",
     "ui/MessageBubble.jsx",
     "ui/MessageInput.jsx",
+    "ui/interactionRules.js",
     "ui/modalFocus.js",
     "ui/GroupDetails.jsx"
   ],
   "store": {
     "tagline": "Your people, across every Möbius.",
-    "description": "Social gives every Möbius a direct way to reach people on other instances. Find someone by handle, send private one-to-one messages, create group conversations, or post to a shared community board.\n\nMessages travel directly between each person's Möbius and each side keeps its own copy. Everyone browses one global board and opt-in People directory. Private conversations stay on the participants’ own instances.",
+    "description": "Social gives every Möbius a direct way to reach people on other instances. Find someone by handle, send private one-to-one messages, create group conversations, or post to a shared community board.\n\nMessages travel directly between each person's Möbius and each side keeps its own copy. Everyone can read the global Community board; join to search People, message, or post. Private conversations stay on the participants’ own instances.",
     "screenshots": [
       {
         "src": "static/store/messages.png",

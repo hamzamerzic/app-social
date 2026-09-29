@@ -20,6 +20,12 @@ def verify(base: str, expected_sha: str, opener=urllib.request.urlopen) -> None:
   status, board = read("/api/common/board?limit=1")
   assert status == 200 and isinstance(board, dict)
   assert isinstance(board.get("posts"), list)
+  try:
+    read("/api/common/directory")
+  except urllib.error.HTTPError as error:
+    assert error.code == 403
+  else:
+    raise AssertionError("directory unexpectedly public")
   status, actor = read("/api/common/actor")
   assert status == 200 and actor["public_key"]["alg"] == "ed25519"
 

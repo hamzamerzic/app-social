@@ -1,4 +1,4 @@
-"""The public directory and board served by the central Social community host.
+"""The members-only directory and public board on the central Social host.
 
 The on-disk schema is the existing Common schema rooted at
 ``<data_dir>/common``:
@@ -595,6 +595,10 @@ class CommonPublicStore:
     """Map each directory member's host to its avatar content hash."""
     return self._member_index()[0]
 
+  def is_member(self, host: str) -> bool:
+    """Registration grants access even for legacy members still choosing a handle."""
+    return isinstance(self._load_object(self.directory_path()).get(host), dict)
+
   def set_member_handle(self, host: str, handle: str) -> None:
     """Record the handle a registered member's own actor card now shows."""
     if self._member_index()[1].get(host) == handle:
@@ -1156,7 +1160,7 @@ async def refresh_member_profile(
   member's own actor card keeps the directory's handle, and so every board
   row by them, current without waiting for their instance to re-register.
 
-  Members list themselves in the public directory by choice and already serve
+  Members list themselves in the shared directory by choice and already serve
   this avatar publicly from their own instance. Holding one re-encoded copy
   here under its content hash lets every viewer's instance fetch it from this
   host once, instead of from each member's own, possibly slow, server.
@@ -1265,25 +1269,32 @@ async def send_board_activity(
 
 
 async def verify_named_member(
-  store: CommonPublicStore, verifier: ActorVerifier, envelope: dict,
+  store: CommonPublicStore, verifier: ActorVerifier, envelope: dict, *,
+  require_registration: bool = True, expected_handle: str | None = None,
 ) -> dict:
   """Verify a public write whose author must be named by a handle.
 
   Everything on the board and in the directory is shown by handle, so a member
   without one cannot join or take part. A cached card can predate a handle the
-  member has just chosen, so an unnamed card is re-read once before refusing.
+  member has just chosen, so an unnamed or outdated card is re-read once.
   The verified handle is the member's current name, so the directory takes it
   here; every row by them follows without waiting for a sweep.
   """
   actor = await verifier.verify_envelope(envelope)
-  if not actor.get("handle"):
+  if not actor.get("handle") or (
+    expected_handle is not None and actor.get("handle") != expected_handle
+  ):
     try:
       await verifier.fetch_actor(envelope["from"], force=True)
       actor = await verifier.verify_envelope(envelope)
     except HTTPException:
-      raise HTTPException(status_code=409, detail=NEEDS_USERNAME) from None
+      if not actor.get("handle"):
+        raise HTTPException(status_code=409, detail=NEEDS_USERNAME) from None
+      raise
     if not actor.get("handle"):
       raise HTTPException(status_code=409, detail=NEEDS_USERNAME)
+  if require_registration and not store.is_member(envelope["from"]):
+    raise HTTPException(status_code=403, detail="Join Social first.")
   store.set_member_handle(envelope["from"], actor["handle"])
   return actor
 
@@ -1292,7 +1303,7 @@ def create_public_router(
   store: CommonPublicStore, verifier: ActorVerifier, *, prefix: str = "",
   on_activity=None, on_register=None,
 ) -> tuple[APIRouter, None]:
-  """Build the community host's public directory and board surface.
+  """Build the community host's directory and public board surface.
 
   ``on_activity(kind, author_host, actor_host, actor_handle, post_id)`` is an
   optional awaitable the host calls after a genuine new like or reply by
@@ -1303,7 +1314,23 @@ def create_public_router(
   router = APIRouter(prefix=prefix, tags=["common-public"])
 
   @router.get("/directory")
-  def search_directory(q: str = ""):
+  def reject_public_directory():
+    raise HTTPException(
+      status_code=403, detail="Join Social to see People.",
+      headers={"Cache-Control": "no-store"},
+    )
+
+  @router.post("/directory/search")
+  async def search_directory_for_member(request: Request):
+    envelope = await read_envelope(request)
+    if envelope.get("v") != 0 or envelope.get("type") != "directory_read":
+      raise HTTPException(status_code=400, detail="Unsupported envelope type.")
+    q = envelope.get("q")
+    if not isinstance(q, str) or len(q) > MAX_NAME_CHARS:
+      raise HTTPException(status_code=400, detail="Directory search is invalid.")
+    await verifier.verify_envelope(envelope)
+    if not store.is_member(envelope["from"]):
+      raise HTTPException(status_code=403, detail="Join Social to see People.")
     return store.search_directory(q)
 
   @router.post("/directory")
@@ -1311,7 +1338,13 @@ def create_public_router(
     envelope = await read_envelope(request)
     if envelope.get("v") != 0 or envelope.get("type") != "register":
       raise HTTPException(status_code=400, detail="Unsupported envelope type.")
-    actor = await verify_named_member(store, verifier, envelope)
+    claimed_handle = envelope.get("handle")
+    if not isinstance(claimed_handle, str) or len(claimed_handle) > MAX_NAME_CHARS:
+      raise HTTPException(status_code=400, detail="Directory profile is invalid.")
+    actor = await verify_named_member(
+      store, verifier, envelope, require_registration=False,
+      expected_handle=claimed_handle,
+    )
     handle = actor["handle"]
     bio = envelope.get("bio") or ""
     if (
@@ -1322,7 +1355,7 @@ def create_public_router(
     registered = store.register(envelope["from"], handle, bio)
     if on_register is not None:
       await on_register(envelope["from"])
-    return registered
+    return {**registered, "handle": handle}
 
   @router.get("/directory/avatars/{name}")
   def get_member_avatar(name: str, request: Request):
@@ -1461,6 +1494,8 @@ def create_public_router(
     if not valid_id(post_id):
       raise HTTPException(status_code=400, detail="Post id is invalid.")
     await verifier.verify_envelope(envelope)
+    if not store.is_member(envelope["from"]):
+      raise HTTPException(status_code=403, detail="Join Social first.")
     return store.delete_post(post_id, envelope["from"])
 
   @router.post("/board")

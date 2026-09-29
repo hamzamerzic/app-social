@@ -14,8 +14,8 @@ Ed25519-signed envelopes and no third-party storage:
    establishes consent. Each side stores only its own copy (in the Common
    mini-app's per-app storage), so a conversation lives exclusively on the two
    participants' servers.
-3. **Community host role** — any instance can host the shared, public parts:
-   an opt-in user directory (search) and a message board. Peers register and
+3. **Community host role** — the shared host serves a members-only directory
+   and a public message board. Peers register and
    post with the same signed-envelope scheme. Which host to use is the
    owner's choice (default: their own instance).
 
@@ -23,7 +23,7 @@ Public peer surface (no owner auth; envelope signatures are the authority):
   GET  /api/app-services/social/actor        federation keys; joined profile card
   GET  /api/app-services/social/avatar       instance profile avatar
   POST /api/app-services/social/inbox        deliver a signed DM
-  GET|POST /api/app-services/social/directory  public directory
+  GET|POST /api/app-services/social/directory  join and directory access control
   GET|POST /api/app-services/social/board      public board
   GET /api/app-services/social/board/{media|thumbnail}/{post_id}[/{index}][.{type}]
       hosted board image; links ending in the type are CDN-cacheable
@@ -40,7 +40,7 @@ Owner surface (owner JWT or the Social app's scoped token):
       local/cached community board image (mime: the type the post records)
   POST /api/services/social/reply        sign + submit a board reply to the community host
   GET  /api/services/social/feed         community host's board (local read when self)
-  GET  /api/services/social/people       community host directory search
+  GET  /api/services/social/people       member-only directory search
   GET  /api/services/social/peer/{host}  a peer's actor card (profile view)
   POST /api/services/social/peer-avatars  a bounded visible-avatar batch
 
@@ -62,12 +62,12 @@ import re
 import time
 import uuid
 from pathlib import Path
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from common_protocol import (
@@ -155,6 +155,10 @@ def _identity_path() -> Path:
   # Unlike the other Common paths, callers use this to distinguish an
   # untouched installation. Merely probing /actor must not materialize state.
   return Path(get_settings().data_dir) / "common" / "identity.json"
+
+
+def _identity_lock_path() -> Path:
+  return _identity_path().with_name(".identity.lock")
 
 
 def _avatar_path() -> Path:
@@ -472,9 +476,25 @@ def _encryption_public_key(private_key_b64: str) -> str:
   ).decode()
 
 
-def _load_identity() -> dict:
+def _load_identity(*, locked: bool = False) -> dict:
   """Load (or lazily create) this instance's federation identity."""
   path = _identity_path()
+  if path.is_file():
+    identity = json.loads(path.read_text())
+    if identity.get("enc_private_key_b64"):
+      return identity
+  if not locked:
+    # Only first-use creation/migration writes here. Its lock-holder does not
+    # await before saving the keys, so a synchronous caller cannot deadlock an
+    # async registration waiting on the same event loop.
+    lock_path = _identity_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+      fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+      try:
+        return _load_identity(locked=True)
+      finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
   if path.is_file():
     identity = json.loads(path.read_text())
     if not identity.get("enc_private_key_b64"):
@@ -963,16 +983,25 @@ async def _mark_dm_read(app, peer_host: str) -> bool:
 
 @router.get("/actor")
 async def get_actor(db=Depends(get_db)):
-  """Publish keys for private federation, and profile data only after join."""
+  """Publish keys for federation, and profile data only for confirmed members."""
   # An unauthenticated probe must not lazily create an identity on an
   # untouched installation. Authenticated owner use and established
   # federation operations create this file before peers need its keys.
   if not _identity_path().is_file():
     raise HTTPException(status_code=404, detail="Social profile not found.")
   identity = _load_identity()
-  if not identity.get("joined_at"):
+  if not _profile_public(identity):
     return _key_actor_doc(identity)
-  return _actor_doc(identity, await public_actor_metadata())
+  metadata = await public_actor_metadata()
+  identity = _load_identity()
+  if not _profile_public(identity):
+    return _key_actor_doc(identity)
+  actor = _actor_doc(identity, metadata)
+  if not _membership_confirmed(identity):
+    # The host needs this card only for the registration handshake; a failed
+    # join must not leave a shared cached copy of the temporary profile.
+    return JSONResponse(actor, headers={"Cache-Control": "no-store"})
+  return actor
 
 
 def _temporarily_unavailable_avatar(
@@ -988,10 +1017,11 @@ def _temporarily_unavailable_avatar(
 
 @router.get("/avatar")
 def get_avatar():
-  """This instance's public profile avatar. Public by design."""
+  """This instance's avatar, public only during registration or membership."""
   if not _identity_path().is_file():
     raise HTTPException(status_code=404, detail="Social profile not found.")
-  if not _load_identity().get("joined_at"):
+  identity = _load_identity()
+  if not _profile_public(identity):
     raise HTTPException(status_code=404, detail="Social profile not found.")
   path = _avatar_path()
   if not path.is_file():
@@ -1002,6 +1032,7 @@ def get_avatar():
     headers={
       "Cache-Control": (
         "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+        if _membership_confirmed(identity) else "no-store"
       ),
       "X-Content-Type-Options": "nosniff",
     },
@@ -1011,6 +1042,8 @@ def get_avatar():
 @router.post("/inbox")
 async def receive_message(request: Request, db=Depends(get_db)):
   """Accept one signed direct message from a peer instance."""
+  if not _joined_for_federation():
+    raise HTTPException(status_code=403, detail="Join Social before receiving messages.")
   envelope = await _read_envelope(request)
   if envelope.get("v") != 0 or envelope.get("type") != "message":
     raise HTTPException(status_code=400, detail="Unsupported envelope type.")
@@ -1120,6 +1153,34 @@ def _require_owner_or_common_app(db, principal: Principal):
   return app
 
 
+def _membership_confirmed(identity: dict) -> bool:
+  return bool(identity.get("joined_at") and identity.get("directory_synced"))
+
+
+def _profile_public(identity: dict) -> bool:
+  # The host must read the named actor while verifying registration. A bounded
+  # window permits that handshake without publishing a failed join indefinitely.
+  window = identity.get("registration_public_until")
+  return bool(identity.get("joined_at")) and (
+    _membership_confirmed(identity) or
+    isinstance(window, (int, float)) and window > time.time()
+  )
+
+
+def _joined_for_federation() -> bool:
+  # An anonymous inbound probe must not create a new identity on an untouched app.
+  return _identity_path().is_file() and _membership_confirmed(_load_identity())
+
+
+def _require_member(db, principal: Principal):
+  """Owner/app access is not Social membership; both are needed for private areas."""
+  app = _require_owner_or_common_app(db, principal)
+  identity = _load_identity()
+  if not _membership_confirmed(identity):
+    raise HTTPException(status_code=403, detail="Join Social to access this area.")
+  return app
+
+
 class ProfileUpdate(BaseModel):
   bio: str | None = None
 
@@ -1161,7 +1222,8 @@ async def _refresh_profile_cache(db, principal: Principal) -> dict:
   actor card and directory registration working when the account service is
   briefly unreachable; the live profile remains the source of truth.
   """
-  identity = _load_identity()
+  async with _identity_lock():
+    cached_avatar_url = _load_identity(locked=True).get("avatar_source_url")
   profile = None
   account_error = None
   avatar_updated = False
@@ -1169,36 +1231,41 @@ async def _refresh_profile_cache(db, principal: Principal) -> dict:
     profile = await owner_profile()
   except HTTPException as exc:
     account_error = str(exc.detail)
-  if profile:
-    name = str(profile.get("display_name") or profile.get("handle") or "")
-    handle = str(profile.get("handle") or "")
-    if name[:MAX_NAME_CHARS] != identity.get("name") or (
-      handle[:MAX_NAME_CHARS] != identity.get("handle")
-    ):
-      identity["name"] = name[:MAX_NAME_CHARS]
-      identity["handle"] = handle[:MAX_NAME_CHARS]
-      _save_identity(identity)
-    avatar_url = profile.get("avatar_url")
-    if (
-      isinstance(avatar_url, str)
-      and avatar_url
-      and avatar_url != identity.get("avatar_source_url")
-    ):
+  avatar = None
+  avatar_url = profile.get("avatar_url") if profile else None
+  if isinstance(avatar_url, str) and avatar_url and avatar_url != cached_avatar_url:
+    try:
+      avatar = await _download_avatar(avatar_url)
+    except Exception:
+      pass
+  async with _identity_lock():
+    # Profile calls may return while registration is in flight. Apply only
+    # these profile fields to the latest saved identity, never a stale snapshot.
+    identity = _load_identity(locked=True)
+    changed = False
+    if profile:
+      name = str(profile.get("display_name") or profile.get("handle") or "")[:MAX_NAME_CHARS]
+      handle = str(profile.get("handle") or "")[:MAX_NAME_CHARS]
+      if name != identity.get("name") or handle != identity.get("handle"):
+        identity["name"] = name
+        identity["handle"] = handle
+        changed = True
       try:
-        avatar = await _download_avatar(avatar_url)
-        atomic_write(_avatar_path(), avatar)
-        identity["avatar_source_url"] = avatar_url
-        _save_identity(identity)
-        avatar_updated = True
-      except Exception:
+        if avatar is not None and avatar_url != identity.get("avatar_source_url"):
+          atomic_write(_avatar_path(), avatar)
+          identity["avatar_source_url"] = avatar_url
+          avatar_updated = changed = True
+        elif "avatar_url" in profile and not avatar_url:
+          avatar_path = _avatar_path()
+          if avatar_path.is_file() or identity.get("avatar_source_url"):
+            avatar_path.unlink(missing_ok=True)
+            identity.pop("avatar_source_url", None)
+            avatar_updated = changed = True
+      except OSError:
+        # A failed local photo cache must not prevent joining or profile edits.
         pass
-    elif "avatar_url" in profile and not avatar_url:
-      avatar_path = _avatar_path()
-      if avatar_path.is_file() or identity.get("avatar_source_url"):
-        avatar_path.unlink(missing_ok=True)
-        identity.pop("avatar_source_url", None)
+      if changed:
         _save_identity(identity)
-        avatar_updated = True
   if identity.get("joined_at") and identity.get("directory_synced") != _directory_listing(identity):
     # The directory lists this handle and copies this avatar; re-registering
     # tells the community host to refresh both, and repeats until it succeeds.
@@ -1229,7 +1296,7 @@ async def _me_response(
     "handle": identity.get("handle") or "",
     "bio": identity.get("bio") or "",
     "connected": connected,
-    "joined": bool(identity.get("joined_at")),
+    "joined": _membership_confirmed(identity),
     "account_error": account_error,
     "identity_app_id": await identity_app_id(),
   }
@@ -1277,21 +1344,22 @@ async def join_community(
   require_nondelegated_owner_control(principal)
   _require_owner_or_common_app(db, principal)
   state = await _refresh_profile_cache(db, principal)
-  identity = state["identity"]
-  if not state["profile"] and not identity.get("name"):
-    raise HTTPException(
-      status_code=409,
-      detail=(
-        "No Möbius profile is connected yet. Connect your account in "
-        "Möbius · You first."
-      ),
-    )
-  _require_username(identity)
-  identity["joined_at"] = identity.get("joined_at") or time.time()
-  _save_identity(identity)
+  async with _identity_lock():
+    identity = _load_identity(locked=True)
+    if not state["profile"] and not identity.get("name"):
+      raise HTTPException(
+        status_code=409,
+        detail=(
+          "No Möbius profile is connected yet. Connect your account in "
+          "Möbius · You first."
+        ),
+      )
+    _require_username(identity)
+    identity["joined_at"] = identity.get("joined_at") or time.time()
+    _save_identity(identity)
   status = await _register_with_community_host(identity)
   return {
-    "status": "joined",
+    "status": "joined" if status == "registered" else "pending",
     "directory": status,
     "name": identity.get("name") or "",
     "handle": identity.get("handle") or "",
@@ -1306,31 +1374,97 @@ def _directory_listing(identity: dict) -> dict:
   }
 
 
+async def _legacy_registration_matches(handle: str) -> bool:
+  """Check the old host's public directory before trusting its bare 200 reply.
+
+  Remove this only after older community hosts no longer need to interoperate.
+  New hosts return the verified handle directly and never use this read.
+  """
+  response = await federation_request(
+    "GET", _peer_service_url(COMMUNITY_HOST, "directory"),
+    params={"q": _own_host()}, timeout_seconds=3.0,
+  )
+  response.raise_for_status()
+  users = response.json().get("users")
+  return isinstance(users, list) and any(
+    isinstance(person, dict) and person.get("host") == _own_host()
+    and person.get("handle") == handle for person in users
+  )
+
+
+@asynccontextmanager
+async def _identity_lock():
+  # Each service request may run in another process. Nonblocking flock also
+  # lets a second request on this event loop wait without freezing the first.
+  # Keep this inode: unlinking it could split the lock across processes.
+  path = _identity_lock_path()
+  path.parent.mkdir(parents=True, exist_ok=True)
+  with path.open("a+b") as handle:
+    while True:
+      try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+      except BlockingIOError:
+        await asyncio.sleep(0.02)
+    try:
+      yield
+    finally:
+      fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 async def _register_with_community_host(identity: dict) -> str:
   """Announce this instance to its community host. Returns a status string."""
-  host = COMMUNITY_HOST
-  envelope = {
-    "v": 0,
-    "type": "register",
-    "from": _own_host(),
-    "handle": identity.get("handle") or "",
-    "bio": identity.get("bio") or "",
-    "sent_at": time.time(),
-  }
-  envelope["sig"] = _sign(envelope, identity["private_key_b64"])
-  try:
-    response = await _post_signed_envelope(
-      _peer_service_url(host, "directory"), envelope,
-      max_response_bytes=MAX_ENVELOPE_BYTES,
-    )
-    response.raise_for_status()
-  except httpx.HTTPStatusError as exc:
-    return "verification_failed" if exc.response.status_code == 403 else "rejected"
-  except Exception:
-    return "unreachable"
-  identity["directory_synced"] = _directory_listing(identity)
-  _save_identity(identity)
-  return "registered"
+  async with _identity_lock():
+    # A waiting request may hold a snapshot from before another Join finished.
+    saved = dict(_load_identity(locked=True))
+    identity.clear()
+    identity.update(saved)
+    listing = _directory_listing(identity)
+    envelope = {
+      "v": 0,
+      "type": "register",
+      "from": _own_host(),
+      "handle": identity.get("handle") or "",
+      "bio": identity.get("bio") or "",
+      "sent_at": time.time(),
+    }
+    envelope["sig"] = _sign(envelope, identity["private_key_b64"])
+    identity["registration_public_until"] = time.time() + 60
+    _save_identity(identity)
+    status = "unreachable"
+    try:
+      response = await _post_signed_envelope(
+        _peer_service_url(COMMUNITY_HOST, "directory"), envelope,
+        max_response_bytes=MAX_ENVELOPE_BYTES,
+      )
+      response.raise_for_status()
+      acknowledgement = response.json()
+      if not isinstance(acknowledgement, dict) or acknowledgement.get("status") != "registered":
+        status = "verification_failed"
+      elif acknowledgement.get("handle") == listing["handle"]:
+        status = "registered"
+      elif "handle" not in acknowledgement:
+        # The still-running old host returns only {status: registered}.
+        # Check its actual directory row before considering this Join complete.
+        status = (
+          "registered" if await _legacy_registration_matches(listing["handle"])
+          else "verification_failed"
+        )
+      else:
+        status = "verification_failed"
+    except httpx.HTTPStatusError as exc:
+      status = "verification_failed" if exc.response.status_code == 403 else "rejected"
+    except Exception:
+      pass
+    finally:
+      latest = dict(_load_identity(locked=True))
+      if status == "registered":
+        latest["directory_synced"] = listing
+      latest.pop("registration_public_until", None)
+      _save_identity(latest)
+      identity.clear()
+      identity.update(latest)
+    return status
 
 
 def _require_username(identity: dict) -> None:
@@ -1363,10 +1497,11 @@ async def update_me(
 ):
   require_nondelegated_owner_control(principal)
   _require_owner_or_common_app(db, principal)
-  identity = _load_identity()
-  if update.bio is not None:
-    identity["bio"] = update.bio.strip()[:MAX_BIO_CHARS]
-  _save_identity(identity)
+  async with _identity_lock():
+    identity = _load_identity(locked=True)
+    if update.bio is not None:
+      identity["bio"] = update.bio.strip()[:MAX_BIO_CHARS]
+      _save_identity(identity)
   status = (
     await _register_with_community_host(identity)
     if identity.get("joined_at") else "not_joined"
@@ -1381,10 +1516,10 @@ async def accept_message_request(
   principal: Principal = Depends(get_principal),
 ):
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   # Acceptance may be the first authenticated federation action on a legacy
   # plaintext request. Create keys now so the accepted peer can verify and
-  # encrypt the owner's reply without requiring a public-directory join.
+  # encrypt the owner's reply after the required Social join.
   _load_identity()
   state = await _set_dm_request_state(app, _request_peer(peer_host), "accepted")
   return {"status": state}
@@ -1397,7 +1532,7 @@ async def decline_message_request(
   principal: Principal = Depends(get_principal),
 ):
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   state = await _set_dm_request_state(app, _request_peer(peer_host), "declined")
   return {"status": state}
 
@@ -1409,7 +1544,7 @@ async def block_message_request(
   principal: Principal = Depends(get_principal),
 ):
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   state = await _set_dm_request_state(app, _request_peer(peer_host), "blocked")
   return {"status": state}
 
@@ -1421,7 +1556,7 @@ async def mark_direct_conversation_read(
   principal: Principal = Depends(get_principal),
 ):
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   changed = await _mark_dm_read(app, _request_peer(peer_host))
   return {"status": "read", "changed": changed}
 
@@ -1436,7 +1571,7 @@ async def direct_message_history(
 ):
   """Read one bounded newest-first slice, returned in display order."""
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   peer = _request_peer(peer_host)
   messages_dir = _conversation_dir(app, peer) / "msgs"
   try:
@@ -1455,7 +1590,7 @@ async def send_message(
 ):
   """Persist one stable DM identity, then make a bounded delivery attempt."""
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   to_host = message.to.strip().lower()
   text = message.text.strip()
   if not _valid_host(to_host):
@@ -1502,7 +1637,7 @@ async def retry_direct_message(
 ):
   """Retry a persisted outgoing message without creating a new identity."""
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   peer = _request_peer(peer_host)
   if not _valid_id(message_id):
     raise HTTPException(status_code=400, detail="Message id is invalid.")
@@ -1522,7 +1657,7 @@ async def publish_post(
 ):
   """Sign a board post and submit it to the community host."""
   require_nondelegated_owner_control(principal)
-  _require_owner_or_common_app(db, principal)
+  _require_member(db, principal)
   text = post.text.strip()
   attachment = _validate_attachment(post.attachment)
   attachments = _validate_attachments(post.attachments)
@@ -1771,7 +1906,7 @@ async def react_to_post(
 
 async def _react_to_post(post_id_value, emoji, db, principal):
   require_nondelegated_owner_control(principal)
-  _require_owner_or_common_app(db, principal)
+  _require_member(db, principal)
   post_id = str(post_id_value).strip()
   if not re.fullmatch(r"[a-f0-9-]{8,64}", post_id):
     raise HTTPException(status_code=400, detail="Post id is invalid.")
@@ -1812,7 +1947,7 @@ async def reply_to_post(
 ):
   """Reply to a community-board post, signed as this instance."""
   require_nondelegated_owner_control(principal)
-  _require_owner_or_common_app(db, principal)
+  _require_member(db, principal)
   post_id = body.post_id.strip()
   if not re.fullmatch(r"[a-f0-9-]{8,64}", post_id):
     raise HTTPException(status_code=400, detail="Post id is invalid.")
@@ -1859,7 +1994,7 @@ async def delete_own_post(
 ):
   """Delete one of the owner's own board posts from the community host."""
   require_nondelegated_owner_control(principal)
-  _require_owner_or_common_app(db, principal)
+  _require_member(db, principal)
   post_id = body.post_id.strip()
   if not re.fullmatch(r"[a-f0-9-]{8,64}", post_id):
     raise HTTPException(status_code=400, detail="Post id is invalid.")
@@ -1909,15 +2044,51 @@ async def _people_payload(
   db: object = None,
   principal: Principal = None,
 ) -> dict:
-  _require_owner_or_common_app(db, principal)
+  _require_member(db, principal)
+  return await _search_community_members(q)
+
+
+async def _search_community_members(q: str) -> dict:
+  """One signed directory read for Social and shared-object invite lookup."""
   host = COMMUNITY_HOST
+  identity = _load_identity()
+  envelope = {
+    "v": 0, "type": "directory_read", "from": _own_host(),
+    "q": q, "sent_at": time.time(),
+  }
+  envelope["sig"] = _sign(envelope, identity["private_key_b64"])
   try:
     response = await federation_request(
-      "GET", _peer_service_url(host, "directory"), params={"q": q},
+      "POST", _peer_service_url(host, "directory/search"), json=envelope,
       timeout_seconds=OUTBOUND_TIMEOUT_S,
     )
     response.raise_for_status()
     return {"host": host, **response.json()}
+  except httpx.HTTPStatusError as exc:
+    if exc.response.status_code == 404:
+      # The shared host is rolled out separately from personal installations.
+      # This old public read is reachable only after the local membership gate;
+      # once the host supports signed reads, it is never used.
+      try:
+        legacy = await federation_request(
+          "GET", _peer_service_url(host, "directory"), params={"q": q},
+          timeout_seconds=OUTBOUND_TIMEOUT_S,
+        )
+        legacy.raise_for_status()
+        return {"host": host, **legacy.json()}
+      except Exception as legacy_exc:
+        raise HTTPException(
+          status_code=502, detail="Community host could not be reached."
+        ) from legacy_exc
+    if exc.response.status_code == 403:
+      raise HTTPException(
+        status_code=403, detail="Join Social again to access People.",
+      ) from exc
+    raise HTTPException(
+      status_code=502, detail="Community host could not be reached."
+    ) from exc
+  except HTTPException:
+    raise
   except Exception as exc:
     raise HTTPException(
       status_code=502, detail="Community host could not be reached."
@@ -1958,8 +2129,8 @@ async def bootstrap_social(
         )
         else "missing"
       )
-    except HTTPException:
-      registration = "unavailable"
+    except HTTPException as exc:
+      registration = "missing" if exc.status_code == 403 else "unavailable"
   return {"me": {**me, "registration": registration}, "feed": feed}
 
 
@@ -1970,7 +2141,7 @@ async def get_peer(
   principal: Principal = Depends(get_principal),
 ):
   """A peer's public actor card, for profile views in the app UI."""
-  _require_owner_or_common_app(db, principal)
+  _require_member(db, principal)
   actor = await _fetch_actor(host.strip().lower())
   return actor
 

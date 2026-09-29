@@ -46,7 +46,7 @@ export default function Messages({
   return (
     <div className={`cn-content cn-screen${creating ? ' has-dialog' : ''}`}>
       <div className="cn-view-heading">
-        <div><h2>Messages</h2><p>Your accepted conversations and requests.</p></div>
+        <div><h2>Chats</h2><p>Your accepted conversations and requests.</p></div>
       </div>
       <div className="cn-message-tabs" role="tablist" aria-label="Message inbox">
         <button type="button" role="tab" aria-selected={!showingRequests}

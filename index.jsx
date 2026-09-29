@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Chat, Globe, Plus, Users } from '@openai/apps-sdk-ui/components/Icon'
+import { Chat, Globe, Users } from '@openai/apps-sdk-ui/components/Icon'
 import { CSS } from './theme.js'
 import * as api from './api.js'
 import Board, { Avatar } from './ui/Board.jsx'
@@ -13,12 +13,12 @@ import { Lightbox } from './ui/Media.jsx'
 import { joinGlobalCommunity, checkGlobalRegistration } from './community.js'
 import {
   accountHandoff, clearParticipationIntent, loadParticipationIntent,
-  participationActionLabel, participationIntentMatches, participationStep,
+  participationIntentMatches, participationStep,
   saveParticipationIntent,
 } from './participation.js'
 import { reconcileFeedPage } from './reconciliation.js'
 
-function ParticipationNotice({ me, state, busy, onJoin, onAccount, onCheck }) {
+function ParticipationNotice({ me, state, busy, onJoin, onCheck }) {
   if (state === 'loading') {
     return null
   }
@@ -34,6 +34,8 @@ function ParticipationNotice({ me, state, busy, onJoin, onAccount, onCheck }) {
       </section>
     )
   }
+
+  if (!me?.joined) return null
 
   if (me?.joined && me?.handle) {
     if (!me.registration) return null
@@ -54,46 +56,24 @@ function ParticipationNotice({ me, state, busy, onJoin, onAccount, onCheck }) {
     )
   }
 
-  const step = participationStep(me)
-  const canJoin = step === 'join'
+  return null
+}
+
+function JoinAccess({ area, me, loading, busy, error, onJoin }) {
   return (
-    <section className="cn-welcome" aria-labelledby="cn-welcome-title">
-      <span className="cn-welcome-mark" aria-hidden="true"><Globe /></span>
-      <div className="cn-welcome-copy">
-        <h2 id="cn-welcome-title">
-          {canJoin ? `Browse as @${me.handle}`
-            : step === 'username' ? 'Choose a username to join' : 'Browse without signing in'}
-        </h2>
-        <p>
-          {canJoin
-            ? 'The board and people directory are public. Join only when you want to post, reply, react or message.'
-            : step === 'username'
-              ? 'People see your username on everything you post, reply or send. Pick one in Möbius · You, then come back to join.'
-              : 'The board and people directory are open. Use Möbius · You only when you want to participate.'}
-        </p>
-        {canJoin && (
-          <span className="cn-welcome-privacy">
-            Joining shares your handle and profile picture. Your name and email stay private.
-          </span>
-        )}
+    <div className="cn-content cn-screen">
+      <div className="cn-empty cn-join-access">
+        <div className="cn-empty-mark" aria-hidden="true">{area === 'Chats' ? <Chat /> : <Users />}</div>
+        <h2 className="cn-empty-title">Join Social to see {area}</h2>
+        <p className="cn-empty-text">Community is open to read. Join to see {area.toLowerCase()} and take part.</p>
+        <button className="cn-btn cn-btn-primary" type="button" onClick={onJoin}
+                disabled={loading || busy}>
+          {loading ? 'Checking account…' : busy ? 'Joining…' : 'Join Social'}
+        </button>
+        {error && <p className="cn-inline-error" role="alert">{error}</p>}
+        {!loading && me?.handle && <p className="cn-join-privacy">Joining shares @{me.handle} and your profile photo, not your name or email.</p>}
       </div>
-      <div className="cn-welcome-actions">
-        {canJoin ? (
-          <button className="cn-btn cn-btn-primary" onClick={onJoin} disabled={busy}>
-            {busy ? 'Joining…' : `Join as @${me.handle}`}
-          </button>
-        ) : (
-          <>
-            <button className="cn-btn cn-btn-ghost" onClick={onAccount}>
-              {participationActionLabel(step)}
-            </button>
-            <button className="cn-btn cn-btn-ghost" onClick={onCheck} disabled={busy}>
-              Check again
-            </button>
-          </>
-        )}
-      </div>
-    </section>
+    </div>
   )
 }
 
@@ -102,11 +82,11 @@ function MainNavigation({ className = '', tab, unread, boardActivity, onSelect }
     <nav className={`cn-nav ${className}`.trim()} aria-label="Main navigation">
       <button className={`cn-nav-item${tab === 'board' ? ' is-active' : ''}`} aria-current={tab === 'board' ? 'page' : undefined} onClick={() => onSelect('board')}>
         {boardActivity && <span className="cn-nav-dot" aria-label="New board activity" />}
-        <Globe aria-hidden="true" /><span>Board</span>
+        <Globe aria-hidden="true" /><span>Community</span>
       </button>
       <button className={`cn-nav-item${tab === 'messages' ? ' is-active' : ''}`} aria-current={tab === 'messages' ? 'page' : undefined} onClick={() => onSelect('messages')}>
         {unread > 0 && <span className="cn-badge">{unread}</span>}
-        <Chat aria-hidden="true" /><span>Messages</span>
+        <Chat aria-hidden="true" /><span>Chats</span>
       </button>
       <button className={`cn-nav-item${tab === 'people' ? ' is-active' : ''}`} aria-current={tab === 'people' ? 'page' : undefined} onClick={() => onSelect('people')}>
         <Users aria-hidden="true" /><span>People</span>
@@ -141,7 +121,6 @@ export default function App({ appId, token }) {
   const [lightbox, setLightbox] = useState(null)
   const [profileRequest, setProfileRequest] = useState(null)
   const [composing, setComposing] = useState(false)
-  const [threadExpanded, setThreadExpanded] = useState(false)
   const [creatingGroup, setCreatingGroup] = useState(false)
   const [participationIntent, setParticipationIntent] = useState(null)
   const [intentState, setIntentState] = useState('loading')
@@ -156,6 +135,7 @@ export default function App({ appId, token }) {
   const meRef = useRef(null)
   meRef.current = me
   const handoffPending = useRef(false)
+  const hasPrivateAccess = Boolean(me?.joined && me?.registration !== 'missing')
 
   function showToast(text, kind) {
     setToast({ text, kind })
@@ -325,18 +305,19 @@ export default function App({ appId, token }) {
       })
       .catch(() => null)
     loadBootstrap()
-    loadConversations()
     loadSavedParticipationIntent()
     const loadDeferred = () => {
       api.getAppIcon(appId)
         .then((blob) => setAppIconUrl(URL.createObjectURL(blob)))
         .catch(() => {})
-      api.searchPeople('', undefined, { background: true })
-        .then((found) => window.mobius?.storage?.set('cache/people.json', {
-          users: found.users,
-          cached_at: Date.now(),
-        }))
-        .catch(() => null)
+      if (meRef.current?.joined && meRef.current?.registration !== 'missing') {
+        api.searchPeople('', undefined, { background: true })
+          .then((found) => window.mobius?.storage?.set('cache/people.json', {
+            users: found.users,
+            cached_at: Date.now(),
+          }))
+          .catch(() => null)
+      }
     }
     const idleId = window.requestIdleCallback
       ? window.requestIdleCallback(loadDeferred, { timeout: 1800 })
@@ -405,8 +386,17 @@ export default function App({ appId, token }) {
   }, [])
 
   useEffect(() => {
-    if (version > 0) loadConversations()
-  }, [version])
+    if (hasPrivateAccess) loadConversations()
+    else {
+      conversationLoad.current += 1
+      setConversations([])
+      setGroups([])
+      setMessagesState('loading')
+      navHandle.current?.close()
+      navHandle.current = null
+      setThread(null)
+    }
+  }, [hasPrivateAccess, version])
 
   // Surface new likes/replies on the owner's own posts as a dot on the Board
   // tab. The community host holds those posts, so the app can't be pushed about
@@ -455,9 +445,11 @@ export default function App({ appId, token }) {
       if (thread) closeThread()
       setTab('board')
     } else if (kind === 'dm') {
+      if (!meRef.current?.joined || meRef.current?.registration === 'missing') { setTab('messages'); return }
       const convo = (await api.listConversations()).find((item) => item.peer === id)
       openThread(id, convo?.peer_handle, api.requestStatus(convo) === 'pending')
     } else if (kind === 'group') {
+      if (!meRef.current?.joined || meRef.current?.registration === 'missing') { setTab('messages'); return }
       openGroup(await api.getGroup(id))
     }
   }
@@ -520,9 +512,13 @@ export default function App({ appId, token }) {
     try {
       await joinGlobalCommunity(api.join)
       const profile = await loadMe()
-      if (!profile) return false
+      if (!profile) {
+        setJoinError('Social couldn’t check your account. Try joining again.')
+        return false
+      }
       await loadFeed()
       if (profile.registration === 'registered') showToast('Welcome to global Social', 'success')
+      else setJoinError('Social couldn’t confirm your membership yet. Try joining again.')
       return profile.registration === 'registered'
     } catch (error) {
       setJoinError(error.message)
@@ -530,6 +526,12 @@ export default function App({ appId, token }) {
     } finally {
       setSaving(false)
     }
+  }
+
+  function beginJoin() {
+    if (meState === 'error' || !me) return loadMe()
+    if (me.registration === 'missing' || participationStep(me) === 'join') return join()
+    openIdentityApp()
   }
 
   async function requestParticipation(intent) {
@@ -574,10 +576,10 @@ export default function App({ appId, token }) {
   const unread =
     activeConversations.reduce((sum, c) => sum + (c.unread || 0), 0) +
     activeGroups.reduce((sum, g) => sum + (g.unread || 0), 0)
-  const canParticipate = participationStep(me) === 'ready'
+  const canParticipate = participationStep(me) === 'ready' && me?.registration !== 'missing'
 
   // ── render ────────────────────────────────────────────────────────────────
-  if (thread) {
+  if (thread && canParticipate) {
     return (
       <div className="cn-root"><style>{CSS}</style>
         {thread.kind === 'group' ? (
@@ -639,14 +641,13 @@ export default function App({ appId, token }) {
       <MainNavigation className="cn-nav-mobile" tab={tab} unread={unread}
                       boardActivity={boardActivity} onSelect={setTab} />
 
-      <div className="cn-scroll">
-        <div className="cn-content">
+      <div className={`cn-scroll${tab === 'board' ? ' is-board' : ''}`}>
+        {tab === 'board' && <div className="cn-content">
           <ParticipationNotice
             me={me}
             state={meState}
             busy={saving}
             onJoin={join}
-            onAccount={openIdentityApp}
             onCheck={() => loadMe()}
           />
           {joinError && <div className="cn-directory-error" role="alert">
@@ -655,7 +656,7 @@ export default function App({ appId, token }) {
           {me?.account_error && !me?.connected && (
             <p className="cn-inline-error" role="status">{me.account_error}</p>
           )}
-        </div>
+        </div>}
         {tab === 'board' && (
           <Board me={me} feed={feed} feedState={feedState} onRefresh={loadFeed}
                  hasEarlier={feedHasEarlier} onLoadEarlier={loadEarlierFeed}
@@ -664,8 +665,8 @@ export default function App({ appId, token }) {
                  participationIntent={participationIntent}
                  intentState={intentState}
                  participationBusy={saving}
+                 onJoin={beginJoin} joinBusy={saving || meState === 'loading'}
                  emojiReactions={Boolean(feedCapabilities.emoji_reactions)}
-                 onThreadOpenChange={setThreadExpanded}
                  onRetryIntent={loadSavedParticipationIntent}
                  onRequestParticipation={requestParticipation}
                  onCompleteParticipation={completeParticipationIntent}
@@ -676,7 +677,7 @@ export default function App({ appId, token }) {
                  onOpenImage={openLightbox} />
         )}
         {tab === 'messages' && (
-          me?.joined && me?.name ? (
+          canParticipate ? (
             <Messages canCreate={canParticipate} me={me} conversations={activeConversations} groups={activeGroups}
                       messageRequests={pendingConversations} groupRequests={pendingGroups}
                       loadState={messagesState} onRetry={loadConversations}
@@ -688,32 +689,19 @@ export default function App({ appId, token }) {
                       onGroupsChanged={openCreatedGroup}
                       showToast={showToast} />
           ) : (
-            <div className="cn-content cn-screen">
-              <div className="cn-empty">
-                <div className="cn-empty-mark" aria-hidden="true"><Chat /></div>
-                <div className="cn-empty-title">Join before you message</div>
-                <p className="cn-empty-text">
-                  You can browse people first. Join Social when you’re ready to start a private conversation.
-                </p>
-                <button className="cn-btn cn-btn-secondary" onClick={() => setTab('people')}>Browse people</button>
-              </div>
-            </div>
+            <JoinAccess area="Chats" me={me} loading={meState === 'loading'}
+                        busy={saving} error={joinError} onJoin={beginJoin} />
           )
         )}
         {tab === 'people' && (
-          <People me={me} canMessage={canParticipate}
+          canParticipate ? <People me={me} canMessage={canParticipate}
                   onMessage={(host, name) => openThread(host, name)} showToast={showToast}
                   requestedProfile={profileRequest}
                   onProfileRequestHandled={() => setProfileRequest(null)} />
+            : <JoinAccess area="People" me={me} loading={meState === 'loading'}
+                          busy={saving} error={joinError} onJoin={beginJoin} />
         )}
       </div>
-
-      {tab === 'board' && !composing && !threadExpanded && (
-        <button className="cn-compose-fab" type="button" onClick={() => setComposing(true)}
-                aria-label={canParticipate ? 'Create post' : 'Write a post to share after joining'}>
-          <Plus aria-hidden="true" />
-        </button>
-      )}
 
       {toast && <div className={`cn-toast${toast.kind ? ` is-${toast.kind}` : ''}`} role="status">{toast.text}</div>}
       <Lightbox image={lightbox} onClose={() => setLightbox(null)} />

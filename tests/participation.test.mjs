@@ -107,12 +107,18 @@ test('a tap before the profile loads is never saved as a sign-up draft', () => {
   assert.ok(body.indexOf('if (!me)') < body.indexOf('onRequestParticipation(intent)'))
 })
 
-test('public board and directory render independently from global-directory membership', () => {
+test('public Community renders before Join while Chats and People show only access gates', () => {
   const source = readFileSync(new URL('../index.jsx', import.meta.url), 'utf8')
   assert.match(source, /loadFeed\(\)\s*loadMe\(\)/)
   assert.doesNotMatch(source, /loadMe\(\)\.then/)
   assert.match(source, /\{tab === 'board' && \(/)
   assert.match(source, /\{tab === 'people' && \(/)
+  assert.match(source, /canParticipate \? <People/)
+  assert.match(source, /<JoinAccess area="People"/)
+  assert.match(source, /<JoinAccess area="Chats"/)
+  assert.match(source, /if \(hasPrivateAccess\) loadConversations\(\)/)
+  assert.match(source, /conversationLoad\.current \+= 1/)
+  assert.match(source, /me\?\.registration !== 'missing'/)
   assert.doesNotMatch(source, /tab === 'board' && !needsJoin/)
   assert.doesNotMatch(source, /tab === 'people' && !needsJoin/)
 })
@@ -132,8 +138,9 @@ test('board replies use the owner route that signs and forwards remote replies',
 test('the UI keeps a final explicit control for publish, reply and react', () => {
   const board = readFileSync(new URL('../ui/Board.jsx', import.meta.url), 'utf8')
   assert.match(board, /async function submitPost/)
-  assert.match(board, /if \(canInteract\) return publish\(\)/)
-  assert.match(board, /onClick=\{submitPost\}/)
+  assert.match(board, /if \(canInteract\) await publish\(\)/)
+  assert.match(board, /\{canInteract \? <form className="cn-board-composer" onSubmit=\{submitPost\}>/)
+  assert.match(board, /className="cn-board-send" type="submit"/)
   assert.match(board, /<form className=.*onSubmit=\{sendReply\}>/)
   assert.match(board, /toggleReaction\(post, emoji\)/)
   assert.match(board, /cn-inline-thread/)

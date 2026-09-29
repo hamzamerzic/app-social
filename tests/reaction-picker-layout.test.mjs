@@ -107,6 +107,10 @@ test('24 counted reactions and the inline picker stay inside a phone viewport', 
       '--disable-gpu',
       '--hide-scrollbars',
       '--window-size=320,1000',
+      // --dump-dom can serialize the parent before the srcdoc frame loads.
+      // Advance the browser's clock so the real layout assertion always sees
+      // the frame's measurement, even on a slower CI runner.
+      '--virtual-time-budget=2000',
       '--dump-dom',
       pathToFileURL(htmlPath).href,
     ], { encoding: 'utf8', timeout: 20_000 })

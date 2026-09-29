@@ -51,6 +51,10 @@ class DirectDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     with (
       patch.object(social_routes, "APP", self.app),
+      patch.object(social_routes, "_load_identity", return_value={
+        "joined_at": 1, "directory_synced": {"handle": "owner"},
+        "private_key_b64": "unused",
+      }),
       patch.object(social_routes, "_fetch_actor", new=peer_discovery),
     ):
       result = await social_routes.send_message(
@@ -94,7 +98,7 @@ class DirectDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     with (
       patch.object(social_routes, "_fetch_actor", new=AsyncMock(return_value={})),
-      patch.object(social_routes, "_load_identity", return_value={"private_key_b64": "unused"}),
+      patch.object(social_routes, "_load_identity", return_value={"private_key_b64": "unused", "joined_at": 1, "directory_synced": {"handle": "owner"}}),
       patch.object(social_routes, "_sign", return_value="signature"),
       patch.object(social_routes, "_post_signed_envelope", new=deliver),
     ):
@@ -128,7 +132,7 @@ class DirectDeliveryTests(unittest.IsolatedAsyncioTestCase):
     with (
       patch.object(social_routes, "APP", self.app),
       patch.object(social_routes, "_fetch_actor", new=AsyncMock(return_value={})),
-      patch.object(social_routes, "_load_identity", return_value={"private_key_b64": "unused"}),
+      patch.object(social_routes, "_load_identity", return_value={"private_key_b64": "unused", "joined_at": 1, "directory_synced": {"handle": "owner"}}),
       patch.object(social_routes, "_sign", return_value="signature"),
       patch.object(social_routes, "_post_signed_envelope", new=delivery),
     ):
@@ -178,7 +182,7 @@ class DirectDeliveryTests(unittest.IsolatedAsyncioTestCase):
     }
     with (
       patch.object(social_routes, "_fetch_actor", new=AsyncMock(return_value=encrypted_actor)),
-      patch.object(social_routes, "_load_identity", return_value={"private_key_b64": "unused"}),
+      patch.object(social_routes, "_load_identity", return_value={"private_key_b64": "unused", "joined_at": 1, "directory_synced": {"handle": "owner"}}),
       patch.object(social_routes, "_seal_dm", return_value={"ciphertext": "sealed"}),
       patch.object(social_routes, "_sign", return_value="signature"),
       patch.object(social_routes, "_post_signed_envelope", new=accepted_then_process_exits),

@@ -45,6 +45,403 @@ def signed(key, body):
 
 
 class SocialServiceTests(unittest.TestCase):
+  def seed_member(self, root):
+    identity = root / "apps" / "7" / "server" / "common" / "identity.json"
+    identity.parent.mkdir(parents=True, exist_ok=True)
+    identity.write_text(json.dumps({
+      "joined_at": 1, "directory_synced": {"handle": "owner", "avatar": ""},
+      "handle": "owner", "private_key_b64": base64.b64encode(b"p" * 32).decode(),
+    }))
+
+  def test_unjoined_owner_cannot_open_people_or_private_chat_routes(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      actor = {"scope": "owner", "delegated": False}
+      for path in (
+        "people", "peer/member.example", "conversations/member.example/messages",
+        "groups/deadbeef/messages",
+      ):
+        with self.subTest(path=path):
+          response = self.call(root, path, actor=actor)
+          self.assertEqual(response["status"], 403)
+          self.assertIn("Join Social", response["body"]["detail"])
+
+  def test_failed_join_keeps_public_actor_key_only_and_avatar_hidden(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      common = root / "apps/7/server/common"
+      common.mkdir(parents=True)
+      (common / "identity.json").write_text(json.dumps({
+        "private_key_b64": base64.b64encode(b"p" * 32).decode(),
+        "enc_private_key_b64": base64.b64encode(b"e" * 32).decode(),
+        "handle": "owner", "bio": "Not published", "joined_at": 1,
+      }))
+      (common / "avatar.png").write_bytes(b"an existing photo")
+      actor = self.call(root, "actor")
+      self.assertEqual(actor["status"], 200)
+      self.assertIn("public_key", actor["body"])
+      self.assertNotIn("handle", actor["body"])
+      self.assertNotIn("bio", actor["body"])
+      self.assertEqual(self.call(root, "avatar")["status"], 404)
+
+  def test_temporary_registration_actor_is_not_cacheable(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      common = root / "apps/7/server/common"
+      common.mkdir(parents=True)
+      (common / "identity.json").write_text(json.dumps({
+        "private_key_b64": base64.b64encode(b"p" * 32).decode(),
+        "enc_private_key_b64": base64.b64encode(b"e" * 32).decode(),
+        "handle": "owner", "joined_at": 1,
+        "registration_public_until": time.time() + 30,
+      }))
+      actor = self.call(root, "actor")
+      self.assertEqual(actor["status"], 200)
+      self.assertEqual(actor["body"]["handle"], "owner")
+      self.assertEqual(actor["headers"]["cache-control"], "no-store")
+
+  def test_legacy_key_migration_keeps_one_identity_across_workers(self):
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import patch
+    with patch.dict(os.environ, {
+      "APP_STORAGE_DIR": "/tmp/social-key-migration-test", "APP_ID": "7",
+      "APP_SLUG": "social", "INSTANCE_DOMAIN": "self.example",
+      "INSTANCE_ORIGIN": "https://self.example",
+    }):
+      import social_routes
+
+    with tempfile.TemporaryDirectory() as directory:
+      path = Path(directory) / "identity.json"
+      original = {
+        "private_key_b64": base64.b64encode(b"p" * 32).decode(),
+        "joined_at": 1, "directory_synced": {"handle": "owner"},
+        "handle": "owner", "name": "Owner",
+      }
+      path.write_text(json.dumps(original))
+      barrier = threading.Barrier(4)
+
+      def load():
+        barrier.wait(timeout=5)
+        return social_routes._load_identity()
+
+      with patch.object(social_routes, "_identity_path", return_value=path):
+        with ThreadPoolExecutor(max_workers=4) as pool:
+          loaded = list(pool.map(lambda _index: load(), range(4)))
+      saved = json.loads(path.read_text())
+      self.assertTrue(saved["enc_private_key_b64"])
+      self.assertEqual({item["enc_private_key_b64"] for item in loaded}, {
+        saved["enc_private_key_b64"],
+      })
+      self.assertEqual(saved["directory_synced"], original["directory_synced"])
+      self.assertEqual(saved["private_key_b64"], original["private_key_b64"])
+
+  def test_join_is_not_reported_complete_until_directory_accepts_it(self):
+    import asyncio
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock, patch
+    with patch.dict(os.environ, {
+      "APP_STORAGE_DIR": "/tmp/social-join-test", "APP_ID": "7", "APP_SLUG": "social",
+    }):
+      from service_runtime import Principal
+      import social_routes
+
+    identity = {"name": "Owner", "handle": "owner", "private_key_b64": "unused"}
+    principal = Principal("owner", None, None)
+
+    @asynccontextmanager
+    async def unlocked():
+      yield
+    with (
+      patch.object(social_routes, "_require_owner_or_common_app"),
+      patch.object(social_routes, "_refresh_profile_cache", new=AsyncMock(
+        return_value={"identity": identity, "profile": {"name": "Owner"}},
+      )),
+      patch.object(social_routes, "_identity_lock", new=unlocked),
+      patch.object(social_routes, "_load_identity", return_value=identity),
+      patch.object(social_routes, "_save_identity"),
+      patch.object(social_routes, "_register_with_community_host", new=AsyncMock(
+        return_value="unreachable",
+      )),
+    ):
+      pending = asyncio.run(social_routes.join_community(db=None, principal=principal))
+    self.assertEqual(pending["status"], "pending")
+    self.assertFalse(social_routes._membership_confirmed(identity))
+
+    async def accepted(record):
+      record["directory_synced"] = {"handle": "owner"}
+      return "registered"
+
+    with (
+      patch.object(social_routes, "_require_owner_or_common_app"),
+      patch.object(social_routes, "_refresh_profile_cache", new=AsyncMock(
+        return_value={"identity": identity, "profile": {"name": "Owner"}},
+      )),
+      patch.object(social_routes, "_identity_lock", new=unlocked),
+      patch.object(social_routes, "_load_identity", return_value=identity),
+      patch.object(social_routes, "_save_identity"),
+      patch.object(social_routes, "_register_with_community_host", new=accepted),
+    ):
+      joined = asyncio.run(social_routes.join_community(db=None, principal=principal))
+    self.assertEqual(joined["status"], "joined")
+    self.assertTrue(social_routes._membership_confirmed(identity))
+
+  def test_registration_exposes_profile_only_during_the_host_handshake(self):
+    import asyncio
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock, patch
+    with patch.dict(os.environ, {
+      "APP_STORAGE_DIR": "/tmp/social-registration-window-test",
+      "APP_ID": "7", "APP_SLUG": "social", "INSTANCE_DOMAIN": "self.example",
+    }):
+      import social_routes
+
+    identity = {"joined_at": 1, "handle": "owner", "private_key_b64": "unused"}
+    seen = []
+
+    @asynccontextmanager
+    async def unlocked():
+      yield
+
+    async def unreachable(*_args, **_kwargs):
+      seen.append(social_routes._profile_public(identity))
+      raise httpx.ConnectError("offline")
+
+    with (
+      patch.object(social_routes, "_identity_lock", new=unlocked),
+      patch.object(social_routes, "_save_identity"),
+      patch.object(social_routes, "_load_identity", side_effect=lambda **_kw: dict(identity)),
+      patch.object(social_routes, "_own_host", return_value="self.example"),
+      patch.object(social_routes, "_sign", return_value="signature"),
+      patch.object(social_routes, "_post_signed_envelope", new=unreachable),
+    ):
+      status = asyncio.run(social_routes._register_with_community_host(identity))
+    self.assertEqual(status, "unreachable")
+    self.assertEqual(seen, [True])
+    self.assertFalse(social_routes._profile_public(identity))
+    self.assertNotIn("registration_public_until", identity)
+
+    with tempfile.TemporaryDirectory() as directory:
+      avatar = Path(directory) / "avatar.png"
+      avatar.write_bytes(b"photo")
+      identity["registration_public_until"] = time.time() + 30
+      with (
+        patch.object(social_routes, "_identity_path", return_value=avatar),
+        patch.object(social_routes, "_avatar_path", return_value=avatar),
+        patch.object(social_routes, "_load_identity", return_value=identity),
+      ):
+        self.assertEqual(social_routes.get_avatar().headers["cache-control"], "no-store")
+      identity["registration_public_until"] = time.time() - 1
+      self.assertFalse(social_routes._profile_public(identity))
+      identity["registration_public_until"] = time.time() + 30
+      identity.pop("joined_at")
+      self.assertFalse(social_routes._profile_public(identity))
+      identity["joined_at"] = 1
+      identity.pop("registration_public_until")
+
+    with (
+      patch.object(social_routes, "_identity_lock", new=unlocked),
+      patch.object(social_routes, "_save_identity"),
+      patch.object(social_routes, "_load_identity", side_effect=lambda **_kw: dict(identity)),
+      patch.object(social_routes, "_own_host", return_value="self.example"),
+      patch.object(social_routes, "_sign", return_value="signature"),
+      patch.object(social_routes, "_post_signed_envelope", new=AsyncMock(
+        return_value=httpx.Response(200, json={"status": "registered", "handle": "owner"}, request=httpx.Request("POST", "https://self.example")),
+      )),
+    ):
+      status = asyncio.run(social_routes._register_with_community_host(identity))
+    self.assertEqual(status, "registered")
+    self.assertTrue(social_routes._profile_public(identity))
+    self.assertNotIn("registration_public_until", identity)
+
+  def test_failed_overlapping_registration_cannot_undo_a_successful_join(self):
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import patch
+    with patch.dict(os.environ, {
+      "APP_STORAGE_DIR": "/tmp/social-overlap-test", "APP_ID": "7", "APP_SLUG": "social",
+      "INSTANCE_DOMAIN": "self.example", "INSTANCE_ORIGIN": "https://self.example",
+    }):
+      import social_routes
+
+    with tempfile.TemporaryDirectory() as directory:
+      path = Path(directory) / "identity.json"
+      identity = {
+        "joined_at": 1, "handle": "owner", "private_key_b64": "unused",
+        "enc_private_key_b64": base64.b64encode(b"e" * 32).decode(),
+      }
+      path.write_text(json.dumps(identity))
+      first_in_host = threading.Event()
+      second_started = threading.Event()
+      release_first = threading.Event()
+      calls = []
+
+      async def host(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+          first_in_host.set()
+          if not release_first.wait(5):
+            raise AssertionError("The overlapping attempt did not start")
+          status = 200
+        else:
+          status = 503
+        return httpx.Response(
+          status, json={"status": "registered", "handle": "owner"},
+          request=httpx.Request("POST", "https://self.example"),
+        )
+
+      def register(snapshot, started=None):
+        if started is not None:
+          started.set()
+        return asyncio.run(social_routes._register_with_community_host(snapshot))
+
+      with (
+        patch.object(social_routes, "_identity_path", return_value=path),
+        patch.object(social_routes, "_own_host", return_value="self.example"),
+        patch.object(social_routes, "_sign", return_value="signature"),
+        patch.object(social_routes, "_post_signed_envelope", new=host),
+        ThreadPoolExecutor(max_workers=2) as pool,
+      ):
+        first = pool.submit(register, dict(identity))
+        self.assertTrue(first_in_host.wait(5))
+        second = pool.submit(register, dict(identity), second_started)
+        self.assertTrue(second_started.wait(5))
+        release_first.set()
+        self.assertEqual(first.result(5), "registered")
+        self.assertEqual(second.result(5), "rejected")
+      saved = json.loads(path.read_text())
+      self.assertEqual(saved["directory_synced"]["handle"], "owner")
+      self.assertNotIn("registration_public_until", saved)
+
+  def test_registration_checks_the_hosts_actual_handle_before_confirming_join(self):
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+    with patch.dict(os.environ, {
+      "APP_STORAGE_DIR": "/tmp/social-registration-ack-test", "APP_ID": "7",
+      "APP_SLUG": "social", "INSTANCE_DOMAIN": "self.example",
+      "INSTANCE_ORIGIN": "https://self.example",
+    }):
+      import social_routes
+
+    with tempfile.TemporaryDirectory() as directory:
+      path = Path(directory) / "identity.json"
+      original = {
+        "joined_at": 1, "handle": "new", "private_key_b64": "unused",
+        "enc_private_key_b64": base64.b64encode(b"e" * 32).decode(),
+      }
+      post_url = "https://self.example/api/app-services/social/directory"
+      get_url = "https://www.mobius.you/api/app-services/social/directory"
+
+      def response(status, body, url=post_url):
+        return httpx.Response(
+          status, json=body,
+          request=httpx.Request("POST" if url == post_url else "GET", url),
+        )
+
+      async def register(ack, legacy=None):
+        path.write_text(json.dumps(original))
+        with (
+          patch.object(social_routes, "_identity_path", return_value=path),
+          patch.object(social_routes, "_own_host", return_value="self.example"),
+          patch.object(social_routes, "_sign", return_value="signature"),
+          patch.object(social_routes, "_post_signed_envelope", new=AsyncMock(
+            return_value=response(200, ack),
+          )),
+          patch.object(social_routes, "federation_request", new=AsyncMock(
+            return_value=response(200, {"users": [
+              {"host": "self.example", "handle": legacy},
+            ]}, get_url),
+          )) as read,
+        ):
+          status = await social_routes._register_with_community_host(dict(original))
+        saved = json.loads(path.read_text())
+        return status, saved, read.await_count
+
+      status, saved, reads = asyncio.run(register(
+        {"status": "registered", "handle": "old"},
+      ))
+      self.assertEqual(status, "verification_failed")
+      self.assertNotIn("directory_synced", saved)
+      self.assertEqual(reads, 0)
+
+      status, saved, reads = asyncio.run(register(
+        {"status": "registered"}, legacy="old",
+      ))
+      self.assertEqual(status, "verification_failed")
+      self.assertNotIn("directory_synced", saved)
+      self.assertEqual(reads, 1)
+
+      status, saved, reads = asyncio.run(register(
+        {"status": "registered"}, legacy="new",
+      ))
+      self.assertEqual(status, "registered")
+      self.assertEqual(saved["directory_synced"]["handle"], "new")
+      self.assertEqual(reads, 1)
+
+      status, saved, reads = asyncio.run(register(
+        {"status": "registered", "handle": "new"},
+      ))
+      self.assertEqual(status, "registered")
+      self.assertEqual(saved["directory_synced"]["handle"], "new")
+      self.assertEqual(reads, 0)
+
+  def test_profile_refresh_waits_for_join_without_freezing_the_event_loop(self):
+    # Run in a bounded child: a blocking flock would freeze the event loop so
+    # even asyncio.wait_for could not stop this regression test.
+    script = r'''
+import asyncio, base64, json, tempfile
+from pathlib import Path
+from unittest.mock import patch
+import httpx
+import social_routes
+
+async def main(path):
+  identity = {
+    "joined_at": 1, "handle": "owner", "private_key_b64": "unused",
+    "enc_private_key_b64": base64.b64encode(b"e" * 32).decode(),
+  }
+  path.write_text(json.dumps(identity))
+  entered = asyncio.Event()
+  release = asyncio.Event()
+
+  async def host(*_args, **_kwargs):
+    entered.set()
+    await release.wait()
+    return httpx.Response(200, json={"status": "registered", "handle": "owner"}, request=httpx.Request("POST", "https://self.example"))
+
+  async def profile():
+    return {"handle": "owner", "display_name": "Updated", "avatar_url": None}
+
+  with (patch.object(social_routes, "_identity_path", return_value=path),
+        patch.object(social_routes, "_own_host", return_value="self.example"),
+        patch.object(social_routes, "_sign", return_value="signature"),
+        patch.object(social_routes, "_post_signed_envelope", new=host),
+        patch.object(social_routes, "owner_profile", new=profile)):
+    joining = asyncio.create_task(social_routes._register_with_community_host(dict(identity)))
+    await entered.wait()
+    refreshing = asyncio.create_task(social_routes._refresh_profile_cache(None, None))
+    await asyncio.sleep(0.05)
+    assert social_routes._profile_public(json.loads(path.read_text()))
+    release.set()
+    status, refreshed = await asyncio.wait_for(asyncio.gather(joining, refreshing), 3)
+    assert status == "registered"
+    assert refreshed["identity"]["name"] == "Updated"
+    saved = json.loads(path.read_text())
+    assert saved["directory_synced"]["handle"] == "owner"
+    assert "registration_public_until" not in saved
+
+with tempfile.TemporaryDirectory() as directory:
+  asyncio.run(main(Path(directory) / "identity.json"))
+'''
+    env = {**os.environ, "INSTANCE_DOMAIN": "self.example", "APP_ID": "7",
+           "APP_SLUG": "social", "APP_STORAGE_DIR": "/tmp/social-identity-race",
+           "INSTANCE_ORIGIN": "https://self.example",
+           "API_BASE_URL": "http://127.0.0.1:9"}
+    result = subprocess.run(
+      [sys.executable, "-c", script], cwd=ROOT, env=env,
+      capture_output=True, text=True, timeout=6,
+    )
+    self.assertEqual(result.returncode, 0, result.stderr)
+
   def test_wire_json_size_matches_the_http_transport(self):
     envelope = {
       "type": "board_post", "text": "Four photos 📸",
@@ -392,6 +789,7 @@ asyncio.run(main())
   def test_read_markers_are_mutated_by_social_without_rewriting_metadata(self):
     with tempfile.TemporaryDirectory() as directory:
       root = Path(directory)
+      self.seed_member(root)
       storage = root / "apps" / "7"
       dm_meta = storage / "conversations" / "peer.example" / "meta.json"
       group_meta = storage / "groups" / "deadbeef" / "meta.json"
@@ -433,6 +831,7 @@ asyncio.run(main())
   def test_message_history_is_bounded_cursor_ordered_and_reconciles_file_writes(self):
     with tempfile.TemporaryDirectory() as directory:
       root = Path(directory)
+      self.seed_member(root)
       storage = root / "apps" / "7"
       messages = storage / "conversations" / "peer.example" / "msgs"
       messages.mkdir(parents=True)
@@ -510,6 +909,7 @@ mirror_message('dm', 'peer.example', json.loads(path.read_text()), path)
   def test_message_history_falls_back_to_json_when_its_index_is_unavailable(self):
     with tempfile.TemporaryDirectory() as directory:
       root = Path(directory)
+      self.seed_member(root)
       storage = root / "apps" / "7"
       messages = storage / "conversations" / "peer.example" / "msgs"
       messages.mkdir(parents=True)
@@ -537,6 +937,7 @@ mirror_message('dm', 'peer.example', json.loads(path.read_text()), path)
   def test_metadata_only_versions_do_not_rescan_unchanged_message_files(self):
     with tempfile.TemporaryDirectory() as directory:
       root = Path(directory)
+      self.seed_member(root)
       storage = root / "apps" / "7"
       conversation = storage / "conversations" / "peer.example"
       messages = conversation / "msgs"
@@ -704,6 +1105,7 @@ mirror_message('dm', 'peer.example', json.loads(path.read_text()), path)
           "enc_private_key_b64": base64.b64encode(b"e" * 32).decode(),
           "enc_public_key_b64": base64.b64encode(b"x" * 32).decode(),
           "handle": "owner", "bio": "Hello", "joined_at": 1,
+          "directory_synced": {"handle": "owner"},
         }))
         actor = self.call(
           root, "actor", api_base_url=f"http://127.0.0.1:{server.server_port}",
@@ -733,7 +1135,7 @@ mirror_message('dm', 'peer.example', json.loads(path.read_text()), path)
     def community(method, url, **kwargs):
       self.assertTrue(url.startswith("https://www.mobius.you/api/app-services/social/"))
       body = (
-        {"users": [{"host": "someone-else.example"}]} if url.endswith("/directory")
+        {"users": [{"host": "someone-else.example"}]} if url.endswith("/directory/search")
         else {"capabilities": {}, "next_cursor": None, "posts": []}
       )
       return httpx.Response(200, json=body, request=httpx.Request(method, url))
@@ -742,6 +1144,11 @@ mirror_message('dm', 'peer.example', json.loads(path.read_text()), path)
     with (
       patch.dict(os.environ, environment),
       patch.object(social_routes, "_require_owner_or_common_app"),
+      patch.object(social_routes, "_load_identity", return_value={
+        "joined_at": 1, "directory_synced": {"handle": "owner"},
+        "private_key_b64": "unused",
+      }),
+      patch.object(social_routes, "_sign", return_value="signature"),
       patch.object(social_routes, "_cached_me_payload", new=AsyncMock(return_value=me)),
       patch.object(social_routes, "federation_request", new=AsyncMock(side_effect=community)),
     ):
@@ -750,6 +1157,60 @@ mirror_message('dm', 'peer.example', json.loads(path.read_text()), path)
     self.assertEqual(result["feed"]["posts"], [])
     self.assertEqual(result["me"]["handle"], "owner")
     self.assertEqual(result["me"]["registration"], "missing")
+
+  def test_joined_people_search_uses_old_host_only_when_signed_route_is_absent(self):
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+    environment = {
+      "APP_ID": "7", "APP_SLUG": "social",
+      "APP_STORAGE_DIR": "/tmp/social-directory-rollout-test",
+      "INSTANCE_DOMAIN": "self.example", "INSTANCE_ORIGIN": "https://self.example",
+      "API_BASE_URL": "http://127.0.0.1:9",
+    }
+    with patch.dict(os.environ, environment):
+      import social_routes
+
+    calls = []
+
+    async def community(method, url, **kwargs):
+      calls.append((method, url, kwargs))
+      status = 404 if method == "POST" else 200
+      body = {} if status == 404 else {"users": [{"host": "alex.example", "handle": "alex"}]}
+      return httpx.Response(status, json=body, request=httpx.Request(method, url))
+
+    with (
+      patch.dict(os.environ, environment),
+      patch.object(social_routes, "_require_member") as require_member,
+      patch.object(social_routes, "_load_identity", return_value={
+        "private_key_b64": "unused", "joined_at": 1,
+        "directory_synced": {"handle": "owner"},
+      }),
+      patch.object(social_routes, "_sign", return_value="signature"),
+      patch.object(social_routes, "federation_request", new=AsyncMock(side_effect=community)),
+    ):
+      result = asyncio.run(social_routes._people_payload("alex", db=None, principal=None))
+    require_member.assert_called_once_with(None, None)
+    self.assertEqual(result["users"][0]["host"], "alex.example")
+    self.assertEqual([call[0] for call in calls], ["POST", "GET"])
+    self.assertTrue(calls[0][1].endswith("/directory/search"))
+    self.assertTrue(calls[1][1].endswith("/directory"))
+    self.assertEqual(calls[1][2]["params"], {"q": "alex"})
+
+    async def denied(method, url, **kwargs):
+      calls.append((method, url, kwargs))
+      return httpx.Response(403, json={}, request=httpx.Request(method, url))
+
+    calls.clear()
+    with (
+      patch.dict(os.environ, environment),
+      patch.object(social_routes, "_load_identity", return_value={"private_key_b64": "unused"}),
+      patch.object(social_routes, "_sign", return_value="signature"),
+      patch.object(social_routes, "federation_request", new=AsyncMock(side_effect=denied)),
+    ):
+      with self.assertRaises(HTTPException) as raised:
+        asyncio.run(social_routes._search_community_members("alex"))
+    self.assertEqual(raised.exception.status_code, 403)
+    self.assertEqual([call[0] for call in calls], ["POST"])
 
   def test_federation_source_has_no_legacy_platform_route(self):
     for name in (

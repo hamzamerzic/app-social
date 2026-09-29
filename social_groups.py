@@ -72,7 +72,8 @@ from social_routes import (
   _load_identity,
   _message_preview,
   _own_host,
-  _require_owner_or_common_app,
+  _joined_for_federation,
+  _require_member,
   _verify_peer_envelope,
   _write_app_attachment,
 )
@@ -500,6 +501,8 @@ async def _notify_group_message(
 @router.post("/inbox")
 async def group_inbox(request: Request, db: object = Depends(get_db)):
   """Verify peer authority before serializing against the group lifecycle."""
+  if not _joined_for_federation():
+    raise HTTPException(status_code=403, detail="Join Social before receiving groups.")
   envelope = await _read_envelope(request)
   if envelope.get("v") != 0:
     raise HTTPException(status_code=400, detail="Unsupported envelope version.")
@@ -745,7 +748,7 @@ async def create_group(
 ):
   """Create a group hosted on this instance and invite its first members."""
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   name = body.name.strip()[:MAX_NAME_CHARS]
   if not name:
     raise HTTPException(status_code=400, detail="Give the group a name.")
@@ -808,7 +811,7 @@ async def mark_group_read(
   principal: Principal = Depends(get_principal),
 ):
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   _validate_gid(gid)
   changed = await _mark_group_read(app, gid)
   return {"status": "read", "changed": changed}
@@ -824,7 +827,7 @@ async def group_message_history(
 ):
   """Read one bounded group-history slice in chronological display order."""
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   _validate_gid(gid)
   messages_dir = _group_dir(app, gid) / "msgs"
   try:
@@ -843,7 +846,7 @@ async def accept_group_invitation(
 ):
   """Join only after the owner explicitly accepts the host's invitation."""
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   _validate_gid(gid)
   identity = _load_identity()
   if not identity.get("joined_at"):
@@ -888,7 +891,7 @@ async def decline_group_invitation(
 ):
   """Dismiss an invitation locally without erasing its retained history."""
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   _validate_gid(gid)
   identity = _load_identity()
   async with _group_lock(gid):
@@ -929,7 +932,7 @@ async def send_group_message(
 ):
   """Send while open; host acceptance serializes with membership and deletion."""
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   _validate_gid(gid)
   text = body.text.strip()
   attachment = _validate_attachment(body.attachment)
@@ -1014,7 +1017,7 @@ async def add_group_member(
 ):
   """Add one deployment, or retry its current roster delivery, without history."""
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   _validate_gid(gid)
   host = body.host.strip().lower()
   if not _valid_host(host):
@@ -1080,7 +1083,7 @@ async def delete_group(
 ):
   """Close the host-owned group durably; never erase a member's local history."""
   require_nondelegated_owner_control(principal)
-  app = _require_owner_or_common_app(db, principal)
+  app = _require_member(db, principal)
   _validate_gid(gid)
   async with _group_lock(gid):
     with _host_group_transaction(gid):
