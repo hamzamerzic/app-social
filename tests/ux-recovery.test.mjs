@@ -157,7 +157,9 @@ test('public board startup is not gated by identity and behaves like a chronolog
   const board = readFileSync(new URL('../ui/Board.jsx', import.meta.url), 'utf8')
   assert.doesNotMatch(app, /if \(meState === 'loading'\) \{\s*return/)
   assert.match(app, /canInteract=\{canParticipate\} accountState=\{meState\}/)
-  assert.match(board, /accountState === 'loading' \? null : <div className="cn-board-join">/)
+  assert.match(board, /canInteract \|\| accountState === 'loading' \? <>/)
+  assert.match(board, /sendDisabled=\{!canInteract \|\|/)
+  assert.match(board, /if \(canInteract\) await publish\(\)/)
   assert.match(app, /storage\?\.get\('cache\/board\.json'\)/)
   assert.match(app, /api\.getBootstrap\(\)/)
   const bootstrap = app.slice(app.indexOf('async function loadBootstrap()'), app.indexOf('const loadEarlierFeed'))
@@ -175,7 +177,7 @@ test('public board startup is not gated by identity and behaves like a chronolog
   assert.match(board, /chronologicalFeed\.map/)
   assert.match(board, /className="cn-board-composer"/)
   assert.match(board, /placeholder="Message everyone…"/)
-  assert.match(board, /sendLabel="Send message"/)
+  assert.match(board, /sendLabel=\{accountState === 'loading' \? 'Checking your account…' : 'Send message'\}/)
   const composer = readFileSync(new URL('../ui/Composer.jsx', import.meta.url), 'utf8')
   assert.match(composer, /<Plus aria-hidden="true" \/>/)
   assert.doesNotMatch(board, /<ImageSquare/)
@@ -295,17 +297,18 @@ test('high-cardinality phone reactions wrap without clipping accessible controls
   assert.match(board, /canInteract \? reactionActionLabel\(reactions\[emoji\], emoji\) : 'Join Social to react'/)
   assert.doesNotMatch(board, /className="cn-reaction-anchor"/)
   assert.match(board, /aria-label=\{!canInteract \? 'Join Social to react'/)
-  assert.match(board, /className="cn-reaction-picker"/)
+  assert.match(board, /className=\{`cn-reaction-picker/)
 })
 
 test('reaction picker width fits every 44 pixel choice without horizontal spill', () => {
   const board = readFileSync(new URL('../ui/ReactionControls.jsx', import.meta.url), 'utf8')
   const theme = readFileSync(new URL('../theme.js', import.meta.url), 'utf8')
   assert.match(theme, /\.cn-reaction-picker \{[\s\S]*width: max-content;/)
-  // It floats over the posts below and opens downward, so a first post's
-  // choices can never sit above the top of the feed.
+  // Below is still the default for a first post; the measured placement
+  // switches upward only when the feed/composer would obscure choices.
   assert.match(theme, /\.cn-reaction-picker \{[^}]*position: absolute;[^}]*top: calc\(100% \+ 6px\);/)
   assert.doesNotMatch(theme, /\.cn-reaction-picker \{[^}]*bottom:/)
+  assert.match(theme, /\.cn-reaction-picker\.is-above \{ top: auto; bottom: calc\(100% \+ 6px\); \}/)
   assert.match(theme, /\.cn-reaction-grid \{ display: grid; grid-template-columns: repeat\(6, 44px\); gap: 3px; \}/)
   assert.match(theme, /\.cn-reaction-grid \{ grid-template-columns: repeat\(5, 44px\); \}/)
   assert.match(theme, /\.cn-reaction-grid \{ grid-template-columns: repeat\(4, 44px\); \}/)

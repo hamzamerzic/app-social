@@ -228,9 +228,8 @@ export const CSS = `
 .cn-reaction-chip .cn-flat-emoji { width: 17px; height: 17px; }
 .cn-reaction-chip b { font: inherit; }
 .cn-add-reaction svg { width: 18px; height: 18px; }
-/* The picker floats just under the action row, over the posts below, so
-   opening it moves nothing. It opens downward: opening upward hid the first
-   post's choices above the top of the feed. */
+/* Float without moving the post. The picker chooses the roomier side when
+   the feed edge or composer would cover its choices. */
 .cn-reaction-picker {
   position: absolute; z-index: 30; left: 0; top: calc(100% + 6px);
   width: max-content; max-width: 100%; padding: 10px;
@@ -238,6 +237,8 @@ export const CSS = `
   box-shadow: 0 12px 32px color-mix(in srgb, #000 38%, transparent);
   animation: cn-reaction-in .16s cubic-bezier(.2,.8,.2,1) both;
 }
+.cn-reaction-picker.is-above { top: auto; bottom: calc(100% + 6px); }
+.cn-reaction-picker.is-bounded { overflow-y: auto; overscroll-behavior: contain; }
 .cn-reactions.is-reply { flex-wrap: wrap; }
 .cn-reactions.is-reply .cn-reaction-picker {
   position: relative; top: auto; left: auto; right: auto;
@@ -1101,7 +1102,7 @@ export const CSS = `
 }
 .cn-composer-pill:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
 .cn-composer-pill.has-children { flex-direction: column; align-items: stretch; border-radius: 22px; }
-.cn-composer-input-line { display: flex; flex: 1; align-items: flex-end; gap: 2px; width: 100%; min-width: 0; }
+.cn-composer-input-line { display: flex; flex: 1; align-items: center; gap: 2px; width: 100%; min-width: 0; }
 .cn-composer-input-line textarea {
   display: block; flex: 1; min-width: 0; min-height: 24px; max-height: min(132px, 35dvh);
   padding: 4px 8px 4px 12px; overflow-y: auto; resize: none;
@@ -1111,7 +1112,7 @@ export const CSS = `
 .cn-composer-input-line textarea:focus-visible { outline: none; }
 .cn-composer-input-line textarea::placeholder { color: var(--muted); }
 .cn-composer-send {
-  width: 40px; height: 40px; flex: 0 0 auto; padding: 0;
+  width: 40px; height: 40px; flex: 0 0 auto; align-self: flex-end; padding: 0;
   display: grid; place-items: center; border: 0; border-radius: 50%;
   background: var(--accent); color: var(--accent-fg); cursor: pointer;
   transition: filter .14s, transform .1s, opacity .14s;
@@ -1129,7 +1130,7 @@ export const CSS = `
   -webkit-backdrop-filter: blur(16px) saturate(140%);
   pointer-events: auto; cursor: pointer;
 }
-.cn-composer-attach svg { width: 22px; height: 22px; }
+.cn-composer-attach svg { width: 24px; height: 24px; }
 .cn-composer-attach:hover { background: var(--surface-2, var(--surface)); }
 .cn-composer-attach:disabled { opacity: .45; cursor: default; }
 .cn-composer-attach:focus-visible,

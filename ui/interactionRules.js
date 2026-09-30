@@ -19,6 +19,15 @@ export function prependedScrollTop(previousTop, previousHeight, nextHeight) {
   return Number(previousTop) + Math.max(0, Number(nextHeight) - Number(previousHeight))
 }
 
+// Prefer below unless it would clip. On a cramped viewport, keep every
+// choice reachable by scrolling the menu rather than moving the post.
+export function reactionPickerPlacement(anchor, menuHeight, viewport, gap = 6) {
+  const below = Math.max(0, viewport.bottom - anchor.bottom - gap)
+  const above = Math.max(0, anchor.top - viewport.top - gap)
+  const side = menuHeight > below && above > below ? 'above' : 'below'
+  return { side, maxHeight: side === 'above' ? above : below }
+}
+
 export function clampLightboxScale(value) {
   const numeric = Number(value)
   if (!Number.isFinite(numeric)) return MIN_LIGHTBOX_SCALE
