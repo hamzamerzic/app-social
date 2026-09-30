@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Chat, Globe, Users } from '@openai/apps-sdk-ui/components/Icon'
 import { CSS } from './theme.js'
 import * as api from './api.js'
@@ -17,6 +17,7 @@ import {
   saveParticipationIntent,
 } from './participation.js'
 import { reconcileFeedPage } from './reconciliation.js'
+import { discoveryExtendsFeed, locateBoardPost, mergeDiscoveredPosts, parseBoardIntent } from './boardNavigation.js'
 
 function ParticipationNotice({ me, state, busy, onJoin, onCheck }) {
   if (state === 'loading') {
@@ -80,16 +81,16 @@ function JoinAccess({ area, me, loading, busy, error, onJoin }) {
 function MainNavigation({ className = '', tab, unread, boardActivity, onSelect }) {
   return (
     <nav className={`cn-nav ${className}`.trim()} aria-label="Main navigation">
-      <button className={`cn-nav-item${tab === 'board' ? ' is-active' : ''}`} aria-current={tab === 'board' ? 'page' : undefined} onClick={() => onSelect('board')}>
+      <button className={`cn-nav-item${tab === 'board' ? ' is-active' : ''}`} aria-label="Community" title="Community" aria-current={tab === 'board' ? 'page' : undefined} onClick={() => onSelect('board')}>
         {boardActivity && <span className="cn-nav-dot" aria-label="New board activity" />}
-        <Globe aria-hidden="true" /><span>Community</span>
+        <Globe aria-hidden="true" /><span className="cn-tab-label">Community</span>
       </button>
-      <button className={`cn-nav-item${tab === 'messages' ? ' is-active' : ''}`} aria-current={tab === 'messages' ? 'page' : undefined} onClick={() => onSelect('messages')}>
+      <button className={`cn-nav-item${tab === 'messages' ? ' is-active' : ''}`} aria-label={unread ? `Chats, ${unread} unread` : 'Chats'} title="Chats" aria-current={tab === 'messages' ? 'page' : undefined} onClick={() => onSelect('messages')}>
         {unread > 0 && <span className="cn-badge">{unread}</span>}
-        <Chat aria-hidden="true" /><span>Chats</span>
+        <Chat aria-hidden="true" /><span className="cn-tab-label">Chats</span>
       </button>
-      <button className={`cn-nav-item${tab === 'people' ? ' is-active' : ''}`} aria-current={tab === 'people' ? 'page' : undefined} onClick={() => onSelect('people')}>
-        <Users aria-hidden="true" /><span>People</span>
+      <button className={`cn-nav-item${tab === 'people' ? ' is-active' : ''}`} aria-label="People" title="People" aria-current={tab === 'people' ? 'page' : undefined} onClick={() => onSelect('people')}>
+        <Users aria-hidden="true" /><span className="cn-tab-label">People</span>
       </button>
     </nav>
   )
@@ -102,6 +103,8 @@ export default function App({ appId, token }) {
   const [meState, setMeState] = useState('loading')
   const [tab, setTab] = useState('board')
   const [feed, setFeed] = useState([])
+  const feedRef = useRef(feed)
+  feedRef.current = feed
   const [feedState, setFeedState] = useState('loading')
   const [feedHasEarlier, setFeedHasEarlier] = useState(false)
   const [feedNextCursor, setFeedNextCursor] = useState(null)
@@ -109,6 +112,25 @@ export default function App({ appId, token }) {
   // stable boundary, while null explicitly means the first page is complete.
   const feedNextCursorRef = useRef(undefined)
   const [feedCapabilities, setFeedCapabilities] = useState({})
+  const [boardTarget, setBoardTarget] = useState(null)
+  const targetRequest = useRef(null)
+  const boardScrollRef = useRef(null)
+  const [composerMount, setComposerMount] = useState(null)
+  // These lists share the board's scroller, not its reading position. Board
+  // owns its latest-post/notification positioning when it mounts again.
+  useLayoutEffect(() => {
+    if (tab !== 'board' && boardScrollRef.current) boardScrollRef.current.scrollTop = 0
+  }, [tab])
+  const finishBoardTarget = useCallback(() => {
+    targetRequest.current?.abort()
+    targetRequest.current = null
+    setBoardTarget(null)
+  }, [])
+
+  function selectTab(next) {
+    if (next !== 'board') finishBoardTarget()
+    setTab(next)
+  }
   const [conversations, setConversations] = useState([])
   const [groups, setGroups] = useState([])
   const [messagesState, setMessagesState] = useState('loading')
@@ -262,6 +284,38 @@ export default function App({ appId, token }) {
     feedNextCursorRef.current = result.next_cursor
     return older.length
   }, [feedNextCursor])
+
+  async function revealBoardTarget(target) {
+    targetRequest.current?.abort()
+    const controller = new AbortController()
+    targetRequest.current = controller
+    const request = { ...target, requestId: crypto.randomUUID(), status: 'loading' }
+    setBoardTarget(request)
+    try {
+      const result = await locateBoardPost(target.postId, api.getFeed, api.BOARD_PAGE_SIZE, { signal: controller.signal })
+      if (targetRequest.current !== controller) return
+      if (!result.post) {
+        setBoardTarget(null)
+        showToast('That post is no longer available. The community is still here.', 'error')
+        return
+      }
+      setFeed(current => mergeDiscoveredPosts(current, result.posts))
+      if (discoveryExtendsFeed(feedRef.current, result.posts)) {
+        setFeedHasEarlier(result.hasEarlier)
+        setFeedNextCursor(result.nextCursor ?? null)
+        feedNextCursorRef.current = result.nextCursor
+      }
+      if (result.capabilities) setFeedCapabilities(result.capabilities)
+      setFeedState('ready')
+      setBoardTarget({ ...request, status: 'ready' })
+    } catch (error) {
+      if (controller.signal.aborted) return
+      setBoardTarget(null)
+      showToast('That post couldn’t be opened. Tap the notification again to retry.', 'error')
+    }
+  }
+
+  useEffect(() => () => targetRequest.current?.abort(), [])
 
   const acceptPublishedPost = useCallback((post) => {
     setFeed((current) => [post, ...current.filter((item) => item.id !== post.id)])
@@ -433,7 +487,7 @@ export default function App({ appId, token }) {
   }, [feed, tab, me, feedState])
 
   // ── shell messages: pane visibility and notification taps ────────────────
-  // A notification tap arrives as an app intent: dm:<host>, group:<gid>, board.
+  // Board activity names the exact post, and optionally the affected reply.
   onShellMessage.current = async ({ type, visible, intent }) => {
     if (type === 'moebius:frame-visibility') {
       setForeground(visible !== false)
@@ -444,19 +498,28 @@ export default function App({ appId, token }) {
     if (kind === 'board') {
       if (thread) closeThread()
       setTab('board')
+      const target = parseBoardIntent(intent)
+      if (target?.postId) revealBoardTarget(target)
+      else {
+        targetRequest.current?.abort()
+        setBoardTarget(null)
+        if (!target) showToast('This community notification couldn’t be opened.', 'error')
+      }
     } else if (kind === 'dm') {
-      if (!meRef.current?.joined || meRef.current?.registration === 'missing') { setTab('messages'); return }
+      selectTab('messages')
+      if (!meRef.current?.joined || meRef.current?.registration === 'missing') return
       const convo = (await api.listConversations()).find((item) => item.peer === id)
       openThread(id, convo?.peer_handle, api.requestStatus(convo) === 'pending')
     } else if (kind === 'group') {
-      if (!meRef.current?.joined || meRef.current?.registration === 'missing') { setTab('messages'); return }
+      selectTab('messages')
+      if (!meRef.current?.joined || meRef.current?.registration === 'missing') return
       openGroup(await api.getGroup(id))
     }
   }
   useEffect(() => {
     const listener = (event) => {
       if (event.source !== window.parent || !event.data) return
-      onShellMessage.current(event.data).catch(() => setTab('messages'))
+      onShellMessage.current(event.data).catch(() => selectTab('messages'))
     }
     window.addEventListener('message', listener)
     return () => window.removeEventListener('message', listener)
@@ -464,14 +527,14 @@ export default function App({ appId, token }) {
 
   // ── thread navigation with a real shell back target ───────────────────────
   function openAnyThread(next) {
+    selectTab('messages')
     navHandle.current?.close()
     let handle = null
     handle = window.mobius?.nav?.open?.('common-thread', {
       onBack: () => { navHandle.current = null; setThread(null); loadConversations() },
-      onForward: () => { navHandle.current = handle; setThread(next) },
+      onForward: () => { selectTab('messages'); navHandle.current = handle; setThread(next) },
     })
     navHandle.current = handle || null
-    setTab('messages')
     setThread(next)
   }
 
@@ -624,7 +687,9 @@ export default function App({ appId, token }) {
           <h1 className="cn-title">Social</h1>
         </div>
         <MainNavigation className="cn-nav-wide" tab={tab} unread={unread}
-                        boardActivity={boardActivity} onSelect={setTab} />
+                        boardActivity={boardActivity} onSelect={selectTab} />
+        <MainNavigation className="cn-nav-mobile" tab={tab} unread={unread}
+                        boardActivity={boardActivity} onSelect={selectTab} />
         {meState === 'loading' ? (
           <div className="cn-header-chip is-loading" aria-hidden="true">
             <span className="cn-header-chip-avatar-skeleton" />
@@ -638,10 +703,7 @@ export default function App({ appId, token }) {
         ) : null}
       </header>
 
-      <MainNavigation className="cn-nav-mobile" tab={tab} unread={unread}
-                      boardActivity={boardActivity} onSelect={setTab} />
-
-      <div className={`cn-scroll${tab === 'board' ? ' is-board' : ''}`}>
+      <div ref={boardScrollRef} className={`cn-scroll${tab === 'board' ? ' is-board' : ''}`}>
         {tab === 'board' && <div className="cn-content">
           <ParticipationNotice
             me={me}
@@ -661,18 +723,21 @@ export default function App({ appId, token }) {
           <Board me={me} feed={feed} feedState={feedState} onRefresh={loadFeed}
                  hasEarlier={feedHasEarlier} onLoadEarlier={loadEarlierFeed}
                  composing={composing} setComposing={setComposing}
-                 canInteract={canParticipate}
+                 canInteract={canParticipate} accountState={meState}
                  participationIntent={participationIntent}
                  intentState={intentState}
                  participationBusy={saving}
                  onJoin={beginJoin} joinBusy={saving || meState === 'loading'}
                  emojiReactions={Boolean(feedCapabilities.emoji_reactions)}
+                 replyReactions={Boolean(feedCapabilities.reply_reactions)}
+                 boardTarget={boardTarget} onTargetHandled={finishBoardTarget}
+                 composerMount={composerMount} scrollRef={boardScrollRef}
                  onRetryIntent={loadSavedParticipationIntent}
                  onRequestParticipation={requestParticipation}
                  onCompleteParticipation={completeParticipationIntent}
                  onDiscardParticipation={discardParticipationIntent}
                  onPostConfirmed={acceptPublishedPost}
-                 onOpenPerson={(host) => { setProfileRequest(host); setTab('people') }} showToast={showToast}
+                 onOpenPerson={(host) => { setProfileRequest(host); selectTab('people') }} showToast={showToast}
                  onMessageUser={(host, name) => openThread(host, name)}
                  onOpenImage={openLightbox} />
         )}
@@ -685,7 +750,7 @@ export default function App({ appId, token }) {
                       onOpenThread={(peer) => openThread(peer)}
                       onOpenMessageRequest={(peer, name) => openThread(peer, name, true)}
                       onOpenGroup={openGroup}
-                      onFindPeople={() => setTab('people')}
+                      onFindPeople={() => selectTab('people')}
                       onGroupsChanged={openCreatedGroup}
                       showToast={showToast} />
           ) : (
@@ -702,6 +767,8 @@ export default function App({ appId, token }) {
                           busy={saving} error={joinError} onJoin={beginJoin} />
         )}
       </div>
+
+      {tab === 'board' && <div ref={setComposerMount} className="cn-board-composer-mount" />}
 
       {toast && <div className={`cn-toast${toast.kind ? ` is-${toast.kind}` : ''}`} role="status">{toast.text}</div>}
       <Lightbox image={lightbox} onClose={() => setLightbox(null)} />

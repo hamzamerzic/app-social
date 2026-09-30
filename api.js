@@ -134,10 +134,10 @@ export const publishPost = (text, attachment, attachments, thumbnails) =>
     }),
   })
 export const BOARD_PAGE_SIZE = 30
-export const getFeed = (before = null, { background = false } = {}) => {
+export const getFeed = (before = null, { background = false, signal } = {}) => {
   const query = new URLSearchParams({ limit: String(BOARD_PAGE_SIZE) })
   if (before !== null && before !== undefined) query.set('before', String(before))
-  return call(`feed?${query}`, { background }).then((result) => {
+  return call(`feed?${query}`, { background, signal }).then((result) => {
     noteBoardAvatarDigests(result?.posts)
     return result
   })
@@ -152,8 +152,10 @@ export const getBoardMedia = (postId, index, { thumbnail = false, mime } = {}) =
   if (!thumbnail && mime) query.set('mime', mime)
   return call(`${path}?${query}`, {}, 'blob')
 }
-export const reactToPost = (postId, emoji) =>
-  call('reaction', { method: 'POST', body: JSON.stringify({ post_id: postId, emoji }) })
+export const reactToPost = (postId, emoji, replyId) =>
+  call('reaction', { method: 'POST', body: JSON.stringify({
+    post_id: postId, emoji, ...(replyId ? { reply_id: replyId } : {}),
+  }) })
 export const deletePost = (postId) =>
   call('delete', { method: 'POST', body: JSON.stringify({ post_id: postId }) })
 export const getReplies = (postId, { background = false } = {}) =>

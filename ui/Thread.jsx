@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  ArrowLeft, ArrowUp, Check, Clock, ImageSquare, Lock, Warning,
+  ArrowLeft, Check, Clock, Lock, Warning,
 } from '@openai/apps-sdk-ui/components/Icon'
 import {
   acceptMessageRequest, blockMessageRequest, clearUnread, clockTime,
@@ -9,7 +9,7 @@ import {
 } from '../api.js'
 import { Avatar } from './Board.jsx'
 import MessageBubble, { ReplyTarget, replyTargetFor } from './MessageBubble.jsx'
-import MessageInput, { keepMessageFocus } from './MessageInput.jsx'
+import Composer, { ComposerAttachmentButton, ComposerFooter } from './Composer.jsx'
 import { prepareImage, SelectedImageStrip } from './Media.jsx'
 import {
   addUnseenMessages, isDefinitePrecommitRejection, reconcileLatestPage,
@@ -415,24 +415,20 @@ export default function Thread({
       </div>
       {requestPending ? (
         <div className="cn-request-quiet" role="status">Accept this request to reply.</div>
-      ) : <div className="cn-compose-shell">
-        <ReplyTarget reply={replyTarget} onDismiss={() => setReplyTarget(null)} />
-        <SelectedImageStrip selected={selectedImage} onRemove={() => setSelectedImage(null)} />
-        <form className="cn-compose-bar" onSubmit={send}>
-          <input ref={fileRef} className="cn-file-input" type="file" accept="image/*"
-                 onChange={chooseImage} tabIndex={-1} aria-hidden="true" />
-          <button className="cn-compose-image" type="button" onClick={() => fileRef.current?.click()}
-                  disabled={sending || processingImage} aria-label="Attach photo">
-            {processingImage ? <span className="cn-spinner" /> : <ImageSquare aria-hidden="true" />}
-          </button>
-          <MessageInput inputRef={inputRef} value={draft} onChange={setDraft}
-                        disabled={processingImage} />
-          <button className="cn-send" type="submit" onMouseDown={keepMessageFocus}
-                  disabled={sending || processingImage || (!draft.trim() && !selectedImage)} aria-label="Send">
-            <ArrowUp />
-          </button>
-        </form>
-      </div>}
+      ) : <ComposerFooter scrollRef={scrollRef}>
+        <input ref={fileRef} className="cn-file-input" type="file" accept="image/*"
+               onChange={chooseImage} tabIndex={-1} aria-hidden="true" />
+        <Composer inputRef={inputRef} value={draft} onChange={setDraft} onSubmit={send}
+                  disabled={processingImage}
+                  sendDisabled={sending || processingImage || (!draft.trim() && !selectedImage)}
+                  attachmentAction={<ComposerAttachmentButton onClick={() => fileRef.current?.click()}
+                    disabled={sending || processingImage} />}>
+          {(replyTarget || selectedImage) && <>
+            <ReplyTarget reply={replyTarget} onDismiss={() => setReplyTarget(null)} />
+            <SelectedImageStrip selected={selectedImage} onRemove={() => setSelectedImage(null)} />
+          </>}
+        </Composer>
+      </ComposerFooter>}
     </div>
   )
 }
