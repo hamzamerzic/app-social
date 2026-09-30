@@ -62,6 +62,39 @@ class _ActorCards:
 
 
 class CommunityHostTests(unittest.TestCase):
+  def test_reply_selections_require_the_viewers_signature_not_a_claimed_host(self):
+    with tempfile.TemporaryDirectory() as data_dir:
+      root = Path(data_dir)
+      member = _peer(root, "member.example")
+      other = _peer(root, "other.example")
+      outsider = _peer(root, "outsider.example")
+      store = common_public.CommonPublicStore(data_dir)
+      store.register("member.example", "member", "")
+      store.register("other.example", "other", "")
+      post_id, reply_id = str(uuid.uuid4()), str(uuid.uuid4())
+      store.store_post({
+        "id": post_id, "host": "author.example", "handle": "author",
+        "text": "hello", "created_at": time.time(), "replies": [],
+      })
+      store.add_reply(post_id, reply_id, "other.example", "other", "reply", time.time())
+      store.toggle_reaction(post_id, "member.example", "🎉", reply_id=reply_id)
+      path = f"/api/common/board/{post_id}/replies"
+      body = {
+        "v": 0, "type": "board_replies", "from": "member.example",
+        "post_id": post_id, "sent_at": time.time(),
+      }
+      with TestClient(community_host.create_app(data_dir)) as client:
+        public = client.get(path, params={"viewer": "member.example"}).json()["replies"][0]
+        self.assertEqual(public["reactions"], [{"emoji": "🎉", "count": 1, "reacted": False}])
+        own = client.post(path, json=_signed(member, body)).json()["replies"][0]
+        self.assertTrue(own["reactions"][0]["reacted"])
+        other_body = {**body, "from": "other.example", "viewer": "member.example"}
+        theirs = client.post(path, json=_signed(other, other_body)).json()["replies"][0]
+        self.assertFalse(theirs["reactions"][0]["reacted"])
+        self.assertEqual(client.post(path, json=_signed(other, body)).status_code, 403)
+        self.assertEqual(client.post(path, json=_signed(outsider, {**body, "from": "outsider.example"})).status_code, 403)
+        self.assertEqual(client.post(path, json=_signed(member, {**body, "post_id": reply_id})).status_code, 400)
+
   def test_board_is_public_but_people_require_signed_membership(self):
     with tempfile.TemporaryDirectory() as data_dir:
       peer = _peer(Path(data_dir), "peer.example")
@@ -182,7 +215,46 @@ class CommunityHostTests(unittest.TestCase):
     relay.assert_called_once_with(
       signing_key, COMMUNITY_HOST, kind="like", author_host="author.example",
       actor_host="liker.example", actor_handle="liker", post_id=post_id,
+      reply_id=None, emoji=None, activity_id=unittest.mock.ANY,
     )
+
+  def test_explicit_post_and_reply_reactions_keep_the_legacy_activity_kind(self):
+    with tempfile.TemporaryDirectory() as data_dir:
+      root = Path(data_dir)
+      author = _peer(root, "author.example")
+      actor = _peer(root, "actor.example")
+      store = common_public.CommonPublicStore(data_dir)
+      store.register("author.example", "author", "")
+      store.register("actor.example", "actor", "")
+      post_id, reply_id = str(uuid.uuid4()), str(uuid.uuid4())
+      relay = AsyncMock()
+      with (patch.object(community_host, "send_board_activity", new=relay),
+            TestClient(community_host.create_app(data_dir)) as client):
+        client.post("/api/common/board", json=_signed(author, {
+          "v": 0, "type": "board_post", "id": post_id, "from": "author.example",
+          "text": "Hello", "sent_at": time.time(),
+        })).raise_for_status()
+        store.add_reply(post_id, reply_id, "author.example", "author", "Reply", time.time())
+        for target in [None, reply_id]:
+          envelope = _signed(actor, {
+            "v": 0, "type": "board_react", "post_id": post_id, "emoji": "🎉",
+            "from": "actor.example", "sent_at": time.time(),
+            **({"reply_id": target} if target else {}),
+          })
+          client.post("/api/common/board/react", json=envelope).raise_for_status()
+          client.post("/api/common/board/react", json=envelope).raise_for_status()
+        for invalid in ["", False, 0, "🏴"]:
+          response = client.post("/api/common/board/react", json=_signed(actor, {
+            "v": 0, "type": "board_react", "post_id": post_id, "reply_id": reply_id,
+            "emoji": invalid, "from": "actor.example", "sent_at": time.time(),
+          }))
+          self.assertEqual(response.status_code, 400)
+      self.assertEqual(relay.await_count, 2)
+      for call in relay.await_args_list:
+        self.assertEqual(call.kwargs["kind"], "like")
+        self.assertEqual(call.kwargs["emoji"], "🎉")
+        self.assertEqual(len(call.kwargs["activity_id"]), 64)
+      self.assertEqual([call.kwargs["reply_id"] for call in relay.await_args_list], [None, reply_id])
 
   def test_activity_notices_verify_against_the_published_key(self):
     private = community_host.new_signing_key()

@@ -99,6 +99,20 @@ export function optimisticReactionChange(post, override, emoji) {
   }
 }
 
+export function reactionKey({ postId, replyId }) {
+  return replyId ? `${postId}:${replyId}` : postId
+}
+
+export function confirmedReactions(result) {
+  return Object.fromEntries(BOARD_REACTION_EMOJIS.map(emoji => [emoji, {
+    count: Math.max(0, Number(result.reaction_counts?.[emoji]
+      ?? (emoji === '❤️' ? result.likes : 0) ?? 0)),
+    reacted: Array.isArray(result.reacted)
+      ? result.reacted.includes(emoji)
+      : emoji === '❤️' && Boolean(result.liked),
+  }]))
+}
+
 export function boardRefreshDelay(lastActivityAt, now = Date.now()) {
   return now - lastActivityAt < ACTIVE_WINDOW_MS ? 2500 : 15000
 }

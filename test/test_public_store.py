@@ -17,6 +17,7 @@ from PIL import Image
 
 from common_protocol import MAX_BOARD_ATTACHMENTS, validate_attachment
 from common_public import (
+  BOARD_REACTION_EMOJIS,
   BOARD_IMAGE_CACHE,
   BOARD_INDEX_NORMALIZATION_VERSION,
   CommonPublicStore,
@@ -35,6 +36,48 @@ def forged_png_header(width=20000, height=20000):
 
 
 class PublicBoardIndexTests(unittest.TestCase):
+  def test_reply_reactions_are_scoped_replay_safe_and_private(self):
+    with tempfile.TemporaryDirectory() as directory:
+      store = CommonPublicStore(directory)
+      store.register("one.example", "one", "")
+      store.register("two.example", "two", "")
+      store.store_post({
+        "id": "post-react", "host": "author.example", "created_at": 1,
+        "text": "hello", "replies": [
+          {"id": "reply-one", "host": "one.example", "created_at": 2, "text": "one"},
+          {"id": "reply-two", "host": "two.example", "created_at": 3, "text": "two"},
+        ],
+      })
+      for emoji in BOARD_REACTION_EMOJIS:
+        result = store.toggle_reaction(
+          "post-react", "viewer.example", emoji, reply_id="reply-one",
+          replay_token=f"add-{emoji}",
+        )
+        self.assertTrue(result["activity"])
+        replay = store.toggle_reaction(
+          "post-react", "viewer.example", emoji, reply_id="reply-one",
+          replay_token=f"add-{emoji}",
+        )
+        self.assertFalse(replay["activity"])
+      self.assertEqual(len(result["reaction_counts"]), len(BOARD_REACTION_EMOJIS))
+      replies = store.get_replies("post-react", "viewer.example")["replies"]
+      self.assertEqual(len(replies[0]["reactions"]), len(BOARD_REACTION_EMOJIS))
+      self.assertTrue(all(item["reacted"] for item in replies[0]["reactions"]))
+      self.assertEqual(replies[1]["reactions"], [])
+      self.assertNotIn("_reaction_replays", replies[0])
+      self.assertEqual(store.read_board(1, None)[0]["reactions"], [])
+      unlike = store.toggle_reaction("post-react", "viewer.example", "🎉", reply_id="reply-one")
+      self.assertFalse(unlike["activity"])
+      self.assertEqual(unlike["author_host"], "one.example")
+      with self.assertRaises(HTTPException) as missing:
+        store.toggle_reaction("post-react", "viewer.example", "🎉", reply_id="unknown-reply")
+      self.assertEqual(missing.exception.status_code, 404)
+      with self.assertRaises(HTTPException) as invalid:
+        store.toggle_reaction("post-react", "viewer.example", "🏴", reply_id="reply-one")
+      self.assertEqual(invalid.exception.status_code, 400)
+      reopened = CommonPublicStore(directory)
+      self.assertEqual(len(reopened.get_replies("post-react")["replies"]), 2)
+
   def _write_cursor_edge_records(self, store):
     records = [
       ("normal-top", {"id": "normal-top", "created_at": 5.0}),

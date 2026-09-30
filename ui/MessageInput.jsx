@@ -15,7 +15,7 @@ export function keepMessageFocus(event) {
 // sends; touch-keyboard Enter and Shift+Enter add a line. IME composition is
 // never interrupted.
 export default function MessageInput({
-  inputRef, value, onChange, disabled, className, maxLength = MAX_MESSAGE_CHARS,
+  inputRef, value, onChange, onFocus, disabled, className, maxLength = MAX_MESSAGE_CHARS,
   maxHeight, placeholder = 'Message', label = placeholder,
 }) {
   useLayoutEffect(() => {
@@ -33,7 +33,7 @@ export default function MessageInput({
 
   return (
     <textarea ref={inputRef} className={className} rows={1} value={value} maxLength={maxLength}
-              onChange={(event) => onChange(event.target.value)} onKeyDown={onKeyDown}
+              onChange={(event) => onChange(event.target.value)} onFocus={onFocus} onKeyDown={onKeyDown}
               disabled={disabled} placeholder={placeholder} autoComplete="off" aria-label={label} />
   )
 }

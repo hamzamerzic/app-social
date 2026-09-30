@@ -1,14 +1,14 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import {
-  ArrowUp, Chat, EmojiAdd, Heart, Paperclip, Trash, X,
+  Chat, Trash, X,
 } from '@openai/apps-sdk-ui/components/Icon'
 import {
   avatarHue, deletePost, getPeer, getReplies, initials,
-  postDateTime, postReply, publishPost, reactToPost, timeAgo,
+  postDateTime, postReply, publishPost, timeAgo,
 } from '../api.js'
 import {
-  BOARD_REACTION_EMOJIS, boardRefreshDelay, optimisticReactionChange,
-  reactionActionLabel, reactionState, reconcileReplies, replyActionLabel,
+  boardRefreshDelay, reactionKey, reconcileReplies, replyActionLabel,
   threadRefreshDelay,
 } from '../reconciliation.js'
 import { useModalFocus } from './modalFocus.js'
@@ -18,9 +18,9 @@ import { membershipDuration } from '../profile.js'
 import {
   cachedAvatar, cachedAvatarUrl, discardAvatar, subscribeAvatar,
 } from '../avatarCache.js'
-import { EMOJI_ART } from '../emoji_art.js'
+import ReactionControls, { useBoardReactions } from './ReactionControls.jsx'
 import { boardPostFitsWireLimit } from '../board_payload.js'
-import MessageInput from './MessageInput.jsx'
+import Composer, { ComposerAttachmentButton, ComposerFooter } from './Composer.jsx'
 import { prependedScrollTop } from './interactionRules.js'
 
 const MAX_POST_IMAGES = 4
@@ -83,10 +83,6 @@ function cachedReplies(postId, { force = false, background = false } = {}) {
 function repliesMatchCount(post) {
   const replies = replyCache.get(String(post.id))?.result?.replies
   return Array.isArray(replies) && replies.length === Number(post.reply_count || 0)
-}
-
-function FlatEmoji({ emoji }) {
-  return <img className="cn-flat-emoji" src={EMOJI_ART[emoji]} alt="" aria-hidden="true" draggable="false" />
 }
 
 function Avatar({ name, host, size, remote = false, lazy = false, onOpen = null }) {
@@ -252,9 +248,11 @@ function ProfilePreview({ host, seed, onClose, onViewProfile, onMessage, canMess
 export default function Board({
   me, feed, feedState, onRefresh, onOpenPerson, onMessageUser, showToast, onOpenImage,
   hasEarlier, onLoadEarlier,
-  composing, setComposing, canInteract, participationIntent, intentState,
+  composing, setComposing, canInteract, accountState, participationIntent, intentState,
   participationBusy, onJoin, joinBusy, onRetryIntent, onRequestParticipation,
-  onCompleteParticipation, onDiscardParticipation, onPostConfirmed, emojiReactions = false,
+  onCompleteParticipation, onDiscardParticipation, onPostConfirmed, emojiReactions = false, replyReactions = false,
+  boardTarget, onTargetHandled,
+  composerMount, scrollRef,
 }) {
   const [draft, setDraft] = useState('')
   const [posting, setPosting] = useState(false)
@@ -262,7 +260,6 @@ export default function Board({
   const [deleteTarget, setDeleteTarget] = useState(null)
   const [hiddenIds, setHiddenIds] = useState(() => new Set())
   const [selectedImages, setSelectedImages] = useState([])
-  const [reactionOverrides, setReactionOverrides] = useState({})
   const [reactionPickerFor, setReactionPickerFor] = useState(null)
   const [previewPost, setPreviewPost] = useState(null)
   const [replyPost, setReplyPost] = useState(null)
@@ -271,12 +268,14 @@ export default function Board({
   const [replyError, setReplyError] = useState('')
   const [replyDraft, setReplyDraft] = useState('')
   const [replySending, setReplySending] = useState(false)
+  const [notificationReveal, setNotificationReveal] = useState(null)
+  const openedTarget = useRef(null)
+  const replyDrafts = useRef(new Map())
   const [handoffBusy, setHandoffBusy] = useState(false)
   const [loadingEarlier, setLoadingEarlier] = useState(false)
   const [earlierError, setEarlierError] = useState('')
   const replyRequest = useRef(0)
   const replySendingRef = useRef(false)
-  const reactionPickerRef = useRef(null)
   // Start relaxed: the launch just delivered the feed, and every early poll
   // would queue ahead of avatars and history on the single service lane.
   const lastActivityAt = useRef(0)
@@ -287,6 +286,7 @@ export default function Board({
   const bottomMarkerRef = useRef(null)
   const stickToBottom = useRef(true)
   const initialScrollDone = useRef(false)
+  const threadAnchor = useRef(null)
   const deleteRef = useModalFocus(
     Boolean(deleteTarget),
     () => setDeleteTarget(null),
@@ -316,6 +316,7 @@ export default function Board({
 
   useEffect(() => {
     if (feedState !== 'ready') return undefined
+    if (boardTarget || replyPost) return undefined
     const firstReadyScroll = !initialScrollDone.current
     if (!firstReadyScroll && !stickToBottom.current) return undefined
     const frame = requestAnimationFrame(() => {
@@ -326,20 +327,70 @@ export default function Board({
       stickToBottom.current = true
     })
     return () => cancelAnimationFrame(frame)
-  }, [feedState, feed.length, pending?.id])
+  }, [feedState, feed.length, pending?.id, boardTarget, replyPost?.id])
+
+  // A thread swap can remove a tall section above the tapped post. Keep that
+  // post in place before paint; while replies load, don't let native anchoring
+  // choose a different row below it. Notification navigation owns its own scroll.
+  useLayoutEffect(() => {
+    const scroller = scrollRef?.current
+    if (!scroller) return
+    const previousAnchor = scroller.style.overflowAnchor
+    if (replyPost) scroller.style.overflowAnchor = 'none'
+    const anchor = threadAnchor.current
+    threadAnchor.current = null
+    const post = anchor && document.getElementById(`cn-post-${anchor.id}`)
+    if (post) scroller.scrollTop += post.getBoundingClientRect().top - anchor.top
+    return () => { scroller.style.overflowAnchor = previousAnchor }
+  }, [replyPost?.id, scrollRef])
+
+  function keepPostPosition(post) {
+    const element = post && document.getElementById(`cn-post-${post.id}`)
+    if (element) threadAnchor.current = { id: post.id, top: element.getBoundingClientRect().top }
+    initialScrollDone.current = true
+    stickToBottom.current = false
+  }
 
   useEffect(() => {
-    if (!reactionPickerFor) return undefined
+    if (!replyPost) return
+    replyDrafts.current.set(replyPost.id, replyDraft)
+    while (replyDrafts.current.size > REPLY_CACHE_LIMIT) {
+      replyDrafts.current.delete(replyDrafts.current.keys().next().value)
+    }
+  }, [replyPost?.id, replyDraft])
+
+  useEffect(() => {
+    if (boardTarget?.status !== 'ready' || openedTarget.current === boardTarget.requestId) return
+    const post = feed.find(item => item.id === boardTarget.postId)
+    if (!post) return
+    openedTarget.current = boardTarget.requestId
+    initialScrollDone.current = true
+    stickToBottom.current = false
+    setNotificationReveal(boardTarget)
+    setReplyPost(post)
+    setReplies([])
+    setReplyDraft(replyDrafts.current.get(post.id) || '')
+    setReactionPickerFor(null)
+    loadReplies(post, { force: true })
+  }, [boardTarget, feed])
+
+  useEffect(() => {
+    if (!notificationReveal || !['ready', 'error'].includes(replyState)) return undefined
+    const target = notificationReveal
     const frame = requestAnimationFrame(() => {
-      reactionPickerRef.current?.querySelector('button')?.focus()
+      let element = target.replyId && replyState === 'ready'
+        ? document.getElementById(`cn-reply-${target.replyId}`) : null
+      if (target.replyId && replyState === 'ready' && !element) {
+        showToast('That reply is no longer available. Here’s the original post.', 'error')
+      }
+      element ||= document.getElementById(`cn-post-${target.postId}`)
+      element?.scrollIntoView({ block: 'center' })
+      element?.focus({ preventScroll: true })
+      setNotificationReveal(null)
+      onTargetHandled?.()
     })
     return () => cancelAnimationFrame(frame)
-  }, [reactionPickerFor])
-
-  function dismissReactionPicker(postId) {
-    setReactionPickerFor(null)
-    requestAnimationFrame(() => document.getElementById(`cn-react-${postId}`)?.focus())
-  }
+  }, [notificationReveal, replyState, replies, onTargetHandled])
 
   function countFor(post) {
     const count = Number(
@@ -412,19 +463,27 @@ export default function Board({
       closeReplies()
       return
     }
+    if (replyPost?.id !== post.id) keepPostPosition(post)
     markActivity()
+    if (notificationReveal) {
+      setNotificationReveal(null)
+      onTargetHandled?.()
+    }
     setReactionPickerFor(null)
     setPreviewPost(null)
     const cached = replyCache.get(String(post.id))?.result
     setReplyPost(post)
     setReplies(cached?.replies || [])
     setReplyState(cached ? 'ready' : 'idle')
-    setReplyDraft(restoredDraft)
+    setReplyDraft(restoredDraft || replyDrafts.current.get(post.id) || '')
     loadReplies(post, { background: Boolean(cached) })
   }
 
   function closeReplies() {
+    keepPostPosition(replyPost)
     replyRequest.current += 1
+    setNotificationReveal(null)
+    onTargetHandled?.()
     setReplyPost(null)
     setReplyState('idle')
     setReplyError('')
@@ -553,9 +612,9 @@ export default function Board({
     setReplies((prior) => [...prior, optimistic])
     setReplyDraft('')
     try {
-      await postReply(post.id, text)
+      const receipt = await postReply(post.id, text)
       setReplies((prior) => prior.map((reply) => (
-        reply.id === localId ? { ...reply, pending: false } : reply
+        reply.id === localId ? { ...reply, id: receipt.id || localId, pending: false } : reply
       )))
       await loadReplies(post, { background: true, force: true })
       window.mobius?.signal?.('item_created', { type: 'board_reply' })
@@ -573,41 +632,24 @@ export default function Board({
     }
   }
 
-  async function toggleReaction(post, emoji) {
-    const completedIntent = createParticipationIntent('like', {
-      postId: post.id, emoji,
-    })
-    markActivity()
-    const { current, next } = optimisticReactionChange(
-      post, reactionOverrides[post.id], emoji,
-    )
-    setReactionPickerFor(null)
-    setReactionOverrides((prior) => ({ ...prior, [post.id]: next }))
-    try {
-      const result = await reactToPost(post.id, emoji)
-      const confirmed = Object.fromEntries(BOARD_REACTION_EMOJIS.map((item) => [item, {
-        count: Number(result.reaction_counts?.[item]
-          ?? (item === '❤️' ? result.likes : 0) ?? 0),
-        reacted: Array.isArray(result.reacted)
-          ? result.reacted.includes(item)
-          : item === '❤️' && Boolean(result.liked),
-      }]))
-      setReactionOverrides((prior) => ({
-        ...prior, [post.id]: confirmed,
+  const { overrides: reactionOverrides, pending: reactionPending, toggle: toggleItemReaction } = useBoardReactions({
+    refreshTarget: async (target) => {
+      if (!target.replyId) return onRefresh(true)
+      if (replyPost?.id !== target.postId) return false
+      return loadReplies(replyPost, { background: true, force: true })
+    },
+    onError: (error) => showToast(error.message, 'error'),
+    onSettled: (target, emoji) => {
+      if (!target.replyId) onCompleteParticipation?.(createParticipationIntent('like', {
+        postId: target.postId, emoji,
       }))
-      const refreshed = await onRefresh(true)
-      if (refreshed) {
-        setReactionOverrides((prior) => {
-          const nextOverrides = { ...prior }
-          delete nextOverrides[post.id]
-          return nextOverrides
-        })
-      }
-      onCompleteParticipation?.(completedIntent)
-    } catch (error) {
-      setReactionOverrides((prior) => ({ ...prior, [post.id]: current }))
-      showToast(error.message, 'error')
-    }
+    },
+  })
+
+  function toggleReaction(item, emoji, target = { postId: item.id }) {
+    markActivity()
+    setReactionPickerFor(null)
+    return toggleItemReaction(item, emoji, target)
   }
 
   async function continueParticipation(kind, values) {
@@ -670,7 +712,7 @@ export default function Board({
       openReplies(post, intent.text || '')
       return
     }
-    setReactionPickerFor(post.id)
+    setReactionPickerFor(reactionKey({ postId: post.id }))
     const button = document.getElementById(`cn-react-${post.id}`)
     button?.scrollIntoView?.({ block: 'center', behavior: 'smooth' })
     button?.focus?.()
@@ -863,6 +905,7 @@ export default function Board({
 
   return (
     <div className="cn-content cn-screen cn-board-chat">
+      {boardTarget?.status === 'loading' && <p className="cn-intent-status" role="status">Opening the community conversation…</p>}
       {intentState === 'loading' && (
         <p className="cn-intent-status" role="status">Checking for a saved draft…</p>
       )}
@@ -937,17 +980,13 @@ export default function Board({
       {earlierError && <p className="cn-inline-error" role="status">{earlierError}</p>}
       <div className="cn-feed">
         {chronologicalFeed.map((post) => {
-          const reactions = reactionState(post, reactionOverrides[post.id])
-          const visibleReactions = BOARD_REACTION_EMOJIS.filter((emoji) => (
-            reactions[emoji].count > 0 || reactions[emoji].reacted
-          ))
           const replyCount = countFor(post)
           const threadOpen = replyPost?.id === post.id
           const togglePreview = canInteract
             ? () => setPreviewPost(previewPost?.id === post.id ? null : { id: post.id, host: post.host })
             : null
           return (
-            <article className={`cn-post${threadOpen ? ' has-thread' : ''}${me?.host && post.host === me.host ? ' is-mine' : ''}`} key={post.id}
+            <article id={`cn-post-${post.id}`} tabIndex={-1} className={`cn-post${threadOpen ? ' has-thread' : ''}${me?.host && post.host === me.host ? ' is-mine' : ''}`} key={post.id}
                      onClick={(event) => {
                        if (!event.target.closest('button, input, textarea, a, .cn-avatar')) openReplies(post)
                      }}>
@@ -1007,69 +1046,15 @@ export default function Board({
                   )}
                   <span>{replyActionLabel(replyCount)}</span>
                 </button>
-                <div className="cn-reactions"
-                     aria-label="Post reactions">
-                  {visibleReactions.map((emoji) => (
-                    <button key={emoji} id={!emojiReactions && emoji === '❤️' ? `cn-react-${post.id}` : undefined}
-                            className={`cn-reaction-chip${reactions[emoji].reacted ? ' is-reacted' : ''}`}
-                            onClick={() => canInteract
-                              ? toggleReaction(post, emoji)
-                              : onJoin()}
-                            disabled={handoffBusy || participationBusy}
-                            aria-label={canInteract ? reactionActionLabel(reactions[emoji], emoji) : 'Join Social to react'}>
-                      <span className="cn-reaction-visual">
-                        <FlatEmoji emoji={emoji} />
-                        {reactions[emoji].count > 0 && <b>{reactions[emoji].count}</b>}
-                      </span>
-                    </button>
-                  ))}
-                  {(emojiReactions || visibleReactions.length === 0) && (
-                    <button id={`cn-react-${post.id}`} className="cn-react cn-add-reaction"
-                            onClick={() => !canInteract ? onJoin() : emojiReactions
-                              ? setReactionPickerFor(reactionPickerFor === post.id ? null : post.id)
-                              : toggleReaction(post, '❤️')}
-                            disabled={handoffBusy || participationBusy}
-                            aria-expanded={emojiReactions ? reactionPickerFor === post.id : undefined}
-                            aria-label={!canInteract ? 'Join Social to react' : emojiReactions ? 'Add reaction' : 'Like'}>
-                      {emojiReactions ? <EmojiAdd aria-hidden="true" /> : <Heart aria-hidden="true" />}
-                    </button>
-                  )}
-                  {emojiReactions && reactionPickerFor === post.id && (
-                    <div ref={reactionPickerRef} className="cn-reaction-picker" role="group"
-                         aria-label="Choose a reaction"
-                         onKeyDown={(event) => {
-                           if (event.key === 'Escape') {
-                             event.preventDefault()
-                             dismissReactionPicker(post.id)
-                           }
-                         }}>
-                      <span className="cn-reaction-picker-title">Choose a reaction</span>
-                      <div className="cn-reaction-grid">
-                        {BOARD_REACTION_EMOJIS.map((emoji) => (
-                          <button key={emoji} type="button"
-                                  className={reactions[emoji].reacted ? 'is-reacted' : ''}
-                                  onClick={() => {
-                                    if (canInteract) toggleReaction(post, emoji)
-                                    else onJoin()
-                                    dismissReactionPicker(post.id)
-                                  }}
-                                  aria-pressed={reactions[emoji].reacted}
-                                  aria-label={`${reactions[emoji].reacted ? 'Remove' : 'Add'} ${emoji} reaction`}>
-                            <FlatEmoji emoji={emoji} />
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
+                <ReactionControls item={post} target={{ postId: post.id }}
+                  override={reactionOverrides[post.id]} emojiReactions={emojiReactions}
+                  canInteract={canInteract} disabled={handoffBusy || participationBusy || reactionPending[post.id]}
+                  pickerFor={reactionPickerFor} setPickerFor={setReactionPickerFor}
+                  onReact={(emoji) => toggleReaction(post, emoji)} onJoin={onJoin} />
                 </div>
                 {threadOpen && (
                   <section className="cn-inline-thread" id={`cn-thread-${post.id}`}
                            aria-label="Replies" onClick={(event) => event.stopPropagation()}>
-                    <div className="cn-inline-thread-head">
-                      <strong>{replyCount === 0 ? 'Start the conversation' : `${replyCount} ${replyCount === 1 ? 'reply' : 'replies'}`}</strong>
-                      <button type="button" onClick={closeReplies}>Hide</button>
-                    </div>
                     <div className="cn-inline-replies" aria-live="polite">
                       {replyState === 'loading' && <div className="cn-thread-loading" role="status">Loading replies…</div>}
                       {replyState === 'error' && (
@@ -1082,7 +1067,7 @@ export default function Board({
                         <p className="cn-reply-empty">No replies yet.</p>
                       )}
                       {replies.map((reply) => (
-                        <article className={`cn-reply-row${reply.pending ? ' is-pending' : ''}`} key={reply.id}>
+                        <article id={`cn-reply-${reply.id}`} tabIndex={-1} className={`cn-reply-row${reply.pending ? ' is-pending' : ''}`} key={reply.id}>
                           <Avatar name={reply.handle} host={reply.host} size="small" remote />
                           <div className="cn-reply-copy">
                             <div className="cn-reply-meta">
@@ -1090,25 +1075,24 @@ export default function Board({
                               <span className="cn-time">{reply.pending ? 'Sending…' : timeAgo(reply.created_at)}</span>
                             </div>
                             <RichText text={reply.text} />
+                            {replyReactions && !reply.pending && !reply.id.startsWith('local-') && <ReactionControls item={reply}
+                              target={{ postId: post.id, replyId: reply.id }}
+                              override={reactionOverrides[reactionKey({ postId: post.id, replyId: reply.id })]}
+                              emojiReactions canInteract={canInteract}
+                              disabled={handoffBusy || participationBusy || reactionPending[reactionKey({ postId: post.id, replyId: reply.id })]}
+                              pickerFor={reactionPickerFor} setPickerFor={setReactionPickerFor}
+                              onReact={(emoji) => toggleReaction(reply, emoji, { postId: post.id, replyId: reply.id })}
+                              onJoin={onJoin} />}
                           </div>
                         </article>
                       ))}
                     </div>
-                    {canInteract ? <form className="cn-reply-composer" onSubmit={sendReply}>
-                      <div className="cn-social-pill">
-                        <div className="cn-social-input-line">
-                          <MessageInput inputRef={replyInputRef} className="cn-reply-input"
-                                        value={replyDraft} onChange={setReplyDraft} maxLength={1000} maxHeight={132}
-                                        placeholder="Post your reply"
-                                        disabled={replySending || handoffBusy || participationBusy} />
-                          <button className="cn-reply-send"
-                                  type="submit" disabled={replySending || handoffBusy || participationBusy || !replyDraft.trim()}
-                                  aria-label="Send reply">
-                            <ArrowUp aria-hidden="true" />
-                          </button>
-                        </div>
-                      </div>
-                    </form> : <button className="cn-btn cn-btn-primary cn-reply-join" type="button"
+                    {canInteract ? <Composer className="cn-reply-composer" onSubmit={sendReply}
+                      inputRef={replyInputRef} value={replyDraft} onChange={setReplyDraft}
+                      maxLength={1000} placeholder="Post your reply" label="Post your reply"
+                      disabled={replySending || handoffBusy || participationBusy}
+                      sendDisabled={replySending || handoffBusy || participationBusy || !replyDraft.trim()}
+                      sendLabel="Send reply" /> : <button className="cn-btn cn-btn-primary cn-reply-join" type="button"
                                       onClick={onJoin} disabled={joinBusy}>Join Social to reply</button>}
                   </section>
                 )}
@@ -1151,36 +1135,27 @@ export default function Board({
         )}
       </div>
       <div ref={bottomMarkerRef} className="cn-board-bottom" aria-hidden="true" />
-      {canInteract ? <form className="cn-board-composer" onSubmit={submitPost}>
-        <div className="cn-social-input-row">
+      {composerMount && createPortal(<ComposerFooter scrollRef={scrollRef} className="cn-board-footer">
+        {canInteract ? <>
           <input ref={fileRef} className="cn-file-input" type="file" accept="image/*" multiple
                  onChange={chooseImage} tabIndex={-1} aria-hidden="true" />
-          <button className="cn-compose-image" type="button" onClick={() => fileRef.current?.click()}
-                  disabled={posting || selectedImages.length >= MAX_POST_IMAGES}
-                  aria-label="Attach photo"
-                  title={selectedImages.length >= MAX_POST_IMAGES ? `Up to ${MAX_POST_IMAGES} images` : 'Attach photo'}>
-            <Paperclip aria-hidden="true" />
-          </button>
-          <div className={`cn-social-pill${selectedImages.length ? ' is-with-attachments' : ''}`}>
-            <SelectedImagesStrip selected={selectedImages} onRemove={removeImage} />
-            <div className="cn-social-input-line">
-              <MessageInput inputRef={composerInputRef} value={draft} onChange={setDraft}
-                            maxLength={4000} maxHeight={132} placeholder="Message everyone…"
-                            label="Message everyone"
-                            disabled={posting || handoffBusy || participationBusy} />
-              <button className="cn-board-send" type="submit"
-                      disabled={posting || handoffBusy || participationBusy || (!draft.trim() && !selectedImages.length)}
-                      aria-label="Send message">
-                <ArrowUp aria-hidden="true" />
-              </button>
-            </div>
-          </div>
-        </div>
-      </form> : <div className="cn-board-composer cn-board-join">
-        <button className="cn-btn cn-btn-primary" type="button" onClick={onJoin}
-                disabled={joinBusy}>Join Social to message</button>
-        <p className="cn-composer-disclosure">Community is open to read. Join to message and open Chats and People.</p>
-      </div>}
+          <Composer className="cn-board-composer" onSubmit={submitPost}
+            inputRef={composerInputRef} value={draft} onChange={setDraft}
+            maxLength={4000} placeholder="Message everyone…" label="Message everyone"
+            disabled={posting || handoffBusy || participationBusy}
+            sendDisabled={posting || handoffBusy || participationBusy || (!draft.trim() && !selectedImages.length)}
+            sendLabel="Send message"
+            attachmentAction={<ComposerAttachmentButton onClick={() => fileRef.current?.click()}
+              disabled={posting || selectedImages.length >= MAX_POST_IMAGES}
+              label={selectedImages.length >= MAX_POST_IMAGES ? `Up to ${MAX_POST_IMAGES} images` : 'Attach photo'} />}>
+            {selectedImages.length > 0 && <SelectedImagesStrip selected={selectedImages} onRemove={removeImage} />}
+          </Composer>
+        </> : accountState === 'loading' ? null : <div className="cn-board-join">
+          <button className="cn-btn cn-btn-primary" type="button" onClick={onJoin}
+                  disabled={joinBusy}>Join Social to message</button>
+          <p className="cn-composer-disclosure">Community is open to read. Join to message and open Chats and People.</p>
+        </div>}
+      </ComposerFooter>, composerMount)}
 
       {deleteTarget && (
         <div className="cn-scrim" role="dialog" aria-modal="true" aria-label="Delete message"

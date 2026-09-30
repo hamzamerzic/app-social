@@ -59,7 +59,10 @@
     "ui/MessageInput.jsx",
     "ui/interactionRules.js",
     "ui/modalFocus.js",
-    "ui/GroupDetails.jsx"
+    "ui/GroupDetails.jsx",
+    "boardNavigation.js",
+    "ui/Composer.jsx",
+    "ui/ReactionControls.jsx"
   ],
   "store": {
     "tagline": "Your people, across every Möbius.",

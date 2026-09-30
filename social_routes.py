@@ -75,6 +75,7 @@ from common_protocol import (
   MAX_ATTACHMENT_BYTES, MAX_AVATAR_BYTES, MAX_BIO_CHARS,
   COMMUNITY_HOST, MAX_BOARD_ATTACHMENTS as _MAX_BOARD_ATTACHMENTS,
   MAX_ENVELOPE_BYTES, MAX_NAME_CHARS, MAX_POST_TEXT_CHARS, MAX_REPLY_TEXT_CHARS,
+  CLOCK_SKEW_S,
   NEEDS_USERNAME, OUTBOUND_TIMEOUT_S, PROTOCOL, PUBLIC_SERVICE_PATH, ActorVerifier,
   canonical as _canonical, peer_service_url as _peer_service_url,
   post_signed_envelope as _post_signed_envelope,
@@ -90,7 +91,7 @@ from common_protocol import (
 from common_public import (
   AVATAR_DIGEST, BOARD_REACTION_EMOJIS, CommonPublicStore, image_thumbnail_bytes,
 )
-from common_transport import FederationTransportError, federation_request
+from common_transport import DEFAULT_MAX_RESPONSE_BYTES, FederationTransportError, federation_request
 from service_io import atomic_write
 from message_history import (
   begin_message_mutation, load_page, mark_version_covered, mirror_message,
@@ -1107,10 +1108,59 @@ async def receive_message(request: Request, db=Depends(get_db)):
   }
 
 
-def _activity_line(kind: str, actor_host: str, actor_handle: str) -> str:
+def _activity_line(kind: str, actor_host: str, actor_handle: str,
+                   emoji: str | None = None, reply_id: str | None = None) -> str:
   who = f"@{actor_handle}" if actor_handle else actor_host
-  verb = "liked" if kind == "like" else "replied to"
-  return f"{who} {verb} your post"
+  item = "reply" if reply_id is not None and kind != "reply" else "post"
+  if kind == "reply":
+    return f"{who} replied to your post"
+  if kind == "reaction" or (kind == "like" and emoji is not None):
+    return f"{who} reacted {emoji} to your {item}"
+  return f"{who} liked your {item}"
+
+
+@contextmanager
+def _activity_replay_journal():
+  """Serialize only short local journal transactions, never the push await."""
+  directory = Path(_data_dir()) / "common"
+  directory.mkdir(parents=True, exist_ok=True)
+  with (directory / ".activity-replays.lock").open("a+b") as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    try:
+      path = directory / "activity-replays.json"
+      try:
+        journal = json.loads(path.read_text())
+      except (OSError, ValueError):
+        journal = {}
+      yield path, journal if isinstance(journal, dict) else {}
+    finally:
+      fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _claim_activity(token: str, claim: str) -> bool:
+  now = time.time()
+  with _activity_replay_journal() as (path, journal):
+    live = {key: value for key, value in journal.items()
+            if isinstance(value, dict) and isinstance(value.get("until"), (int, float))
+            and value["until"] > now}
+    if token in live:
+      return False
+    if len(live) >= 2048:
+      raise HTTPException(status_code=429, detail="Activity replay journal is full.")
+    live[token] = {"claim": claim, "until": now + 30}
+    atomic_write(path, json.dumps(live))
+    return True
+
+
+def _finish_activity(token: str, claim: str, delivered: bool) -> None:
+  with _activity_replay_journal() as (path, journal):
+    if journal.get(token, {}).get("claim") != claim:
+      return
+    if delivered:
+      journal[token] = {"until": time.time() + 2 * CLOCK_SKEW_S}
+    else:
+      journal.pop(token, None)
+    atomic_write(path, json.dumps(journal))
 
 
 @router.post("/activity")
@@ -1124,20 +1174,43 @@ async def receive_board_activity(request: Request):
   if not _valid_id(envelope.get("post_id")):
     raise HTTPException(status_code=400, detail="Post id is invalid.")
   kind = envelope.get("kind")
-  if kind not in ("like", "reply"):
+  if kind not in ("like", "reply", "reaction"):
     raise HTTPException(status_code=400, detail="Unsupported activity kind.")
+  reply_id = envelope.get("reply_id")
+  if reply_id is not None and not _valid_id(reply_id):
+    raise HTTPException(status_code=400, detail="Reply id is invalid.")
+  emoji = envelope.get("emoji")
+  if emoji is not None and emoji not in BOARD_REACTION_EMOJIS:
+    raise HTTPException(status_code=400, detail="Reaction is not supported.")
+  if kind == "reaction" and emoji is None:
+    raise HTTPException(status_code=400, detail="Reaction emoji is required.")
+  activity_id = envelope.get("activity_id")
+  if activity_id is not None and (not isinstance(activity_id, str) or not 1 <= len(activity_id) <= 128):
+    raise HTTPException(status_code=400, detail="Activity id is invalid.")
   # Only the community host stores boards, so only it may report activity;
   # otherwise any signed peer could push arbitrary notifications.
   if envelope.get("from") != COMMUNITY_HOST:
     raise HTTPException(status_code=403, detail="Only the community host reports activity.")
   await _verify_peer_envelope(envelope)
   actor_host = envelope.get("actor") or envelope["from"]
+  if actor_host == _own_host():
+    return {"status": "ok"}
   actor_handle = envelope.get("actor_handle")
   actor_handle = actor_handle[:MAX_NAME_CHARS] if isinstance(actor_handle, str) else ""
-  await notify(
-    "Activity on your post", _activity_line(kind, actor_host, actor_handle),
-    "board",
-  )
+  token = hashlib.sha256((activity_id or _canonical(envelope).decode()).encode()).hexdigest()
+  claim = str(uuid.uuid4())
+  if not _claim_activity(token, claim):
+    return {"status": "ok"}
+  intent = f"board:{envelope['post_id']}" + (f":{reply_id}" if reply_id else "")
+  try:
+    delivered = await notify(
+      "Activity on your reply" if reply_id and kind != "reply" else "Activity on your post",
+      _activity_line(kind, actor_host, actor_handle, emoji, reply_id), intent,
+    )
+  except BaseException:
+    _finish_activity(token, claim, False)
+    raise
+  _finish_activity(token, claim, delivered is True)
   return {"status": "ok"}
 
 
@@ -1716,10 +1789,24 @@ async def get_replies_for_owner(
     raise HTTPException(status_code=400, detail="Post id is invalid.")
   host = COMMUNITY_HOST
   try:
-    response = await federation_request(
-      "GET", _peer_service_url(host, f"board/{post_id}/replies"),
-      timeout_seconds=OUTBOUND_TIMEOUT_S,
-    )
+    url = _peer_service_url(host, f"board/{post_id}/replies")
+    response = None
+    if _joined_for_federation():
+      identity = _load_identity()
+      envelope = {
+        "v": 0, "type": "board_replies", "from": _own_host(),
+        "post_id": post_id, "sent_at": time.time(),
+      }
+      envelope["sig"] = _sign(envelope, identity["private_key_b64"])
+      response = await _post_signed_envelope(
+        url, envelope, max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES,
+      )
+      # The shared host rolls out separately. Older hosts offer public replies
+      # only; never turn a rejected signature into an anonymous retry.
+      if response.status_code in (404, 405):
+        response = None
+    if response is None:
+      response = await federation_request("GET", url, timeout_seconds=OUTBOUND_TIMEOUT_S)
     response.raise_for_status()
     result = response.json()
     if not isinstance(result.get("replies"), list):
@@ -1877,6 +1964,7 @@ class LikePost(BaseModel):
 class ReactionPost(BaseModel):
   post_id: str
   emoji: str
+  reply_id: str | None = None
 
 
 class ReplyPost(BaseModel):
@@ -1901,15 +1989,17 @@ async def react_to_post(
   principal: Principal = Depends(get_principal),
 ):
   """Toggle one standard emoji reaction on a community-board post."""
-  return await _react_to_post(body.post_id, body.emoji, db, principal)
+  return await _react_to_post(body.post_id, body.emoji, db, principal, body.reply_id)
 
 
-async def _react_to_post(post_id_value, emoji, db, principal):
+async def _react_to_post(post_id_value, emoji, db, principal, reply_id=None):
   require_nondelegated_owner_control(principal)
   _require_member(db, principal)
   post_id = str(post_id_value).strip()
   if not re.fullmatch(r"[a-f0-9-]{8,64}", post_id):
     raise HTTPException(status_code=400, detail="Post id is invalid.")
+  if reply_id is not None and not _valid_id(reply_id):
+    raise HTTPException(status_code=400, detail="Reply id is invalid.")
   if emoji not in BOARD_REACTION_EMOJIS:
     raise HTTPException(status_code=400, detail="Reaction is not supported.")
   identity = _load_identity()
@@ -1925,6 +2015,8 @@ async def _react_to_post(post_id_value, emoji, db, principal):
   }
   if emoji is not None:
     envelope["emoji"] = emoji
+  if reply_id is not None:
+    envelope["reply_id"] = reply_id
   envelope["sig"] = _sign(envelope, identity["private_key_b64"])
   try:
     response = await _post_signed_envelope(
@@ -1975,7 +2067,7 @@ async def reply_to_post(
       max_response_bytes=MAX_ENVELOPE_BYTES,
     )
     response.raise_for_status()
-    return response.json()
+    return {**response.json(), "id": reply_id}
   except Exception as exc:
     raise HTTPException(
       status_code=502, detail=_community_write_error(exc, "reply")

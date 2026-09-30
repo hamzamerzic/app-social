@@ -906,7 +906,7 @@ class CommonPublicStore:
 
   def toggle_reaction(
     self, post_id: str, host: str, emoji: str,
-    *, replay_token: str | None = None,
+    *, reply_id: str | None = None, replay_token: str | None = None,
   ) -> dict:
     """Toggle one standard emoji reaction with idempotent envelope retries."""
     if emoji not in BOARD_REACTION_EMOJIS:
@@ -920,17 +920,26 @@ class CommonPublicStore:
       if not path.is_file():
         raise HTTPException(status_code=404, detail="Unknown post.")
       post = self._load_object(path)
-      reactions = self._reaction_hosts(post)
+      target = post
+      if reply_id is not None:
+        replies = post.get("replies")
+        target = next(
+          (reply for reply in replies if isinstance(reply, dict) and reply.get("id") == reply_id),
+          None,
+        ) if isinstance(replies, list) else None
+        if target is None:
+          raise HTTPException(status_code=404, detail="Unknown reply.")
+      reactions = self._reaction_hosts(target)
       hosts = reactions.setdefault(emoji, {})
-      post["reactions"] = reactions
-      post.pop("likes", None)
-      author_host = post.get("host")
+      target["reactions"] = reactions
+      target.pop("likes", None)
+      author_host = target.get("host")
       now = time.time()
       if replay_token is not None:
-        journal = post.setdefault("_reaction_replays", {})
+        journal = target.setdefault("_reaction_replays", {})
         if not isinstance(journal, dict):
           journal = {}
-          post["_reaction_replays"] = journal
+          target["_reaction_replays"] = journal
         live = {
           token: expiry for token, expiry in journal.items()
           if isinstance(token, str)
@@ -947,7 +956,7 @@ class CommonPublicStore:
         if len(live) >= REACTION_REPLAY_LIMIT:
           raise HTTPException(status_code=429, detail="Reaction replay journal is full.")
         live[replay_token] = now + REACTION_REPLAY_TTL_S
-        post["_reaction_replays"] = live
+        target["_reaction_replays"] = live
       if host not in hosts and len(hosts) >= BOARD_LIKE_LIMIT:
         raise HTTPException(status_code=507, detail="Post reaction limit reached.")
       added = host not in hosts
@@ -1009,7 +1018,7 @@ class CommonPublicStore:
         "author_host": author_host, "activity": True,
       }
 
-  def get_replies(self, post_id: str) -> dict:
+  def get_replies(self, post_id: str, viewer: str | None = None) -> dict:
     path = self.board_dir() / f"{post_id}.json"
     if not path.is_file():
       raise HTTPException(status_code=404, detail="Unknown post.")
@@ -1017,9 +1026,22 @@ class CommonPublicStore:
     replies = post.get("replies")
     if not isinstance(replies, list):
       replies = []
+    presented = []
+    for reply in replies:
+      if not isinstance(reply, dict):
+        continue
+      item = dict(reply)
+      reactions = self._reaction_hosts(item)
+      item.pop("likes", None)
+      item.pop("_reaction_replays", None)
+      item["reactions"] = [
+        {"emoji": emoji, "count": len(hosts), "reacted": bool(viewer and viewer in hosts)}
+        for emoji, hosts in reactions.items() if hosts
+      ]
+      presented.append(item)
     return {
       "replies": self.with_member_profiles(sorted(
-        replies,
+        presented,
         key=lambda reply: reply.get("created_at", 0) if isinstance(reply, dict) else 0,
       ))
     }
@@ -1230,7 +1252,7 @@ def read_board_page(
     if position is not None:
       next_cursor = _encode_board_cursor(*position)
   return {
-    "capabilities": {"emoji_reactions": True, "image_thumbnails": True},
+    "capabilities": {"emoji_reactions": True, "reply_reactions": True, "image_thumbnails": True},
     "posts": posts,
     "next_cursor": next_cursor,
   }
@@ -1239,6 +1261,8 @@ def read_board_page(
 async def send_board_activity(
   private_key_b64: str, board_host: str, *,
   kind: str, author_host: str, actor_host: str, actor_handle: str, post_id: str,
+  reply_id: str | None = None, emoji: str | None = None,
+  activity_id: str | None = None,
 ) -> None:
   """Tell a post's author host about a new like or reply, signed by the board host.
 
@@ -1256,6 +1280,12 @@ async def send_board_activity(
     "to": author_host,
     "sent_at": time.time(),
   }
+  if reply_id is not None:
+    envelope["reply_id"] = reply_id
+  if emoji is not None:
+    envelope["emoji"] = emoji
+  if activity_id is not None:
+    envelope["activity_id"] = activity_id
   envelope["sig"] = sign(envelope, private_key_b64)
   try:
     response = await federation_request(
@@ -1429,6 +1459,18 @@ def create_public_router(
       raise HTTPException(status_code=400, detail="Post id is invalid.")
     return store.get_replies(post_id)
 
+  @router.post("/board/{post_id}/replies")
+  async def get_member_board_replies(post_id: str, request: Request):
+    envelope = await read_envelope(request)
+    if envelope.get("v") != 0 or envelope.get("type") != "board_replies":
+      raise HTTPException(status_code=400, detail="Unsupported envelope type.")
+    if not valid_id(post_id) or envelope.get("post_id") != post_id:
+      raise HTTPException(status_code=400, detail="Post id is invalid.")
+    await verifier.verify_envelope(envelope)
+    if not store.is_member(envelope["from"]):
+      raise HTTPException(status_code=403, detail="Join Social to see your reactions.")
+    return store.get_replies(post_id, envelope["from"])
+
   @router.post("/board/react")
   async def react_to_board(request: Request):
     envelope = await read_envelope(request)
@@ -1437,21 +1479,27 @@ def create_public_router(
     post_id = envelope.get("post_id")
     if not valid_id(post_id):
       raise HTTPException(status_code=400, detail="Post id is invalid.")
+    reply_id = envelope.get("reply_id")
+    if reply_id is not None and not valid_id(reply_id):
+      raise HTTPException(status_code=400, detail="Reply id is invalid.")
     actor = await verify_named_member(store, verifier, envelope)
     replay_token = hashlib.sha256(canonical(envelope)).hexdigest()
     emoji = envelope.get("emoji")
     result = (
       store.toggle_like(post_id, envelope["from"], replay_token=replay_token)
-      if emoji is None
+      if emoji is None and reply_id is None
       else store.toggle_reaction(
-        post_id, envelope["from"], emoji, replay_token=replay_token,
+        post_id, envelope["from"], emoji if emoji is not None else "❤️", reply_id=reply_id,
+        replay_token=replay_token,
       )
     )
     author_host = result.pop("author_host", None)
     activity = result.pop("activity", False)
     if on_activity and activity and author_host not in (None, envelope["from"]):
       await on_activity(
-        "like", author_host, envelope["from"], actor.get("handle") or "", post_id,
+        "like", author_host, envelope["from"],
+        actor.get("handle") or "", post_id, reply_id=reply_id, emoji=emoji,
+        activity_id=replay_token,
       )
     return result
 
@@ -1482,6 +1530,7 @@ def create_public_router(
     if on_activity and activity and author_host not in (None, envelope["from"]):
       await on_activity(
         "reply", author_host, envelope["from"], actor.get("handle") or "", post_id,
+        reply_id=reply_id, activity_id=reply_id,
       )
     return result
 

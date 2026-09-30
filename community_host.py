@@ -68,13 +68,15 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
   verifier = ActorVerifier(configured)
   relays: set[asyncio.Task] = set()
 
-  async def on_activity(kind, author_host, actor_host, actor_handle, post_id):
+  async def on_activity(kind, author_host, actor_host, actor_handle, post_id,
+                        *, reply_id=None, emoji=None, activity_id=None):
     # This host stores the board, so it is the authority that tells a post's
     # author about new activity. The notice never delays the like or reply.
     relay = asyncio.create_task(send_board_activity(
       application.state.signing_key, COMMUNITY_HOST, kind=kind,
       author_host=author_host, actor_host=actor_host,
       actor_handle=actor_handle, post_id=post_id,
+      reply_id=reply_id, emoji=emoji, activity_id=activity_id,
     ))
     relays.add(relay)
     relay.add_done_callback(relays.discard)

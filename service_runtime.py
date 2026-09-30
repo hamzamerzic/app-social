@@ -211,7 +211,7 @@ async def resolve_handle_hosts(handle: str) -> list[str] | None:
   return hosts if isinstance(hosts, list) else None
 
 
-async def notify(title: str, body: str, intent: str) -> None:
+async def notify(title: str, body: str, intent: str) -> bool:
   """Best-effort push; tapping it opens ``intent`` (dm:<host>, group:<gid>, board).
 
   The intent is also the tag, so each conversation keeps one notification.
@@ -226,5 +226,7 @@ async def notify(title: str, body: str, intent: str) -> None:
       "tag": intent,
     })
     response.raise_for_status()
+    return True
   except Exception as exc:
     logging.getLogger("social").warning("Notification not sent: %s", exc)
+    return False

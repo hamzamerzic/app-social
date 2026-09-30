@@ -2,6 +2,7 @@
 
 import json
 import os
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -43,6 +44,56 @@ class MessageLengthTests(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(caught.exception.status_code, 413)
 
 
+class ReplyReadTests(unittest.IsolatedAsyncioTestCase):
+  async def test_public_reply_read_does_not_create_an_identity_or_claim_a_viewer(self):
+    peer = AsyncMock(return_value=httpx.Response(200, json={"replies": []},
+      request=httpx.Request("GET", "https://community.example/replies")))
+    with (
+      patch.object(social_routes, "_require_owner_or_common_app"),
+      patch.object(social_routes, "_joined_for_federation", return_value=False),
+      patch.object(social_routes, "_load_identity") as identity,
+      patch.object(social_routes, "federation_request", new=peer),
+    ):
+      await social_routes.get_replies_for_owner("abcdef12", db=None, principal=None)
+    identity.assert_not_called()
+    self.assertEqual(peer.await_args.args[0], "GET")
+    self.assertNotIn("params", peer.await_args.kwargs)
+
+  async def test_members_sign_reply_reads_and_only_legacy_hosts_fall_back_to_public_counts(self):
+    for status in (200, 404, 405, 403, 500):
+      with self.subTest(status=status):
+        replies = [{"id": f"reply-{index}", "text": "🦋" * 1000} for index in range(200)]
+        response = httpx.Response(status, json={"replies": replies},
+          request=httpx.Request("POST", "https://community.example/replies"))
+        signed = AsyncMock(return_value=response)
+        public = AsyncMock(return_value=httpx.Response(200, json={"replies": []},
+          request=httpx.Request("GET", "https://community.example/replies")))
+        with (
+          patch.object(social_routes, "_require_owner_or_common_app"),
+          patch.object(social_routes, "_joined_for_federation", return_value=True),
+          patch.object(social_routes, "_load_identity", return_value={"private_key_b64": "fixture"}),
+          patch.object(social_routes, "_sign", return_value="fixture-signature"),
+          patch.object(social_routes, "_own_host", return_value="self.example"),
+          patch.object(social_routes, "_post_signed_envelope", new=signed),
+          patch.object(social_routes, "federation_request", new=public),
+        ):
+          if status in (403, 500):
+            with self.assertRaises(HTTPException) as caught:
+              await social_routes.get_replies_for_owner("abcdef12", db=None, principal=None)
+            self.assertEqual(caught.exception.status_code, 502)
+          else:
+            await social_routes.get_replies_for_owner("abcdef12", db=None, principal=None)
+        envelope = signed.await_args.args[1]
+        self.assertEqual((envelope["type"], envelope["from"], envelope["post_id"]),
+                         ("board_replies", "self.example", "abcdef12"))
+        self.assertNotIn("viewer", envelope)
+        self.assertGreater(len(response.content), social_routes.MAX_ENVELOPE_BYTES)
+        self.assertGreater(signed.await_args.kwargs["max_response_bytes"], len(response.content))
+        self.assertEqual(public.await_count, int(status in (404, 405)))
+        if public.await_count:
+          self.assertNotIn("params", public.await_args.kwargs)
+
+
 class NotificationTests(unittest.IsolatedAsyncioTestCase):
   async def test_a_notification_opens_and_groups_by_its_conversation(self):
     send = AsyncMock(return_value=httpx.Response(
@@ -72,24 +123,82 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
       "actor": "liker.example", "actor_handle": "liker",
       "from": "impostor.example", "to": "self.example", "sent_at": 1.0,
     }
-    notify = AsyncMock()
-    with (
-      patch.dict(social_routes.os.environ, {
-        "INSTANCE_DOMAIN": "self.example",
-        "INSTANCE_ORIGIN": "https://self.example",
-        "API_BASE_URL": "http://127.0.0.1:9",
-      }),
-      patch.object(social_routes, "_read_envelope", new=AsyncMock(return_value=envelope)),
-      patch.object(social_routes, "_verify_peer_envelope", new=AsyncMock(return_value={})),
-      patch.object(social_routes, "notify", new=notify),
-    ):
-      with self.assertRaises(HTTPException) as caught:
+    notify = AsyncMock(return_value=True)
+    with tempfile.TemporaryDirectory() as directory:
+      with (
+        patch.dict(social_routes.os.environ, {
+          "INSTANCE_DOMAIN": "self.example",
+          "INSTANCE_ORIGIN": "https://self.example",
+          "API_BASE_URL": "http://127.0.0.1:9",
+        }),
+        patch.object(social_routes, "_read_envelope", new=AsyncMock(return_value=envelope)),
+        patch.object(social_routes, "_verify_peer_envelope", new=AsyncMock(return_value={})),
+        patch.object(social_routes, "notify", new=notify),
+        patch.object(social_routes, "_data_dir", return_value=directory),
+      ):
+        with self.assertRaises(HTTPException) as caught:
+          await social_routes.receive_board_activity(None)
+        self.assertEqual(caught.exception.status_code, 403)
+        envelope["from"] = social_routes.COMMUNITY_HOST
         await social_routes.receive_board_activity(None)
-      self.assertEqual(caught.exception.status_code, 403)
-      envelope["from"] = social_routes.COMMUNITY_HOST
-      await social_routes.receive_board_activity(None)
     notify.assert_awaited_once()
-    self.assertEqual(notify.await_args.args[2], "board")
+    self.assertEqual(notify.await_args.args[2], "board:abcdef12")
+
+  async def test_reaction_activity_replay_and_exact_reply_intent(self):
+    envelope = {
+      "v": 0, "type": "board_activity", "post_id": "abcdef12",
+      "reply_id": "abcdef34", "kind": "like", "emoji": "🎉",
+      "activity_id": "first", "actor": "liker.example",
+      "actor_handle": "liker", "from": social_routes.COMMUNITY_HOST,
+      "to": "self.example", "sent_at": 1.0,
+    }
+    sent = AsyncMock(return_value=True)
+    with tempfile.TemporaryDirectory() as directory:
+      with (
+        patch.object(social_routes, "_data_dir", return_value=directory),
+        patch.object(social_routes, "_own_host", return_value="self.example"),
+        patch.object(social_routes, "_read_envelope", new=AsyncMock(return_value=envelope)),
+        patch.object(social_routes, "_verify_peer_envelope", new=AsyncMock(return_value={})),
+        patch.object(social_routes, "notify", new=sent),
+      ):
+        await social_routes.receive_board_activity(None)
+        await social_routes.receive_board_activity(None)
+        self.assertEqual(sent.await_count, 1)
+        self.assertEqual(sent.await_args.args[1], "@liker reacted 🎉 to your reply")
+        self.assertEqual(sent.await_args.args[2], "board:abcdef12:abcdef34")
+        envelope["activity_id"] = "second"
+        await social_routes.receive_board_activity(None)
+        self.assertEqual(sent.await_count, 2)
+        envelope["activity_id"] = "failed"
+        sent.return_value = False
+        await social_routes.receive_board_activity(None)
+        sent.return_value = True
+        await social_routes.receive_board_activity(None)
+        self.assertEqual(sent.await_count, 4)
+
+  def test_every_emoji_is_preserved_in_legacy_compatible_activity_wording(self):
+    for emoji in social_routes.BOARD_REACTION_EMOJIS:
+      self.assertEqual(social_routes._activity_line("like", "peer.example", "peer", emoji),
+                       f"@peer reacted {emoji} to your post")
+      self.assertEqual(social_routes._activity_line("like", "peer.example", "peer", emoji, "abcdef34"),
+                       f"@peer reacted {emoji} to your reply")
+    self.assertEqual(social_routes._activity_line("like", "peer.example", "peer"), "@peer liked your post")
+
+  async def test_reply_receipt_exposes_the_canonical_signed_id(self):
+    peer = AsyncMock(return_value=httpx.Response(200, json={"status": "ok", "reply_count": 1},
+                     request=httpx.Request("POST", "https://community.example/board/reply")))
+    with (
+      patch.object(social_routes, "_require_member"),
+      patch.object(social_routes, "_load_identity", return_value={"handle": "owner", "private_key_b64": "fixture"}),
+      patch.object(social_routes, "_require_username"),
+      patch.object(social_routes, "_sign", return_value="fixture-signature"),
+      patch.object(social_routes, "_own_host", return_value="self.example"),
+      patch.object(social_routes, "_post_signed_envelope", new=peer),
+    ):
+      result = await social_routes.reply_to_post(social_routes.ReplyPost(post_id="abcdef12", text="hello"),
+                  db=None, principal=service_runtime.Principal("owner", None, None))
+    self.assertEqual(result["id"], peer.await_args.args[1]["id"])
+    self.assertEqual(result["reply_count"], 1)
 
 
 if __name__ == "__main__":

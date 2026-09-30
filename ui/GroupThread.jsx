@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  ArrowLeft, ArrowUp, Check, Clock, ImageSquare, Warning,
+  ArrowLeft, Check, Clock, Warning,
 } from '@openai/apps-sdk-ui/components/Icon'
 import {
   acceptGroupInvitation, clearGroupUnread, clockTime, declineGroupInvitation,
@@ -10,7 +10,7 @@ import {
 import { GroupAvatar } from './Messages.jsx'
 import { Avatar } from './Board.jsx'
 import MessageBubble, { ReplyTarget, replyTargetFor } from './MessageBubble.jsx'
-import MessageInput, { keepMessageFocus } from './MessageInput.jsx'
+import Composer, { ComposerAttachmentButton, ComposerFooter } from './Composer.jsx'
 import GroupDetails from './GroupDetails.jsx'
 import { prepareImage, SelectedImageStrip } from './Media.jsx'
 import {
@@ -362,24 +362,20 @@ export default function GroupThread({
       </div>
       {currentGroup.deleted_at ? <div className="cn-group-closed" role="status">This group has been closed. You can still read its earlier messages.</div>
         : requestStatus(currentGroup) === 'pending' ? <div className="cn-request-quiet" role="status">Accept this invitation to send messages.</div>
-        : <div className="cn-compose-shell">
-        <ReplyTarget reply={replyTarget} onDismiss={() => setReplyTarget(null)} />
-        <SelectedImageStrip selected={selectedImage} onRemove={() => setSelectedImage(null)} />
-        <form className="cn-compose-bar" onSubmit={send}>
-          <input ref={fileRef} className="cn-file-input" type="file" accept="image/*"
-                 onChange={chooseImage} tabIndex={-1} aria-hidden="true" />
-          <button className="cn-compose-image" type="button" onClick={() => fileRef.current?.click()}
-                  disabled={sending || processingImage} aria-label="Attach photo">
-            {processingImage ? <span className="cn-spinner" /> : <ImageSquare aria-hidden="true" />}
-          </button>
-          <MessageInput inputRef={inputRef} value={draft} onChange={setDraft}
-                        disabled={processingImage} />
-          <button className="cn-send" type="submit" onMouseDown={keepMessageFocus}
-                  disabled={sending || processingImage || (!draft.trim() && !selectedImage)} aria-label="Send">
-            <ArrowUp />
-          </button>
-        </form>
-      </div>}
+        : <ComposerFooter scrollRef={scrollRef}>
+        <input ref={fileRef} className="cn-file-input" type="file" accept="image/*"
+               onChange={chooseImage} tabIndex={-1} aria-hidden="true" />
+        <Composer inputRef={inputRef} value={draft} onChange={setDraft} onSubmit={send}
+                  disabled={processingImage}
+                  sendDisabled={sending || processingImage || (!draft.trim() && !selectedImage)}
+                  attachmentAction={<ComposerAttachmentButton onClick={() => fileRef.current?.click()}
+                    disabled={sending || processingImage} />}>
+          {(replyTarget || selectedImage) && <>
+            <ReplyTarget reply={replyTarget} onDismiss={() => setReplyTarget(null)} />
+            <SelectedImageStrip selected={selectedImage} onRemove={() => setSelectedImage(null)} />
+          </>}
+        </Composer>
+      </ComposerFooter>}
       {details && <GroupDetails group={currentGroup} me={me} onClose={() => setDetails(false)}
         onUpdated={updated => { refreshRequest.current += 1; setCurrentGroup(updated) }}
         onDeleted={() => { showToast('Group deleted', 'success'); onBack() }} />}
