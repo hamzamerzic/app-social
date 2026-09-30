@@ -105,6 +105,7 @@ test('24 counted reactions and the inline picker stay inside a phone viewport', 
       '--headless=new',
       '--no-sandbox',
       '--disable-gpu',
+      `--user-data-dir=${join(directory, 'browser')}`,
       '--hide-scrollbars',
       '--window-size=320,1000',
       // --dump-dom can serialize the parent before the srcdoc frame loads.
@@ -114,7 +115,8 @@ test('24 counted reactions and the inline picker stay inside a phone viewport', 
       '--dump-dom',
       pathToFileURL(htmlPath).href,
     ], { encoding: 'utf8', timeout: 20_000 })
-    assert.equal(rendered.status, 0, rendered.stderr || rendered.error?.message)
+    assert.ifError(rendered.error)
+    assert.equal(rendered.status, 0, rendered.stderr)
     const match = rendered.stdout.match(/<pre id="result">([^<]+)<\/pre>/)
     assert.ok(match, 'rendered page returned layout measurements')
     const geometry = JSON.parse(match[1].replaceAll('&quot;', '"'))
