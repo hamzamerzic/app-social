@@ -36,6 +36,39 @@ def forged_png_header(width=20000, height=20000):
 
 
 class PublicBoardIndexTests(unittest.TestCase):
+  def test_posts_and_replies_share_private_viewer_aware_reaction_presentation(self):
+    with tempfile.TemporaryDirectory() as directory:
+      store = CommonPublicStore(directory)
+      reaction_fields = {
+        "reactions": {"🎉": {"other.example": 1}, "❤️": {"other.example": 2},
+                      "unsupported": {"viewer.example": 3}, "🔥": {}},
+        "likes": {"viewer.example": 4},
+        "_reaction_replays": {"private-token": 9999999999},
+      }
+      store.store_post({
+        "id": "presentation", "host": "author.example", "created_at": 1,
+        "text": "post", **reaction_fields,
+        "replies": [{"id": "reply", "host": "author.example", "handle": "author", "created_at": 2,
+                     "text": "reply", **reaction_fields}],
+      })
+      for viewer in (None, "viewer.example", "other.example"):
+        post = store.read_board(1, None, viewer)[0]
+        reply = store.get_replies("presentation", viewer)["replies"][0]
+        expected = [
+          {"emoji": emoji, "count": 2 if emoji == "❤️" else 1,
+           "reacted": bool(viewer and (emoji == "❤️" or viewer == "other.example"))}
+          for emoji in BOARD_REACTION_EMOJIS if emoji in ("❤️", "🎉")
+        ]
+        self.assertEqual(post["reactions"], expected)
+        self.assertEqual(reply["reactions"], expected)
+        for item in (post, reply):
+          self.assertNotIn("likes", item)
+          self.assertNotIn("_reaction_replays", item)
+          self.assertNotIn("example", json.dumps(item["reactions"]))
+      stored = json.loads((store.board_dir() / "presentation.json").read_text())
+      self.assertEqual(stored["replies"][0]["likes"], {"viewer.example": 4})
+      self.assertIn("private-token", stored["replies"][0]["_reaction_replays"])
+
   def test_reply_reactions_are_scoped_replay_safe_and_private(self):
     with tempfile.TemporaryDirectory() as directory:
       store = CommonPublicStore(directory)

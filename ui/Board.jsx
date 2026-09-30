@@ -283,7 +283,6 @@ export default function Board({
   const fileRef = useRef(null)
   const composerInputRef = useRef(null)
   const replyInputRef = useRef(null)
-  const bottomMarkerRef = useRef(null)
   const stickToBottom = useRef(true)
   const initialScrollDone = useRef(false)
   const threadAnchor = useRef(null)
@@ -295,8 +294,7 @@ export default function Board({
   replySendingRef.current = replySending
 
   useEffect(() => {
-    const marker = bottomMarkerRef.current
-    const scroller = marker?.closest('.cn-scroll')
+    const scroller = scrollRef.current
     if (!scroller) return undefined
     const trackPosition = () => {
       stickToBottom.current = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 96
@@ -304,15 +302,15 @@ export default function Board({
     trackPosition()
     scroller.addEventListener('scroll', trackPosition, { passive: true })
     return () => scroller.removeEventListener('scroll', trackPosition)
-  }, [])
+  }, [scrollRef])
 
   useEffect(() => {
     if (!composing) return
     composerInputRef.current?.focus()
-    const scroller = bottomMarkerRef.current?.closest('.cn-scroll')
+    const scroller = scrollRef.current
     if (scroller) scroller.scrollTop = scroller.scrollHeight
     setComposing(false)
-  }, [composing, setComposing])
+  }, [composing, setComposing, scrollRef])
 
   useEffect(() => {
     if (feedState !== 'ready') return undefined
@@ -320,14 +318,14 @@ export default function Board({
     const firstReadyScroll = !initialScrollDone.current
     if (!firstReadyScroll && !stickToBottom.current) return undefined
     const frame = requestAnimationFrame(() => {
-      const scroller = bottomMarkerRef.current?.closest('.cn-scroll')
+      const scroller = scrollRef.current
       if (!scroller) return
       scroller.scrollTop = scroller.scrollHeight
       initialScrollDone.current = true
       stickToBottom.current = true
     })
     return () => cancelAnimationFrame(frame)
-  }, [feedState, feed.length, pending?.id, boardTarget, replyPost?.id])
+  }, [feedState, feed.length, pending?.id, boardTarget, replyPost?.id, scrollRef])
 
   // A thread swap can remove a tall section above the tapped post. Keep that
   // post in place before paint; while replies load, don't let native anchoring
@@ -404,7 +402,7 @@ export default function Board({
   async function loadEarlierPosts() {
     const before = feed.at(-1)?.created_at
     if (before === null || before === undefined || loadingEarlier) return
-    const scroller = bottomMarkerRef.current?.closest('.cn-scroll')
+    const scroller = scrollRef.current
     const previousHeight = scroller?.scrollHeight
     const previousTop = scroller?.scrollTop
     setLoadingEarlier(true)
@@ -1134,7 +1132,6 @@ export default function Board({
           </article>
         )}
       </div>
-      <div ref={bottomMarkerRef} className="cn-board-bottom" aria-hidden="true" />
       {composerMount && createPortal(<ComposerFooter scrollRef={scrollRef} className="cn-board-footer">
         {canInteract ? <>
           <input ref={fileRef} className="cn-file-input" type="file" accept="image/*" multiple

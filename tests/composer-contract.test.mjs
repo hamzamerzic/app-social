@@ -8,6 +8,19 @@ const messageInput = readFileSync(new URL('../ui/MessageInput.jsx', import.meta.
 const thread = readFileSync(new URL('../ui/Thread.jsx', import.meta.url), 'utf8')
 const group = readFileSync(new URL('../ui/GroupThread.jsx', import.meta.url), 'utf8')
 const css = readFileSync(new URL('../theme.js', import.meta.url), 'utf8')
+const board = readFileSync(new URL('../ui/Board.jsx', import.meta.url), 'utf8')
+const shell = readFileSync(new URL('../index.jsx', import.meta.url), 'utf8')
+
+test('Community shares the shell-owned scroller for reading, anchoring and composer clearance', () => {
+  assert.match(shell, /ref=\{boardScrollRef\}/)
+  assert.match(shell, /scrollRef=\{boardScrollRef\}/)
+  assert.match(board, /const scroller = scrollRef\.current/)
+  assert.match(board, /<ComposerFooter scrollRef=\{scrollRef\}/)
+  assert.doesNotMatch(board, /bottomMarkerRef|closest\('\.cn-scroll'\)/)
+  assert.match(board, /scroller\.addEventListener\('scroll', trackPosition/)
+  assert.match(board, /scroller\.removeEventListener\('scroll', trackPosition/)
+  assert.match(board, /prependedScrollTop\(previousTop, previousHeight, scroller\.scrollHeight\)/)
+})
 
 test('shared composer keeps MessageInput keyboard semantics and input focus on send', () => {
   assert.match(composer, /<MessageInput\b/)

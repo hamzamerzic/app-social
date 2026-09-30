@@ -183,6 +183,23 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
       self.assertEqual(social_routes._activity_line("like", "peer.example", "peer", emoji, "abcdef34"),
                        f"@peer reacted {emoji} to your reply")
     self.assertEqual(social_routes._activity_line("like", "peer.example", "peer"), "@peer liked your post")
+    self.assertEqual(social_routes._activity_line("reply", "peer.example", "peer", reply_id="abcdef34"),
+                     "@peer replied to your post")
+
+  async def test_activity_accepts_only_the_host_emitted_protocol_kinds(self):
+    envelope = {
+      "v": 0, "type": "board_activity", "post_id": "abcdef12", "kind": "reaction",
+      "emoji": "🎉", "from": social_routes.COMMUNITY_HOST, "to": "self.example",
+    }
+    with (
+      patch.object(social_routes, "_read_envelope", new=AsyncMock(return_value=envelope)),
+      patch.object(social_routes, "_own_host", return_value="self.example"),
+      patch.object(social_routes, "notify", new=AsyncMock()) as sent,
+    ):
+      with self.assertRaises(HTTPException) as caught:
+        await social_routes.receive_board_activity(None)
+    self.assertEqual(caught.exception.status_code, 400)
+    sent.assert_not_awaited()
 
   async def test_reply_receipt_exposes_the_canonical_signed_id(self):
     peer = AsyncMock(return_value=httpx.Response(200, json={"status": "ok", "reply_count": 1},

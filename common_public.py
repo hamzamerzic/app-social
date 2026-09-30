@@ -438,15 +438,7 @@ class CommonPublicStore:
     post["like_count"] = len(heart)
     if viewer is not None:
       post["liked"] = viewer in heart
-    post["reactions"] = [
-      {
-        "emoji": emoji,
-        "count": len(reactions.get(emoji, {})),
-        "reacted": bool(viewer and viewer in reactions.get(emoji, {})),
-      }
-      for emoji in BOARD_REACTION_EMOJIS
-      if reactions.get(emoji)
-    ]
+    post["reactions"] = CommonPublicStore._public_reactions(reactions, viewer)
     replies = post.pop("replies", [])
     if not isinstance(replies, list):
       replies = []
@@ -904,6 +896,15 @@ class CommonPublicStore:
           heart.setdefault(host, created_at)
     return normalized
 
+  @staticmethod
+  def _public_reactions(reactions: dict[str, dict], viewer: str | None) -> list[dict]:
+    """Present post and reply reactions in the same order, without host lists."""
+    return [
+      {"emoji": emoji, "count": len(reactions[emoji]),
+       "reacted": bool(viewer and viewer in reactions[emoji])}
+      for emoji in BOARD_REACTION_EMOJIS if reactions.get(emoji)
+    ]
+
   def toggle_reaction(
     self, post_id: str, host: str, emoji: str,
     *, reply_id: str | None = None, replay_token: str | None = None,
@@ -968,8 +969,8 @@ class CommonPublicStore:
       atomic_write(path, json.dumps(post))
       if self._refresh_board_index(post, path) and owns_dirty_marker:
         self._clear_board_index_dirty()
-      # `activity` is True only for a genuine new like (not an unlike or a
-      # replay), so the router notifies the post's author exactly once.
+      # Only a newly added reaction notifies the target's author, never a
+      # removal or replay.
       return {
         "status": "ok",
         "reaction_counts": {key: len(value) for key, value in reactions.items()},
@@ -1034,15 +1035,12 @@ class CommonPublicStore:
       reactions = self._reaction_hosts(item)
       item.pop("likes", None)
       item.pop("_reaction_replays", None)
-      item["reactions"] = [
-        {"emoji": emoji, "count": len(hosts), "reacted": bool(viewer and viewer in hosts)}
-        for emoji, hosts in reactions.items() if hosts
-      ]
+      item["reactions"] = self._public_reactions(reactions, viewer)
       presented.append(item)
     return {
       "replies": self.with_member_profiles(sorted(
         presented,
-        key=lambda reply: reply.get("created_at", 0) if isinstance(reply, dict) else 0,
+        key=lambda reply: reply.get("created_at", 0),
       ))
     }
 

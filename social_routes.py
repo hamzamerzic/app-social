@@ -1111,10 +1111,10 @@ async def receive_message(request: Request, db=Depends(get_db)):
 def _activity_line(kind: str, actor_host: str, actor_handle: str,
                    emoji: str | None = None, reply_id: str | None = None) -> str:
   who = f"@{actor_handle}" if actor_handle else actor_host
-  item = "reply" if reply_id is not None and kind != "reply" else "post"
   if kind == "reply":
     return f"{who} replied to your post"
-  if kind == "reaction" or (kind == "like" and emoji is not None):
+  item = "reply" if reply_id is not None else "post"
+  if emoji is not None:
     return f"{who} reacted {emoji} to your {item}"
   return f"{who} liked your {item}"
 
@@ -1174,7 +1174,7 @@ async def receive_board_activity(request: Request):
   if not _valid_id(envelope.get("post_id")):
     raise HTTPException(status_code=400, detail="Post id is invalid.")
   kind = envelope.get("kind")
-  if kind not in ("like", "reply", "reaction"):
+  if kind not in ("like", "reply"):
     raise HTTPException(status_code=400, detail="Unsupported activity kind.")
   reply_id = envelope.get("reply_id")
   if reply_id is not None and not _valid_id(reply_id):
@@ -1182,8 +1182,6 @@ async def receive_board_activity(request: Request):
   emoji = envelope.get("emoji")
   if emoji is not None and emoji not in BOARD_REACTION_EMOJIS:
     raise HTTPException(status_code=400, detail="Reaction is not supported.")
-  if kind == "reaction" and emoji is None:
-    raise HTTPException(status_code=400, detail="Reaction emoji is required.")
   activity_id = envelope.get("activity_id")
   if activity_id is not None and (not isinstance(activity_id, str) or not 1 <= len(activity_id) <= 128):
     raise HTTPException(status_code=400, detail="Activity id is invalid.")
@@ -1197,7 +1195,7 @@ async def receive_board_activity(request: Request):
     return {"status": "ok"}
   actor_handle = envelope.get("actor_handle")
   actor_handle = actor_handle[:MAX_NAME_CHARS] if isinstance(actor_handle, str) else ""
-  token = hashlib.sha256((activity_id or _canonical(envelope).decode()).encode()).hexdigest()
+  token = hashlib.sha256(activity_id.encode() if activity_id else _canonical(envelope)).hexdigest()
   claim = str(uuid.uuid4())
   if not _claim_activity(token, claim):
     return {"status": "ok"}

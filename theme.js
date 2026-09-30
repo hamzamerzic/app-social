@@ -175,7 +175,6 @@ export const CSS = `
 .cn-pending-gallery img { width: 100%; height: 100%; display: block; object-fit: cover; }
 
 .cn-board-chat { min-height: 100%; display: flex; flex-direction: column; }
-.cn-board-bottom { height: 1px; flex: 0 0 auto; }
 .cn-board-join { text-align: center; pointer-events: auto; max-width: 720px; margin-inline: auto; }
 .cn-board-join .cn-btn { width: min(100%, 440px); min-height: 48px; }
 .cn-board-join .cn-composer-disclosure { margin: 7px auto 0; }
@@ -882,7 +881,6 @@ export const CSS = `
   flex: 0 0 auto; display: flex; padding-top: 12px;
   border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
 }
-.cn-reply-account { flex: 0 0 auto; }
 @keyframes cn-reply-in {
   from { opacity: 0.35; transform: translateY(4px); }
   to { opacity: 1; transform: none; }
@@ -1029,7 +1027,6 @@ export const CSS = `
   .cn-intent-notice { align-items: stretch; flex-direction: column; }
   .cn-intent-notice .cn-btn { width: 100%; }
   .cn-intent-actions .cn-btn { flex: 1 1 0; width: auto; }
-  .cn-reply-account { width: 100%; }
   .cn-profile-preview { grid-template-columns: 1fr; }
   .cn-profile-preview-actions { padding-right: 0; }
   .cn-profile-preview-actions .cn-btn { flex: 1 1 auto; }

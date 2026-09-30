@@ -10,7 +10,7 @@ export function ComposerAttachmentButton({ onClick, disabled, label = 'Attach ph
 }
 
 export default function Composer({
-  value, onChange, onSubmit, onFocus, disabled, sendDisabled, placeholder = 'Message',
+  value, onChange, onSubmit, disabled, sendDisabled, placeholder = 'Message',
   maxLength, label = placeholder, sendLabel = 'Send', inputRef, attachmentAction,
   children, className = '',
 }) {
@@ -21,7 +21,7 @@ export default function Composer({
     <div className={`cn-composer-pill${children ? ' has-children' : ''}`}>
       {children}
       <div className="cn-composer-input-line">
-        <MessageInput inputRef={textareaRef} value={value} onChange={onChange} onFocus={onFocus}
+        <MessageInput inputRef={textareaRef} value={value} onChange={onChange}
                       disabled={disabled} placeholder={placeholder} label={label} maxLength={maxLength} />
         <button className="cn-composer-send" type="submit" onMouseDown={keepMessageFocus}
                 disabled={sendDisabled} aria-label={sendLabel}>
