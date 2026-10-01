@@ -427,7 +427,10 @@ export default function Board({
 
   async function loadReplies(post, { background = false, force = false } = {}) {
     const request = ++replyRequest.current
-    if (!force && Number(post.reply_count || 0) === 0) {
+    // The feed count is only a hint for the first open, never authority over
+    // a cached conversation or an ongoing check of the open thread.
+    if (!force && !background && Number(post.reply_count || 0) === 0
+        && !replyCache.has(String(post.id))) {
       const result = { replies: [] }
       rememberReplies(String(post.id), result)
       setReplies([])
@@ -439,7 +442,7 @@ export default function Board({
       setReplyError('')
     }
     try {
-      const result = await cachedReplies(post.id, { force, background })
+      const result = await cachedReplies(post.id, { force: force || background, background })
       if (request !== replyRequest.current) return
       const loaded = result.replies || []
       setReplies(prior => reconcileReplies(loaded, prior))
@@ -611,9 +614,15 @@ export default function Board({
     setReplyDraft('')
     try {
       const receipt = await postReply(post.id, text)
+      const confirmed = { ...optimistic, id: receipt.id || localId, pending: false }
       setReplies((prior) => prior.map((reply) => (
-        reply.id === localId ? { ...reply, id: receipt.id || localId, pending: false } : reply
+        reply.id === localId ? confirmed : reply
       )))
+      // Replace any pre-write request without discarding the confirmed write
+      // if its fresh confirmation read fails or the thread is reopened.
+      const key = String(post.id)
+      const cached = replyCache.get(key)?.result?.replies || []
+      rememberReplies(key, { replies: [...cached.filter(reply => reply.id !== confirmed.id), confirmed] })
       await loadReplies(post, { background: true, force: true })
       window.mobius?.signal?.('item_created', { type: 'board_reply' })
       onCompleteParticipation?.(completedIntent)
