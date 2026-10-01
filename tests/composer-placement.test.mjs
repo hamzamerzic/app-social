@@ -2,10 +2,10 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 import { CSS } from '../theme.js'
 import { reactionPickerPlacement } from '../ui/interactionRules.js'
+import { renderLayout } from './helpers/layoutBrowser.mjs'
 
 test('reaction menus stay below a top post and above a bottom post', () => {
   const viewport = { top: 52, bottom: 720 }
@@ -44,7 +44,7 @@ test('picker tracks the feed clearance and keeps reply menus in flow', () => {
 
 test('one-line text is centered, multiline send stays low, and bottom picker choices remain reachable', {
   skip: !process.env.CHROME_BIN && 'CHROME_BIN is not configured',
-}, () => {
+}, async () => {
   const folder = mkdtempSync(join(tmpdir(), 'social-composer-placement-'))
   const file = join(folder, 'test.html')
   const composer = (id, height) => `<form id="${id}" class="cn-composer"><button class="cn-composer-attach"><svg></svg></button><div class="cn-composer-pill"><div class="cn-composer-input-line"><textarea rows="1" style="height:${height}px">Draft</textarea><button class="cn-composer-send">Send</button></div></div></form>`
@@ -53,12 +53,7 @@ test('one-line text is centered, multiline send stays low, and bottom picker cho
     <div class="cn-reactions"><div class="cn-reaction-picker is-above is-bounded" style="max-height:160px"><span class="cn-reaction-picker-title">Choose a reaction</span><div class="cn-reaction-grid">${Array.from({ length: 24 }, () => '<button>R</button>').join('')}</div></div></div><pre id="result"></pre>
     <script>const rect=n=>n.getBoundingClientRect();const rows=['one','many'].map(id=>{const form=document.getElementById(id),input=rect(form.querySelector('textarea')),pill=rect(form.querySelector('.cn-composer-pill')),send=rect(form.querySelector('.cn-composer-send')),plus=rect(form.querySelector('svg'));return{inputCenter:(input.top+input.bottom)/2,pillCenter:(pill.top+pill.bottom)/2,inputBottom:input.bottom,sendBottom:send.bottom,plusWidth:plus.width}});const menu=document.querySelector('.cn-reaction-picker'),trigger=rect(document.querySelector('.cn-reactions')),before=rect(menu);menu.scrollTop=menu.scrollHeight;const last=rect(menu.querySelector('button:last-child')),after=rect(menu);document.getElementById('result').textContent=JSON.stringify({rows,menuTop:before.top,menuBottom:before.bottom,triggerTop:trigger.top,lastVisible:last.bottom<=after.bottom,lastTarget:last.width===44&&last.height===44,scrolls:menu.scrollHeight>menu.clientHeight});</script>`)
   try {
-    const rendered = spawnSync(process.env.CHROME_BIN, ['--headless=new', '--no-sandbox', '--disable-gpu', `--user-data-dir=${join(folder, 'browser')}`, '--window-size=426,860', '--dump-dom', `file://${file}`], { encoding: 'utf8', timeout: 20000 })
-    assert.ifError(rendered.error)
-    assert.equal(rendered.status, 0, rendered.stderr || rendered.error?.message)
-    const match = rendered.stdout.match(/<pre id="result">([^<]+)<\/pre>/)
-    assert.ok(match, 'Chrome returned layout measurements')
-    const result = JSON.parse(match[1].replaceAll('&quot;', '"'))
+    const result = await renderLayout(process.env.CHROME_BIN, file, { width: 426 })
     assert.ok(Math.abs(result.rows[0].inputCenter - result.rows[0].pillCenter) < 1, JSON.stringify(result))
     assert.ok(Math.abs(result.rows[1].inputBottom - result.rows[1].sendBottom) < 1, JSON.stringify(result))
     assert.ok(result.rows.every(row => row.plusWidth === 24))

@@ -3,9 +3,9 @@ import assert from 'node:assert/strict'
 import { accessSync, constants, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { CSS } from '../theme.js'
+import { renderLayout } from './helpers/layoutBrowser.mjs'
 
 const browserCandidates = [
   process.env.CHROME_BIN,
@@ -34,7 +34,7 @@ const browser = findBrowser()
 
 test('24 counted reactions and the inline picker stay inside a phone viewport', {
   skip: browser ? false : 'headless Chrome is unavailable',
-}, () => {
+}, async () => {
   const directory = mkdtempSync(join(tmpdir(), 'social-reaction-layout-'))
   const htmlPath = join(directory, 'index.html')
   const reactions = Array.from({ length: 24 }, (_, index) => `
@@ -101,25 +101,7 @@ test('24 counted reactions and the inline picker stay inside a phone viewport', 
     </script>`, 'utf8')
 
   try {
-    const rendered = spawnSync(browser, [
-      '--headless=new',
-      '--no-sandbox',
-      '--disable-gpu',
-      `--user-data-dir=${join(directory, 'browser')}`,
-      '--hide-scrollbars',
-      '--window-size=320,1000',
-      // --dump-dom can serialize the parent before the srcdoc frame loads.
-      // Advance the browser's clock so the real layout assertion always sees
-      // the frame's measurement, even on a slower CI runner.
-      '--virtual-time-budget=2000',
-      '--dump-dom',
-      pathToFileURL(htmlPath).href,
-    ], { encoding: 'utf8', timeout: 20_000 })
-    assert.ifError(rendered.error)
-    assert.equal(rendered.status, 0, rendered.stderr)
-    const match = rendered.stdout.match(/<pre id="result">([^<]+)<\/pre>/)
-    assert.ok(match, 'rendered page returned layout measurements')
-    const geometry = JSON.parse(match[1].replaceAll('&quot;', '"'))
+    const geometry = await renderLayout(browser, htmlPath, { height: 1000 })
 
     assert.equal(geometry.viewportWidth, 320)
     assert.ok(geometry.lastChipTop > geometry.firstChipTop, 'all 24 counted reactions wrap')
