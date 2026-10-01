@@ -293,7 +293,7 @@ export const CSS = `
   display: flex; flex-direction: column;
   border: 1px solid var(--border); border-radius: 14px; background: transparent; cursor: default;
 }
-.cn-inline-replies { flex: 0 1 auto; min-height: 0; overflow-y: auto; padding: 0 8px; overscroll-behavior: contain; }
+.cn-inline-replies { flex: 0 1 auto; min-height: 0; overflow-y: auto; padding: 0 8px; overscroll-behavior: contain auto; }
 .cn-inline-replies .cn-reply-row { padding: 8px 0; gap: 8px; }
 .cn-thread-loading { min-height: 48px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 13px; }
 .cn-inline-thread .cn-reply-composer { padding: 8px; background: transparent; }
