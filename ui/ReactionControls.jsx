@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { EmojiAdd, Heart } from '@openai/apps-sdk-ui/components/Icon'
 import { reactToPost } from '../api.js'
 import {
@@ -6,6 +6,7 @@ import {
   reactionActionLabel, reactionKey, reactionState,
 } from '../reconciliation.js'
 import { EMOJI_ART } from '../emoji_art.js'
+import { reactionPickerPlacement } from './interactionRules.js'
 
 function FlatEmoji({ emoji }) {
   return <img className="cn-flat-emoji" src={EMOJI_ART[emoji]} alt="" aria-hidden="true" draggable="false" />
@@ -59,13 +60,14 @@ export function useBoardReactions({ refreshTarget, onError, onSettled }) {
 
 export default function ReactionControls({
   item, target, override, emojiReactions, canInteract, disabled,
-  pickerFor, setPickerFor, onReact, onJoin,
+  pickerFor, setPickerFor, onReact, onJoin, scrollRef,
 }) {
   const key = reactionKey(target)
   const open = emojiReactions && pickerFor === key
   const rootRef = useRef(null)
   const triggerRef = useRef(null)
   const pickerRef = useRef(null)
+  const [placement, setPlacement] = useState(null)
   const reactions = reactionState(item, override)
   const visible = BOARD_REACTION_EMOJIS.filter(emoji => reactions[emoji].count || reactions[emoji].reacted)
 
@@ -73,6 +75,37 @@ export default function ReactionControls({
     setPickerFor(null)
     if (restoreFocus) triggerRef.current?.focus({ preventScroll: true })
   }
+
+  useLayoutEffect(() => {
+    const scroll = scrollRef?.current
+    const menu = pickerRef.current
+    if (!open || target.replyId || !scroll || !menu) return undefined
+    const update = () => {
+      const bounds = scroll.getBoundingClientRect()
+      // ComposerFooter owns this measured clearance, including attachments
+      // and multiline growth. Choices must stay above that same boundary.
+      const clearance = parseFloat(getComputedStyle(scroll).paddingBottom) || 0
+      const next = reactionPickerPlacement(rootRef.current.getBoundingClientRect(),
+        menu.scrollHeight + menu.offsetHeight - menu.clientHeight,
+        { top: bounds.top, bottom: bounds.bottom - clearance })
+      setPlacement(prior => prior?.side === next.side && prior?.maxHeight === next.maxHeight ? prior : next)
+    }
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(scroll)
+    observer.observe(menu)
+    // Footer growth changes padding without necessarily resizing the feed.
+    const paddingObserver = new MutationObserver(update)
+    paddingObserver.observe(scroll, { attributes: true, attributeFilter: ['style'] })
+    scroll.addEventListener('scroll', update, { passive: true })
+    window.addEventListener('resize', update)
+    return () => {
+      observer.disconnect()
+      paddingObserver.disconnect()
+      scroll.removeEventListener('scroll', update)
+      window.removeEventListener('resize', update)
+    }
+  }, [open, scrollRef, target.replyId])
 
   useEffect(() => {
     if (!open) return undefined
@@ -111,7 +144,9 @@ export default function ReactionControls({
         ? setPickerFor(open ? null : key) : onReact('❤️')}>
       {emojiReactions ? <EmojiAdd aria-hidden="true" /> : <Heart aria-hidden="true" />}
     </button>}
-    {open && <div ref={pickerRef} id={`cn-picker-${key}`} className="cn-reaction-picker"
+    {open && <div ref={pickerRef} id={`cn-picker-${key}`}
+      className={`cn-reaction-picker${!target.replyId && placement ? ` is-bounded${placement.side === 'above' ? ' is-above' : ''}` : ''}`}
+      style={!target.replyId && placement ? { maxHeight: placement.maxHeight } : undefined}
       role="group" aria-label="Choose a reaction" onKeyDown={event => {
         if (event.key === 'Escape') { event.preventDefault(); close(true) }
       }}>

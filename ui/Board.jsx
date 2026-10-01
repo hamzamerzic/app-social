@@ -1045,6 +1045,7 @@ export default function Board({
                   <span>{replyActionLabel(replyCount)}</span>
                 </button>
                 <ReactionControls item={post} target={{ postId: post.id }}
+                  scrollRef={scrollRef}
                   override={reactionOverrides[post.id]} emojiReactions={emojiReactions}
                   canInteract={canInteract} disabled={handoffBusy || participationBusy || reactionPending[post.id]}
                   pickerFor={reactionPickerFor} setPickerFor={setReactionPickerFor}
@@ -1133,21 +1134,21 @@ export default function Board({
         )}
       </div>
       {composerMount && createPortal(<ComposerFooter scrollRef={scrollRef} className="cn-board-footer">
-        {canInteract ? <>
+        {canInteract || accountState === 'loading' ? <>
           <input ref={fileRef} className="cn-file-input" type="file" accept="image/*" multiple
                  onChange={chooseImage} tabIndex={-1} aria-hidden="true" />
           <Composer className="cn-board-composer" onSubmit={submitPost}
             inputRef={composerInputRef} value={draft} onChange={setDraft}
             maxLength={4000} placeholder="Message everyone…" label="Message everyone"
             disabled={posting || handoffBusy || participationBusy}
-            sendDisabled={posting || handoffBusy || participationBusy || (!draft.trim() && !selectedImages.length)}
-            sendLabel="Send message"
+            sendDisabled={!canInteract || posting || handoffBusy || participationBusy || (!draft.trim() && !selectedImages.length)}
+            sendLabel={accountState === 'loading' ? 'Checking your account…' : 'Send message'}
             attachmentAction={<ComposerAttachmentButton onClick={() => fileRef.current?.click()}
-              disabled={posting || selectedImages.length >= MAX_POST_IMAGES}
+              disabled={!canInteract || posting || selectedImages.length >= MAX_POST_IMAGES}
               label={selectedImages.length >= MAX_POST_IMAGES ? `Up to ${MAX_POST_IMAGES} images` : 'Attach photo'} />}>
             {selectedImages.length > 0 && <SelectedImagesStrip selected={selectedImages} onRemove={removeImage} />}
           </Composer>
-        </> : accountState === 'loading' ? null : <div className="cn-board-join">
+        </> : <div className="cn-board-join">
           <button className="cn-btn cn-btn-primary" type="button" onClick={onJoin}
                   disabled={joinBusy}>Join Social to message</button>
           <p className="cn-composer-disclosure">Community is open to read. Join to message and open Chats and People.</p>
