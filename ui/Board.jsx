@@ -614,11 +614,15 @@ export default function Board({
     setReplyDraft('')
     try {
       const receipt = await postReply(post.id, text)
+      const confirmed = { ...optimistic, id: receipt.id || localId, pending: false }
       setReplies((prior) => prior.map((reply) => (
-        reply.id === localId ? { ...reply, id: receipt.id || localId, pending: false } : reply
+        reply.id === localId ? confirmed : reply
       )))
-      // A read started before this write cannot confirm the newly sent reply.
-      replyCache.delete(String(post.id))
+      // Replace any pre-write request without discarding the confirmed write
+      // if its fresh confirmation read fails or the thread is reopened.
+      const key = String(post.id)
+      const cached = replyCache.get(key)?.result?.replies || []
+      rememberReplies(key, { replies: [...cached.filter(reply => reply.id !== confirmed.id), confirmed] })
       await loadReplies(post, { background: true, force: true })
       window.mobius?.signal?.('item_created', { type: 'board_reply' })
       onCompleteParticipation?.(completedIntent)

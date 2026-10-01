@@ -97,6 +97,35 @@ test('reopening before the feed catches up retains a cached confirmed reply', as
   assert.deepEqual(view.ids, ['confirmed'])
 })
 
+test('a sent first reply survives reopening when its confirmation read fails', async () => {
+  const view = thread({ read: () => { throw new Error('Offline') } })
+  await view.load()
+  await view.send()
+  assert.deepEqual(view.ids, ['confirmed'])
+  assert.equal(view.context.replyDraft, '')
+  assert.deepEqual(view.errors, [], 'a failed read must not turn a successful write into a failed send')
+  view.rows = []
+  await view.load()
+  assert.deepEqual(view.ids, ['confirmed'], 'reopening must retain the successful write despite the stale zero count')
+  assert.equal(await view.load({ background: true }), false)
+  assert.deepEqual(view.ids, ['confirmed'])
+})
+
+test('failed confirmation retains earlier replies, while a later canonical read can remove them', async () => {
+  const view = thread({ count: 1, read: (number) => {
+    if (number === 1) return { replies: [reply('earlier')] }
+    if (number === 2) throw new Error('Offline')
+    return { replies: [] }
+  } })
+  await view.load()
+  await view.send()
+  view.rows = []
+  await view.load()
+  assert.deepEqual(view.ids, ['earlier', 'confirmed'])
+  await view.load({ background: true })
+  assert.deepEqual(view.ids, [], 'successful snapshots remain authoritative, including deletion')
+})
+
 test('an open empty thread discovers a peer reply without waiting for cache expiry', async () => {
   const view = thread()
   await view.load()
