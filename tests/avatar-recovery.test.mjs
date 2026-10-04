@@ -13,7 +13,10 @@ async function mountedPicture(t, name, answer) {
   const document = new EventTarget()
   document.visibilityState = 'visible'
   globalThis.document = document
-  globalThis.window = { mobius: { storage: { async get() { return null }, async set() {}, async remove() {} } } }
+  const saved = []
+  globalThis.window = { mobius: { storage: {
+    async get() { return null }, async set(path, value) { saved.push([path, value]) }, async remove() {},
+  } } }
   const requests = []
   globalThis.fetch = async (_url, options) => {
     const { hosts } = JSON.parse(options.body)
@@ -31,7 +34,7 @@ async function mountedPicture(t, name, answer) {
     Object.assign(globalThis, previous)
   })
   await record.promise
-  return { cache, host, record, requests, shown, document,
+  return { cache, host, record, requests, saved, shown, document,
     unmount() { unsubscribe() },
     remount() { unsubscribe = cache.subscribeAvatar(record, url => shown.push(url)) },
   }
@@ -147,4 +150,26 @@ test('a discarded undecodable picture recovers under the same cooldown instead o
   await settle()
   assert.equal(view.requests.length, 2)
   assert.ok(view.record.url)
+})
+
+test('a first picture appears on a mounted face confirmed to have none when its directory hint arrives', async t => {
+  const view = await mountedPicture(t, 'first-picture', (call, hosts) => (
+    call === 1 ? { avatars: {}, missing: hosts } : found(hosts)
+  ))
+  assert.equal(view.record.url, null)
+  const { noteAvatarDigests } = await import('../avatarHints.js')
+  noteAvatarDigests([{ host: view.host, avatar: 'd'.repeat(64) }])
+  await settle()
+  assert.equal(view.requests.length, 2)
+  assert.ok(view.record.url)
+  assert.equal(view.shown.at(-1), view.record.url)
+})
+
+test('an answer that is not a usable picture is never saved to the device', async t => {
+  const unusable = { mime: 'text/plain', data_b64: 'AQ==' }
+  const view = await mountedPicture(t, 'unusable-answer', (_call, hosts) => ({
+    avatars: Object.fromEntries(hosts.map(host => [host, unusable])), missing: [],
+  }))
+  assert.equal(view.record.url, null)
+  assert.deepEqual(view.saved, [])
 })

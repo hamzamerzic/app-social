@@ -177,9 +177,10 @@ async function resolveBatch(jobs, lane) {
       // Whatever the answer, it was checked against this directory hash; a
       // host the directory cannot serve then keeps time-based freshness.
       job.record.checkedDigest = digests[job.key] || null
-      // Only a definite answer is worth keeping; a transient failure must
-      // not replace a saved face.
-      if (wire || missing.has(job.key)) {
+      // Only a definite answer is worth keeping: a usable face or a confirmed
+      // absence. A transient failure or undecodable data must not replace a
+      // saved face.
+      if (job.record.failedAt === null) {
         saveAvatar(job.key, wire, digest, job.record.checkedDigest)
       }
     }
@@ -238,15 +239,16 @@ function answerIsCurrent(record, key, now) {
   return avatarCacheIsFresh(record && { ...record, promise: null }, now)
 }
 
-// A member who changed their picture gets a new hash in the next feed or
-// directory response; refresh their face wherever it is on screen.
+// A member who changed or first added their picture gets a new hash in the
+// next feed or directory response; refresh their face wherever it is on
+// screen. Only answered records qualify, so an owner picture removed through
+// primeAvatar stays removed.
 onAvatarDigestChange((hosts) => {
   for (const key of hosts) {
     const record = cache.get(key)
-    if (record?.listeners.size && (record.url || record.failedAt !== null)
-        && !isCurrent(record, key, Date.now())) {
-      cachedAvatar(key)
-    }
+    if (!record?.listeners.size) continue
+    const answered = record.url || record.failedAt !== null || record.notFoundAt !== null
+    if (answered && !isCurrent(record, key, Date.now())) cachedAvatar(key)
   }
 })
 
