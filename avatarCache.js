@@ -95,7 +95,6 @@ function scheduleAvatarRecovery() {
     }
     scheduleAvatarRecovery()
   }, Math.max(0, deadline - Date.now()))
-  recoveryTimer?.unref?.()
 }
 
 globalThis.document?.addEventListener('visibilitychange', scheduleAvatarRecovery)
@@ -335,7 +334,6 @@ export function discardAvatar(host, url) {
   record.url = null
   record.fetchedAt = null
   record.failedAt = Date.now()
-  record.notFoundAt = null
   record.generation += 1
   for (const listener of record.listeners) listener(null)
   // An undecodable saved copy must not come back on the next launch.
