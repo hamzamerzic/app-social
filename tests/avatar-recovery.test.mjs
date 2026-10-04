@@ -8,14 +8,16 @@ const settle = async () => {
   await new Promise(resolve => setImmediate(resolve))
 }
 
-async function mountedPicture(t, name, answer) {
+async function mountedPicture(t, name, answer, stored = null) {
   const previous = { fetch: globalThis.fetch, window: globalThis.window, document: globalThis.document }
   const document = new EventTarget()
   document.visibilityState = 'visible'
   globalThis.document = document
   const saved = []
+  const removed = []
   globalThis.window = { mobius: { storage: {
-    async get() { return null }, async set(path, value) { saved.push([path, value]) }, async remove() {},
+    async get() { return stored }, async set(path, value) { saved.push([path, value]) },
+    async remove(path) { removed.push(path) },
   } } }
   const requests = []
   globalThis.fetch = async (_url, options) => {
@@ -34,7 +36,7 @@ async function mountedPicture(t, name, answer) {
     Object.assign(globalThis, previous)
   })
   await record.promise
-  return { cache, host, record, requests, saved, shown, document,
+  return { cache, host, record, requests, saved, removed, shown, document,
     unmount() { unsubscribe() },
     remount() { unsubscribe = cache.subscribeAvatar(record, url => shown.push(url)) },
   }
@@ -157,6 +159,7 @@ test('a first picture appears on a mounted face confirmed to have none when its 
     call === 1 ? { avatars: {}, missing: hosts } : found(hosts)
   ))
   assert.equal(view.record.url, null)
+  assert.deepEqual(view.saved.map(([, value]) => value.avatar), [null], 'a confirmed absence is saved')
   const { noteAvatarDigests } = await import('../avatarHints.js')
   noteAvatarDigests([{ host: view.host, avatar: 'd'.repeat(64) }])
   await settle()
@@ -172,4 +175,12 @@ test('an answer that is not a usable picture is never saved to the device', asyn
   }))
   assert.equal(view.record.url, null)
   assert.deepEqual(view.saved, [])
+})
+
+test('an unusable picture saved by an older version is dropped and fetched fresh', async t => {
+  const stored = { checked_at: 1_000_000, avatar: { mime: 'text/plain', data_b64: 'AQ==' } }
+  const view = await mountedPicture(t, 'unusable-saved', (_call, hosts) => found(hosts), stored)
+  assert.equal(view.requests.length, 1)
+  assert.ok(view.record.url)
+  assert.equal(view.removed.length, 1)
 })

@@ -215,6 +215,12 @@ async function restoreSavedAvatar(key, record) {
   const generation = record.generation
   const saved = await readSavedAvatar(key)
   if (!saved || record.generation !== generation) return false
+  // Older versions could save data that is not a usable picture; ask the
+  // service instead of restoring it as a failure.
+  if (saved.avatar && !avatarBlob(saved.avatar)?.size) {
+    forgetSavedAvatar(key)
+    return false
+  }
   const savedDigest = typeof saved.digest === 'string' ? saved.digest : null
   const applied = saved.avatar
     ? updateRecord(record, saved.avatar, null, generation, saved.checked_at, savedDigest)
