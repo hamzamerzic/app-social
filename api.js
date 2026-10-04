@@ -376,12 +376,12 @@ export function timeAgo(ts) {
 export function postDateTime(ts) {
   if (!ts) return ''
   return new Date(ts * 1000).toLocaleString(undefined, {
-    day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
+    day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
   })
 }
 
 export function clockTime(ts) {
   return new Date(ts * 1000).toLocaleTimeString(undefined, {
-    hour: '2-digit', minute: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
   })
 }
