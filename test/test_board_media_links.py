@@ -54,6 +54,23 @@ class BoardMediaLinkTests(unittest.IsolatedAsyncioTestCase):
       await self.requested(None, thumbnail=True),
       [host_url(f"board/thumbnail/{POST}.webp")],
     )
+
+  async def test_reply_proxy_uses_post_and_reply_scoped_link(self):
+    reply_id = "1f1e2d3c-4b5a-4978-8a9b-0c1d2e3f4a5b"
+    download = AsyncMock(return_value=("image/png", png()))
+    with (
+      patch.object(social_routes, "_require_owner_or_common_app"),
+      patch.object(social_routes, "_download_board_media", new=download),
+    ):
+      response = await social_routes.get_reply_media_for_owner(
+        POST, reply_id, False, "image/png", db=None, principal=None,
+      )
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(response.body, png())
+    self.assertEqual(response.headers["cache-control"], social_routes.OWNER_BOARD_IMAGE_CACHE)
+    self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+    self.assertEqual(download.await_args.args[0], host_url(
+      f"board/{POST}/replies/{reply_id}/media.png"))
     self.assertEqual(
       await self.requested(2, thumbnail=True),
       [host_url(f"board/thumbnail/{POST}/2.webp")],

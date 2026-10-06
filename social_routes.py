@@ -67,7 +67,7 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from common_protocol import (
@@ -1917,6 +1917,36 @@ async def get_board_media_index_for_owner(
   )
 
 
+@router.get("/reply-media/{post_id}/{reply_id}")
+async def get_reply_media_for_owner(
+  post_id: str,
+  reply_id: str,
+  thumbnail: bool = False,
+  mime: str | None = None,
+  db: object = Depends(get_db),
+  principal: Principal = Depends(get_principal),
+):
+  """Proxy one hosted reply image under its post and reply identity."""
+  _require_owner_or_common_app(db, principal)
+  if not _valid_id(post_id) or not _valid_id(reply_id):
+    raise HTTPException(status_code=400, detail="Reply media id is invalid.")
+  extension = "webp" if thumbnail else _ATTACHMENT_MIME_EXT.get(mime)
+  kind = "thumbnail" if thumbnail else "media"
+  path = f"board/{post_id}/replies/{reply_id}/{kind}"
+  if extension:
+    path += f".{extension}"
+  try:
+    found_mime, data = await _download_board_media(_peer_service_url(COMMUNITY_HOST, path))
+    if thumbnail:
+      found_mime, data = image_thumbnail_bytes(data)
+  except Exception as exc:
+    raise HTTPException(status_code=404, detail="Reply image not found.") from exc
+  # The bounded client thumbnail cache already handles reopening. Do not
+  # leave a second, unbounded disk copy that is never read by this proxy.
+  return Response(content=data, media_type=found_mime,
+    headers={"Cache-Control": OWNER_BOARD_IMAGE_CACHE, "X-Content-Type-Options": "nosniff"})
+
+
 async def _feed_payload(
   limit: int = 30,
   before: str | None = None,
@@ -1967,7 +1997,10 @@ class ReactionPost(BaseModel):
 
 class ReplyPost(BaseModel):
   post_id: str
-  text: str
+  text: str = ""
+  id: str | None = None
+  attachment: Any = None
+  thumbnail: Any = None
 
 
 @router.post("/like")
@@ -2042,12 +2075,31 @@ async def reply_to_post(
   if not re.fullmatch(r"[a-f0-9-]{8,64}", post_id):
     raise HTTPException(status_code=400, detail="Post id is invalid.")
   text = body.text.strip()
-  if not text or len(text) > MAX_REPLY_TEXT_CHARS:
-    raise HTTPException(status_code=400, detail="Reply text is invalid.")
+  attachment = _validate_attachment(body.attachment)
+  thumbnail = _validate_attachment(body.thumbnail)
+  _validate_text_or_attachment(text, attachment, "Reply text is invalid.", MAX_REPLY_TEXT_CHARS)
+  if thumbnail is not None and attachment is None:
+    raise HTTPException(status_code=400, detail="Reply thumbnail needs a photo.")
   identity = _load_identity()
   _require_username(identity)
   host = COMMUNITY_HOST
-  reply_id = str(uuid.uuid4())
+  reply_id = body.id or str(uuid.uuid4())
+  if not _valid_id(reply_id):
+    raise HTTPException(status_code=400, detail="Reply id is invalid.")
+  if attachment is not None:
+    # Older hosts may accept board_reply but ignore its new media fields.
+    # Refuse the write until the shared host explicitly advertises support.
+    try:
+      capability_response = await federation_request(
+        "GET", _peer_service_url(host, "board"),
+        params={"limit": 1}, timeout_seconds=OUTBOUND_TIMEOUT_S,
+      )
+      capability_response.raise_for_status()
+      supported = capability_response.json().get("capabilities", {}).get("reply_attachments") is True
+    except Exception as exc:
+      raise HTTPException(status_code=502, detail="Community reply photo support could not be checked.") from exc
+    if not supported:
+      raise HTTPException(status_code=409, detail="Community host does not support reply photos yet.")
   sent_at = time.time()
   envelope = {
     "v": 0,
@@ -2058,7 +2110,12 @@ async def reply_to_post(
     "from": _own_host(),
     "sent_at": sent_at,
   }
+  if attachment is not None:
+    envelope["attachment"] = attachment[0]
+  if thumbnail is not None:
+    envelope["thumbnail"] = thumbnail[0]
   envelope["sig"] = _sign(envelope, identity["private_key_b64"])
+  _validate_attachment_envelope_size(envelope)
   try:
     response = await _post_signed_envelope(
       _peer_service_url(host, "board/reply"), envelope,

@@ -10,6 +10,24 @@ const group = readFileSync(new URL('../ui/GroupThread.jsx', import.meta.url), 'u
 const css = readFileSync(new URL('../theme.js', import.meta.url), 'utf8')
 const board = readFileSync(new URL('../ui/Board.jsx', import.meta.url), 'utf8')
 const shell = readFileSync(new URL('../index.jsx', import.meta.url), 'utf8')
+const media = readFileSync(new URL('../ui/Media.jsx', import.meta.url), 'utf8')
+
+test('single and multiple attachments share the image-only composer tray', () => {
+  assert.match(media, /return <SelectedImagesStrip selected=\{\[selected\]\}/)
+  assert.doesNotMatch(media, /Photo ready|cn-selected-image/)
+  assert.match(media, /disabled=\{disabled\}/)
+  assert.match(media, /onOpen\?\.\(image\.previewUrl/)
+  for (const source of [thread, group, board]) {
+    assert.match(source, /<SelectedImages?Strip\b[^\n]*onOpen=\{onOpenImage\}/)
+  }
+})
+
+test('empty replies show the composer without redundant empty-state copy', () => {
+  assert.doesNotMatch(board, /No replies yet|cn-reply-empty/)
+  assert.match(board, /replyState === 'loading'/)
+  assert.match(board, /replyState === 'error'/)
+  assert.match(css, /\.cn-inline-replies:not\(:empty\)\s*\{[^}]*border-bottom:/)
+})
 
 test('Community shares the shell-owned scroller for reading, anchoring and composer clearance', () => {
   assert.match(shell, /ref=\{boardScrollRef\}/)

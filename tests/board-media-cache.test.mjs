@@ -47,6 +47,30 @@ test('an unsaved thumbnail goes straight to the service without a storage miss',
   }
 })
 
+test('reply thumbnails use their parent-scoped route and cannot reuse a post thumbnail', async () => {
+  const store = storage({
+    'cache/board-thumbnails/post-1-0.webp': new Blob(['post photo']),
+    'cache/board-thumbnails/index.json': { paths: ['cache/board-thumbnails/post-1-0.webp'] },
+  })
+  globalThis.window = { mobius: { storage: store } }
+  let requested
+  globalThis.fetch = async (path) => {
+    requested = path
+    return { ok: true, async blob() { return new Blob(['reply photo']) } }
+  }
+  try {
+    assert.equal(await (await boardThumbnail('post-1', undefined, 'reply-1')).text(), 'reply photo')
+    assert.match(requested, /reply-media\/post-1\/reply-1\?thumbnail=true$/)
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    const { paths } = store.values.get('cache/board-thumbnails/index.json')
+    assert.ok(paths.includes('cache/board-thumbnails/reply-post-1-reply-1.webp'))
+    assert.ok(paths.includes('cache/board-thumbnails/post-1-0.webp'))
+  } finally {
+    delete globalThis.window
+    delete globalThis.fetch
+  }
+})
+
 test('new thumbnails are saved once and only the newest are kept', async () => {
   const store = storage()
   let requests = 0

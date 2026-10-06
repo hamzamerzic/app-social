@@ -217,6 +217,26 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(result["id"], peer.await_args.args[1]["id"])
     self.assertEqual(result["reply_count"], 1)
 
+  async def test_photo_reply_refuses_host_without_advertised_capability(self):
+    attachment = {"mime": "image/png", "data_b64": "eA==", "w": 1, "h": 1}
+    response = httpx.Response(200, json={"posts": [], "capabilities": {}},
+                              request=httpx.Request("GET", "https://community.example/board"))
+    send = AsyncMock()
+    with (
+      patch.object(social_routes, "_require_member"),
+      patch.object(social_routes, "_load_identity", return_value={"handle": "owner", "private_key_b64": "fixture"}),
+      patch.object(social_routes, "_require_username"),
+      patch.object(social_routes, "federation_request", new=AsyncMock(return_value=response)),
+      patch.object(social_routes, "_post_signed_envelope", new=send),
+    ):
+      with self.assertRaises(HTTPException) as caught:
+        await social_routes.reply_to_post(
+          social_routes.ReplyPost(post_id="abcdef12", text="", attachment=attachment),
+          db=None, principal=service_runtime.Principal("owner", None, None),
+        )
+    self.assertEqual(caught.exception.status_code, 409)
+    send.assert_not_awaited()
+
 
 if __name__ == "__main__":
   unittest.main()

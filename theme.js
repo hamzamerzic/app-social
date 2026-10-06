@@ -178,11 +178,6 @@ export const CSS = `
 .cn-board-join { text-align: center; pointer-events: auto; max-width: 720px; margin-inline: auto; }
 .cn-board-join .cn-btn { width: min(100%, 440px); min-height: 48px; }
 .cn-board-join .cn-composer-disclosure { margin: 7px auto 0; }
-.cn-board-composer .cn-selected-gallery {
-  flex-wrap: nowrap; min-width: 0; max-width: 100%; overflow-x: auto;
-  margin: 0; padding: 2px 6px 4px; scrollbar-width: none;
-}
-.cn-board-composer .cn-selected-gallery::-webkit-scrollbar { display: none; }
 .cn-composer-disclosure {
   margin: 7px 4px 0 56px; color: var(--muted); font-size: 12px; line-height: 1.35;
 }
@@ -294,6 +289,7 @@ export const CSS = `
   border: 1px solid var(--border); border-radius: 14px; background: transparent; cursor: default;
 }
 .cn-inline-replies { flex: 0 1 auto; min-height: 0; overflow-y: auto; padding: 0 8px; overscroll-behavior: contain auto; }
+.cn-inline-replies:not(:empty) { border-bottom: 1px solid color-mix(in srgb, var(--border) 72%, transparent); }
 .cn-inline-replies .cn-reply-row { padding: 8px 0; gap: 8px; }
 .cn-thread-loading { min-height: 48px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 13px; }
 .cn-inline-thread .cn-reply-composer { padding: 8px; background: transparent; }
@@ -582,24 +578,15 @@ export const CSS = `
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0.78;
 }
 .cn-file-input { display: none; }
-.cn-selected-image {
-  min-height: 62px; margin: 9px 12px 0; padding: 5px 5px 5px 6px;
-  display: flex; align-items: center; gap: 10px;
-  background: var(--surface-2, var(--surface)); border: 1px solid var(--border); border-radius: 14px;
-}
-.cn-selected-image img { width: 50px; height: 50px; border-radius: 10px; object-fit: cover; display: block; }
-.cn-selected-image > span { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
-.cn-selected-image strong { font-size: 13px; font-weight: 720; }
-.cn-selected-image small { color: var(--muted); font-size: 11.5px; }
-.cn-selected-image button, .cn-reply-target button {
+.cn-reply-target button {
   width: 44px; height: 44px; border: 0; border-radius: 50%; flex: 0 0 auto;
   display: flex; align-items: center; justify-content: center; cursor: pointer;
   background: transparent; color: var(--muted);
 }
-.cn-selected-image button:hover, .cn-reply-target button:hover {
+.cn-reply-target button:hover {
   background: color-mix(in srgb, var(--text) 7%, transparent); color: var(--text);
 }
-.cn-selected-image button svg, .cn-reply-target button svg { width: 18px; height: 18px; }
+.cn-reply-target button svg { width: 18px; height: 18px; }
 .cn-reply-target {
   min-height: 62px; margin: 9px 12px 0; padding: 7px 5px 7px 12px;
   display: flex; align-items: center; gap: 10px;
@@ -642,21 +629,33 @@ export const CSS = `
 
 /* Selected-image tray in the composer */
 .cn-selected-gallery {
-  display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 0;
+  display: flex; align-items: center; gap: 8px;
+  min-width: 0; max-width: 100%; overflow-x: auto;
+  margin: 0; padding: 2px 6px 4px; scrollbar-width: none;
 }
+.cn-selected-gallery::-webkit-scrollbar { display: none; }
 .cn-selected-thumb {
-  position: relative; width: 74px; height: 74px; border-radius: 12px;
+  position: relative; width: 96px; height: 96px; border-radius: 14px;
   overflow: hidden; background: var(--surface-2, var(--surface));
   border: 1px solid var(--border); flex: 0 0 auto;
 }
 .cn-selected-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.cn-selected-thumb button {
-  position: absolute; top: 3px; right: 3px; width: 22px; height: 22px;
-  border: 0; border-radius: 50%; cursor: pointer;
-  display: flex; align-items: center; justify-content: center;
-  background: rgba(8, 8, 12, 0.72); color: #fff;
+.cn-selected-preview {
+  width: 100%; height: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in;
 }
-.cn-selected-thumb button svg { width: 13px; height: 13px; }
+.cn-selected-remove {
+  position: absolute; top: 0; right: 0; width: 44px; height: 44px;
+  padding: 0; border: 0; cursor: pointer; background: transparent; color: #fff;
+  display: flex; align-items: center; justify-content: center;
+}
+.cn-selected-remove::before {
+  content: ''; position: absolute; top: 4px; right: 4px; width: 20px; height: 20px;
+  border-radius: 50%; background: rgba(0, 0, 0, 0.6);
+}
+.cn-selected-remove svg { position: absolute; top: 7.5px; right: 7.5px; width: 13px; height: 13px; }
+.cn-selected-remove:hover::before { background: rgba(0, 0, 0, 0.8); }
+.cn-selected-remove:disabled { opacity: .42; cursor: default; }
+.cn-selected-preview:focus-visible, .cn-selected-remove:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 13px; }
 
 @media (hover: none) {
   .cn-bubble-reply { opacity: 1; pointer-events: auto; }
@@ -805,7 +804,6 @@ export const CSS = `
   width: 38px; height: 4px; border-radius: 2px; background: var(--border);
   margin: -8px auto 16px;
 }
-.cn-sheet .cn-selected-image { margin-inline: 0; }
 .cn-post-compose { display: flex; align-items: flex-start; gap: 11px; }
 .cn-post-compose .cn-avatar { margin-top: 5px; }
 .cn-post-compose .cn-textarea { min-width: 0; flex: 1; min-height: 132px; }
@@ -868,19 +866,15 @@ export const CSS = `
 .cn-reply-row + .cn-reply-row { border-top: 1px solid color-mix(in srgb, var(--border) 62%, transparent); }
 .cn-reply-row.is-pending { opacity: 0.68; }
 .cn-reply-copy { flex: 1; min-width: 0; }
+.cn-reply-image { max-width: 100%; max-height: 180px; margin-top: 6px; border-radius: 10px; }
+.cn-reply-image img { object-fit: contain; }
 .cn-reply-meta { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .cn-reply-meta strong { font-size: 13.5px; font-weight: 720; letter-spacing: -0.008em; }
 .cn-reply-copy p {
   margin: 4px 0 0; font-size: 14.5px; line-height: 1.48; white-space: pre-wrap;
 }
-.cn-reply-empty {
-  margin: 0; padding: 14px 12px; text-align: center; color: var(--muted);
-  font-size: 14px; line-height: 1.5;
-}
-.cn-reply-empty p { margin: 0 0 14px; }
 .cn-reply-composer {
   flex: 0 0 auto; display: flex; padding-top: 12px;
-  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
 }
 @keyframes cn-reply-in {
   from { opacity: 0.35; transform: translateY(4px); }
@@ -1135,6 +1129,27 @@ export const CSS = `
 .cn-composer-attach:disabled { opacity: .45; cursor: default; }
 .cn-composer-attach:focus-visible,
 .cn-composer-send:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Inline replies use quieter 32px circles inside full-size tap targets. */
+.cn-reply-composer { gap: 4px; }
+.cn-reply-composer .cn-composer-send,
+.cn-reply-composer .cn-composer-attach {
+  position: relative; width: 44px; height: 44px; background: transparent; border: 0;
+  backdrop-filter: none; -webkit-backdrop-filter: none;
+}
+.cn-reply-composer .cn-composer-send::before,
+.cn-reply-composer .cn-composer-attach::before {
+  content: ''; position: absolute; inset: 6px; border-radius: 50%; pointer-events: none;
+}
+.cn-reply-composer .cn-composer-send::before { background: var(--accent); }
+.cn-reply-composer .cn-composer-attach::before {
+  border: 1px solid var(--border); background: color-mix(in srgb, var(--surface) 60%, transparent);
+  backdrop-filter: blur(16px) saturate(140%); -webkit-backdrop-filter: blur(16px) saturate(140%);
+}
+.cn-reply-composer .cn-composer-attach:hover { background: transparent; }
+.cn-reply-composer .cn-composer-attach:hover::before { background: var(--surface-2, var(--surface)); }
+.cn-reply-composer .cn-composer-send svg,
+.cn-reply-composer .cn-composer-attach svg { position: relative; width: 18px; height: 18px; }
 
 /* Mobile navigation sits inline with the brand and account, not in a dock. */
 @media (max-width: 719px) {

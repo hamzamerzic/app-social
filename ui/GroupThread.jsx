@@ -17,6 +17,7 @@ import {
   addUnseenMessages, isDefinitePrecommitRejection, reconcileLatestPage,
   reconcileOlderPage, settleOptimistic,
 } from '../message_ui_state.js'
+import { reachedEarlierHistory } from './historyScroll.js'
 
 export default function GroupThread({
   group, me, version, foreground, onBack, showToast, onOpenImage,
@@ -27,10 +28,14 @@ export default function GroupThread({
   const refreshRequest = useRef(0)
   const latestPage = useRef(null)
   const paginationGeneration = useRef(0)
+  const conversationEpoch = useRef(0)
   const seenVersion = useRef(version)
   const [messages, setMessages] = useState(null)
   const [nextCursor, setNextCursor] = useState(null)
   const [loadingEarlier, setLoadingEarlier] = useState(false)
+  const earlierInFlight = useRef(false)
+  const earlierFailed = useRef(false)
+  const lastScrollTop = useRef(null)
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
   const [processingImage, setProcessingImage] = useState(false)
@@ -64,10 +69,11 @@ export default function GroupThread({
         paginationGeneration.current += 1
         setNextCursor(reconciled.nextCursor)
       }
-      setCurrentGroup(metadata); setLoadError('')
+      setCurrentGroup(metadata)
+      if (!earlierFailed.current) setLoadError('')
       return true
     } catch (error) {
-      if (request === refreshRequest.current) setLoadError('Messages couldn’t be refreshed. Your saved history hasn’t been removed.')
+      if (request === refreshRequest.current && !earlierFailed.current) setLoadError('Messages couldn’t be refreshed. Your saved history hasn’t been removed.')
       return false
     }
   }
@@ -75,6 +81,12 @@ export default function GroupThread({
   useEffect(() => {
     seenVersion.current = version
     paginationGeneration.current += 1
+    conversationEpoch.current += 1
+    earlierInFlight.current = false
+    earlierFailed.current = false
+    lastScrollTop.current = null
+    setLoadError('')
+    setLoadingEarlier(false)
     updateMessages(null)
     setNextCursor(null)
     const watch = watchLatestGroupMessages(gid, (page) => {
@@ -93,6 +105,9 @@ export default function GroupThread({
       watch.stop()
       latestPage.current = null
       refreshRequest.current += 1
+      paginationGeneration.current += 1
+      conversationEpoch.current += 1
+      earlierInFlight.current = false
     }
   }, [gid])
   // Messages are read only while this pane is actually visible to the owner.
@@ -109,12 +124,16 @@ export default function GroupThread({
     }
   }, [version])
   async function loadEarlier() {
-    if (!nextCursor || loadingEarlier) return
+    if (!nextCursor || earlierInFlight.current) return
+    earlierInFlight.current = true
+    earlierFailed.current = false
+    setLoadError('')
     const el = scrollRef.current
     const previousHeight = el?.scrollHeight || 0
     stickToBottom.current = false
     setLoadingEarlier(true)
     const generation = paginationGeneration.current
+    const epoch = conversationEpoch.current
     try {
       const page = await listGroupMessages(gid, nextCursor)
       const reconciled = reconcileOlderPage(
@@ -125,14 +144,21 @@ export default function GroupThread({
       setNextCursor(reconciled.nextCursor)
       setLoadError('')
       requestAnimationFrame(() => {
-        if (el) el.scrollTop += el.scrollHeight - previousHeight
+        if (el && el === scrollRef.current && generation === paginationGeneration.current) {
+          el.scrollTop += el.scrollHeight - previousHeight
+          lastScrollTop.current = el.scrollTop
+        }
       })
     } catch {
       if (generation === paginationGeneration.current) {
+        earlierFailed.current = true
         setLoadError('Earlier messages couldn’t be loaded. Your saved history hasn’t been removed.')
       }
     } finally {
-      setLoadingEarlier(false)
+      if (epoch === conversationEpoch.current) {
+        earlierInFlight.current = false
+        setLoadingEarlier(false)
+      }
     }
   }
   useEffect(() => {
@@ -145,7 +171,10 @@ export default function GroupThread({
   function trackScroll() {
     const el = scrollRef.current
     if (!el || requestStatus(currentGroup) === 'pending') return
+    const shouldLoad = reachedEarlierHistory(lastScrollTop.current, el)
+    lastScrollTop.current = el.scrollTop
     stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 72
+    if (shouldLoad && nextCursor && !earlierFailed.current) loadEarlier()
   }
 
   async function chooseImage(event) {
@@ -348,7 +377,7 @@ export default function GroupThread({
             {loadingEarlier ? 'Loading earlier messages…' : 'Load earlier messages'}
           </button>
         )}
-        {loadError && <div className="cn-directory-error" role="alert"><p>{loadError}</p><button className="cn-btn cn-btn-secondary" onClick={refresh}>Try again</button></div>}
+        {loadError && <div className="cn-directory-error" role="alert"><p>{loadError}</p><button className="cn-btn cn-btn-secondary" onClick={() => earlierFailed.current ? loadEarlier() : refresh()}>Try again</button></div>}
         {messages === null && !loadError && <div className="cn-center cn-history-loading" role="status"><div className="cn-spinner" /><span>Loading messages…</span></div>}
         {messages !== null && messages.length === 0 && (
           <div className="cn-empty">
@@ -372,7 +401,7 @@ export default function GroupThread({
                     disabled={sending || processingImage} />}>
           {(replyTarget || selectedImage) && <>
             <ReplyTarget reply={replyTarget} onDismiss={() => setReplyTarget(null)} />
-            <SelectedImageStrip selected={selectedImage} onRemove={() => setSelectedImage(null)} />
+            <SelectedImageStrip selected={selectedImage} onRemove={() => setSelectedImage(null)} onOpen={onOpenImage} />
           </>}
         </Composer>
       </ComposerFooter>}

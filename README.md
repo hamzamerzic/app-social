@@ -58,6 +58,22 @@ never joins or submits an interaction. Directory search requires a registered,
 signed member request; direct and group conversation routes require local
 membership. A personal Möbius hosts no board of its own.
 
+### Photos and captions
+
+Direct messages, group messages, and Community posts send photo attachments
+and text together. Community replies also support one photo with optional text;
+text-only and photo-only replies both work. A selected photo can be removed
+without losing the caption. Reply drafts retain both on a failed send, and an
+unchanged retry reuses the reply identity rather than publishing twice.
+
+Reply photos use the existing image preparation and limits (a 1 MiB image,
+with a separate compact thumbnail). Their media is scoped to the parent post
+and reply and removed with the post. The Community host must advertise
+`reply_attachments: true` before the reply attachment button is enabled; the
+personal service checks that capability again before sending. Deploy the
+companion Community host release as well as this app update. This feature does
+not add animated GIF or video support.
+
 ### Group conversations
 
 Messages lists saved groups and direct conversations. Creating a group opens

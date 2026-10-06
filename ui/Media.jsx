@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { ImageSquare, Minus, Plus, X } from '@openai/apps-sdk-ui/components/Icon'
-import { getBoardMedia } from '../api.js'
+import { getBoardMedia, getReplyMedia } from '../api.js'
 import { boardThumbnail } from '../boardMediaCache.js'
 import {
   clampLightboxScale, pinchLightboxScale, wheelLightboxScale,
@@ -136,7 +136,7 @@ export async function prepareImage(file, maxBytes = MAX_BYTES) {
   }
 }
 
-function ManagedImage({ attachment, storagePath, postId, index, className, alt, onOpen, onUnavailable, square }) {
+function ManagedImage({ attachment, storagePath, postId, replyId, index, className, alt, onOpen, onUnavailable, square }) {
   const directUrl = attachment?.preview_url || null
   const [url, setUrl] = useState(directUrl)
   const [failed, setFailed] = useState(false)
@@ -155,7 +155,7 @@ function ManagedImage({ attachment, storagePath, postId, index, className, alt, 
     }
     setUrl(null)
     const load = postId
-      ? boardThumbnail(postId, index)
+      ? boardThumbnail(postId, index, replyId)
       : window.mobius?.storage?.getBlob?.(storagePath)
     if (!load?.then) {
       setFailed(true)
@@ -186,7 +186,7 @@ function ManagedImage({ attachment, storagePath, postId, index, className, alt, 
       active = false
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [directUrl, postId, index, storagePath])
+  }, [directUrl, postId, replyId, index, storagePath])
 
   return (
     <button
@@ -195,12 +195,14 @@ function ManagedImage({ attachment, storagePath, postId, index, className, alt, 
       style={square ? undefined : { aspectRatio: `${width} / ${height}` }}
       onClick={async () => {
         if (!url) return
-        if (!postId) {
+        if (!postId || directUrl) {
           onOpen(url, alt)
           return
         }
         try {
-          const full = await getBoardMedia(postId, index, { mime: attachment?.mime })
+          const full = replyId
+            ? await getReplyMedia(postId, replyId, { mime: attachment?.mime })
+            : await getBoardMedia(postId, index, { mime: attachment?.mime })
           const fullUrl = URL.createObjectURL(full)
           onOpen(fullUrl, alt, () => URL.revokeObjectURL(fullUrl))
         } catch {
@@ -288,31 +290,33 @@ export function BoardImage({ post, onOpen, onUnavailable }) {
   )
 }
 
-export function SelectedImageStrip({ selected, onRemove }) {
-  if (!selected) return null
-  return (
-    <div className="cn-selected-image">
-      <img src={selected.previewUrl} alt="Selected attachment preview" />
-      <span>
-        <strong>Photo ready</strong>
-        <small>{selected.payload.w} × {selected.payload.h}</small>
-      </span>
-      <button type="button" onClick={onRemove} aria-label="Remove photo">
-        <X aria-hidden="true" />
-      </button>
-    </div>
-  )
+export function ReplyImage({ postId, reply, onOpen, onUnavailable }) {
+  if (!reply?.attachment) return null
+  return <ManagedImage attachment={reply.attachment} postId={postId} replyId={reply.id}
+    className="cn-reply-image" alt="reply photo" onOpen={onOpen} onUnavailable={onUnavailable} />
 }
 
-export function SelectedImagesStrip({ selected, onRemove }) {
+export function SelectedImageStrip({ selected, onRemove, disabled = false, onOpen }) {
+  if (!selected) return null
+  return <SelectedImagesStrip selected={[selected]} onRemove={onRemove}
+    disabled={disabled} onOpen={onOpen} />
+}
+
+export function SelectedImagesStrip({ selected, onRemove, disabled = false, onOpen }) {
   if (!selected?.length) return null
   return (
     <div className="cn-selected-gallery">
       {selected.map((image, i) => (
         <div className="cn-selected-thumb" key={image.id ?? i}>
-          <img src={image.previewUrl} alt={`Selected image ${i + 1}`} />
-          <button type="button" onClick={() => onRemove(i)}
-                  aria-label={`Remove image ${i + 1}`}>
+          <button className="cn-selected-preview" type="button"
+            onPointerDown={event => event.preventDefault()}
+            onClick={() => onOpen?.(image.previewUrl, `Selected photo ${i + 1}`)}
+            aria-label={`Preview selected photo ${i + 1}`}>
+            <img src={image.previewUrl} alt="" />
+          </button>
+          <button className="cn-selected-remove" type="button" onClick={() => onRemove(i)}
+                  onPointerDown={event => event.preventDefault()} disabled={disabled}
+                  aria-label={selected.length === 1 ? 'Remove photo' : `Remove image ${i + 1}`}>
             <X aria-hidden="true" />
           </button>
         </div>

@@ -65,3 +65,18 @@ test('one-line text is centered, multiline send stays low, and bottom picker cho
     rmSync(folder, { recursive: true, force: true })
   }
 })
+
+test('reply buttons look compact while retaining full-size tap targets', {
+  skip: !process.env.CHROME_BIN && 'CHROME_BIN is not configured',
+}, async () => {
+  const folder = mkdtempSync(join(tmpdir(), 'social-compact-reply-'))
+  const file = join(folder, 'test.html')
+  try {
+    writeFileSync(file, `<style>:root{--font:sans-serif;--bg:#fff;--surface:#fff;--text:#111;--border:#ccc;--accent:#7048e8}*{box-sizing:border-box}body{margin:0}${CSS}</style><form class="cn-composer cn-reply-composer"><button class="cn-composer-attach"><svg></svg></button><div class="cn-composer-pill"><div class="cn-composer-input-line"><textarea rows="1">Reply</textarea><button class="cn-composer-send"><svg></svg></button></div></div></form><pre id="result"></pre><script>document.querySelector('#result').textContent=JSON.stringify([...document.querySelectorAll('button')].map(b=>{const r=b.getBoundingClientRect(),p=getComputedStyle(b,'::before'),s=b.querySelector('svg').getBoundingClientRect();return{w:r.width,h:r.height,circle:r.width-parseFloat(p.left)-parseFloat(p.right),icon:s.width}}))</script>`)
+    for (const width of [320, 426, 1280]) {
+      const buttons = await renderLayout(process.env.CHROME_BIN, file, { width })
+      assert.ok(buttons.every(b=>b.w>=44 && b.h>=44),JSON.stringify(buttons))
+      assert.ok(buttons.every(b=>b.circle===32 && b.icon===18),JSON.stringify(buttons))
+    }
+  } finally { rmSync(folder,{recursive:true,force:true}) }
+})
