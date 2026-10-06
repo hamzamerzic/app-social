@@ -292,7 +292,7 @@ export const CSS = `
 .cn-inline-replies:not(:empty) { border-bottom: 1px solid color-mix(in srgb, var(--border) 72%, transparent); }
 .cn-inline-replies .cn-reply-row { padding: 8px 0; gap: 8px; }
 .cn-thread-loading { min-height: 48px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 13px; }
-.cn-inline-thread .cn-reply-composer { padding: 8px; background: transparent; }
+.cn-inline-thread .cn-reply-composer { padding: 6px; background: transparent; }
 .cn-confirm-sheet { max-width: 420px; }
 .cn-feed-skeleton { padding-top: 2px; }
 .cn-post-skeleton {
@@ -1132,6 +1132,8 @@ export const CSS = `
 
 /* Inline replies use quieter 32px circles inside full-size tap targets. */
 .cn-reply-composer { gap: 4px; }
+.cn-reply-composer .cn-composer-pill { min-height: 44px; padding: 0; border-radius: 22px; }
+.cn-reply-composer .cn-composer-input-line textarea { padding: 4px 2px 4px 10px; line-height: 1.3; }
 .cn-reply-composer .cn-composer-send,
 .cn-reply-composer .cn-composer-attach {
   position: relative; width: 44px; height: 44px; background: transparent; border: 0;
