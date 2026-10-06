@@ -63,7 +63,7 @@ test('reply thumbnails use their parent-scoped route and cannot reuse a post thu
     assert.match(requested, /reply-media\/post-1\/reply-1\?thumbnail=true$/)
     await new Promise(resolve => setTimeout(resolve, 1100))
     const { paths } = store.values.get('cache/board-thumbnails/index.json')
-    assert.ok(paths.includes('cache/board-thumbnails/reply-post-1-reply-1.webp'))
+    assert.ok(paths.includes('cache/board-thumbnails/reply/post-1/reply-1.webp'))
     assert.ok(paths.includes('cache/board-thumbnails/post-1-0.webp'))
   } finally {
     delete globalThis.window
@@ -95,4 +95,32 @@ test('new thumbnails are saved once and only the newest are kept', async () => {
   assert.equal(paths.length, THUMBNAIL_LIMIT)
   assert.deepEqual(store.removed, ['cache/board-thumbnails/post-0-0.webp'])
   assert.ok(!paths.includes('cache/board-thumbnails/post-0-0.webp'))
+})
+
+
+test('hyphenated parent and reply IDs never share a thumbnail cache entry', async () => {
+  const oldPath = 'cache/board-thumbnails/reply-abcdef12-abcdef12-abcdef12.webp'
+  const store = storage({
+    [oldPath]: new Blob(['ambiguous legacy photo']),
+    'cache/board-thumbnails/index.json': { paths: [oldPath] },
+  })
+  globalThis.window = { mobius: { storage: store } }
+  let requests = 0
+  globalThis.fetch = async () => {
+    requests += 1
+    return { ok: true, async blob() { return new Blob([`photo-${requests}`]) } }
+  }
+  try {
+    assert.equal(await (await boardThumbnail('abcdef12', undefined, 'abcdef12-abcdef12')).text(), 'photo-1')
+    assert.equal(await (await boardThumbnail('abcdef12-abcdef12', undefined, 'abcdef12')).text(), 'photo-2')
+    assert.equal(await (await boardThumbnail('abcdef12', undefined, 'abcdef12-abcdef12')).text(), 'photo-1')
+    assert.equal(requests, 2)
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    const { paths } = store.values.get('cache/board-thumbnails/index.json')
+    assert.ok(paths.includes('cache/board-thumbnails/reply/abcdef12/abcdef12-abcdef12.webp'))
+    assert.ok(paths.includes('cache/board-thumbnails/reply/abcdef12-abcdef12/abcdef12.webp'))
+  } finally {
+    delete globalThis.window
+    delete globalThis.fetch
+  }
 })

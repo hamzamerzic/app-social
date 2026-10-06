@@ -10,7 +10,7 @@ export const THUMBNAIL_LIMIT = 60
 const INDEX_PATH = 'cache/board-thumbnails/index.json'
 const INDEX_WRITE_DELAY_MS = 1000
 const thumbnailPath = (postId, index, replyId) => replyId
-  ? `cache/board-thumbnails/reply-${encodeURIComponent(postId)}-${encodeURIComponent(replyId)}.webp`
+  ? `cache/board-thumbnails/reply/${encodeURIComponent(postId)}/${encodeURIComponent(replyId)}.webp`
   : `cache/board-thumbnails/${encodeURIComponent(postId)}-${index ?? 0}.webp`
 
 const appStorage = () => globalThis.window?.mobius?.storage

@@ -2,10 +2,13 @@
 
 import base64
 import io
+import struct
 import tempfile
 import time
 import unittest
 import uuid
+import zlib
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from fastapi import HTTPException
@@ -27,7 +30,88 @@ def wire(data, size=(24, 16)):
           "w": size[0], "h": size[1]}
 
 
+def oversized_png_header():
+  data = bytearray(photo())
+  data[16:24] = struct.pack(">II", 5000, 5000)
+  data[29:33] = struct.pack(">I", zlib.crc32(data[12:29]) & 0xffffffff)
+  return bytes(data)
+
+
 class ReplyPhotoTests(unittest.TestCase):
+  def test_missing_reply_thumbnail_recovers_after_transient_processing_failure(self):
+    with tempfile.TemporaryDirectory() as root:
+      store = CommonPublicStore(root)
+      store.store_post({"id": "post", "host": "author.example", "text": "Post",
+                        "created_at": 1, "replies": []})
+      data = photo()
+      with patch("common_public.image_thumbnail_bytes", side_effect=OSError("encoder failed")):
+        result = store.add_reply("post", "reply", "member.example", "member",
+                                 "Caption", 2, (wire(data), data))
+      self.assertTrue(result["activity"])
+      self.assertEqual(store.reply_image("post", "reply")[0].read_bytes(), data)
+      self.assertFalse((store.reply_thumbnail_dir() / "post" / "reply.webp").exists())
+      with patch("common_public.image_thumbnail_bytes", side_effect=OSError("still failing")):
+        self.assertIsNone(store.reply_image("post", "reply", thumbnail=True))
+      self.assertFalse((store.reply_thumbnail_dir() / "post" / "reply.webp").exists())
+
+      recovered = store.reply_image("post", "reply", thumbnail=True)
+
+      self.assertEqual(recovered[1], "image/webp")
+      with Image.open(recovered[0]) as image:
+        self.assertLessEqual(max(image.size), 640)
+      self.assertEqual(store.reply_image("post", "reply", thumbnail=True), recovered)
+      self.assertEqual(len(store.get_replies("post")["replies"]), 1)
+
+  def test_reply_thumbnail_recovery_rejects_corrupt_and_oversized_originals(self):
+    with tempfile.TemporaryDirectory() as root:
+      store = CommonPublicStore(root)
+      store.store_post({"id": "post", "host": "author.example", "text": "Post",
+                        "created_at": 1, "replies": []})
+      corrupt = b"not an image"
+      store.add_reply("post", "corrupt", "member.example", "member", "Photo", 2,
+                      (wire(corrupt), corrupt))
+      self.assertIsNone(store.reply_image("post", "corrupt", thumbnail=True))
+      data = photo()
+      store.add_reply("post", "oversized", "member.example", "member", "Photo", 3,
+                      (wire(data), data))
+      (store.reply_thumbnail_dir() / "post" / "oversized.webp").unlink()
+      store.reply_image("post", "oversized")[0].write_bytes(oversized_png_header())
+
+      with self.assertRaises(HTTPException) as caught:
+        store.reply_image("post", "oversized", thumbnail=True)
+      self.assertEqual(caught.exception.status_code, 400)
+      self.assertFalse((store.reply_thumbnail_dir() / "post" / "oversized.webp").exists())
+
+  def test_deleted_reply_cannot_regenerate_thumbnail_from_orphaned_original(self):
+    with tempfile.TemporaryDirectory() as root:
+      store = CommonPublicStore(root)
+      store.store_post({"id": "post", "host": "author.example", "text": "Post",
+                        "created_at": 1, "replies": []})
+      data = photo()
+      with patch("common_public.image_thumbnail_bytes", side_effect=OSError("encoder failed")):
+        store.add_reply("post", "reply", "member.example", "member", "Photo", 2,
+                        (wire(data), data))
+      find_image = store.find_image
+      deleted = False
+
+      def delete_after_record_check(directory, stem):
+        nonlocal deleted
+        if not deleted and directory == store.reply_thumbnail_dir() / "post":
+          deleted = True
+          store.delete_post("post", "author.example")
+        return find_image(directory, stem)
+
+      with patch.object(store, "find_image", side_effect=delete_after_record_check):
+        self.assertIsNone(store.reply_image("post", "reply", thumbnail=True))
+      self.assertTrue(deleted)
+      orphan_dir = store.reply_media_dir() / "post"
+      orphan_dir.mkdir()
+      (orphan_dir / "reply.png").write_bytes(data)
+
+      self.assertIsNone(store.reply_image("post", "reply", thumbnail=True))
+      self.assertIsNone(store.reply_image("post", "reply"))
+      self.assertFalse((store.reply_thumbnail_dir() / "post" / "reply.webp").exists())
+
   def test_signed_member_photo_and_text_photo_only_retry_and_scoped_deletion(self):
     with tempfile.TemporaryDirectory() as root:
       store = CommonPublicStore(root)

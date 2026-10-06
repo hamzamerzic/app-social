@@ -524,7 +524,36 @@ class CommonPublicStore:
                and isinstance(reply.get("attachment"), dict) for reply in replies):
       return None
     directory = self.reply_thumbnail_dir() if thumbnail else self.reply_media_dir()
-    return self.find_image(directory / post_id, reply_id)
+    found = self.find_image(directory / post_id, reply_id)
+    if found is not None or not thumbnail:
+      return found
+    # A transient encoder/write failure may leave an otherwise valid reply
+    # without its rendition. Recheck under the same lock as deletion before
+    # recreating it, so a removed post can never regain media during recovery.
+    with self._mutation_lock(self._board_lock, "board"):
+      if not post_path.is_file():
+        return None
+      replies = self._load_object(post_path).get("replies", [])
+      if not any(isinstance(reply, dict) and reply.get("id") == reply_id
+                 and isinstance(reply.get("attachment"), dict) for reply in replies):
+        return None
+      found = self.find_image(directory / post_id, reply_id)
+      if found is not None:
+        return found
+      source = self.find_image(self.reply_media_dir() / post_id, reply_id)
+      if source is None:
+        return None
+      try:
+        mime, data = image_thumbnail_bytes(source[0].read_bytes())
+        target_dir = directory / post_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"{reply_id}.{ATTACHMENT_MIME_EXT[mime]}"
+        atomic_write(target, data)
+        return target, mime
+      except BoardImageTooLarge as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+      except (OSError, ValueError, SyntaxError, Image.UnidentifiedImageError):
+        return None
 
   def board_media_path(self, post_id: str, mime: str) -> Path:
     return self.board_media_dir() / f"{post_id}.{ATTACHMENT_MIME_EXT[mime]}"

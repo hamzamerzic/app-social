@@ -117,6 +117,9 @@ PEER_AVATAR_BATCH_LIMIT = 8
 # Keep each peer inside the app-service's 15-second process ceiling while
 # leaving time to encode and return successful peers from the same batch.
 PEER_AVATAR_BATCH_TIMEOUT_S = 12
+# Capability discovery and a signed reply share one budget, leaving room for
+# service startup and a useful error before the 15-second process ceiling.
+COMMUNITY_REPLY_TIMEOUT_S = 13
 # Peer avatars are re-encoded to a small validated raster before caching, so a
 # malicious raster never reaches the browser and cached blobs stay tiny.
 AVATAR_MAX_SIDE = 128
@@ -2086,43 +2089,54 @@ async def reply_to_post(
   reply_id = body.id or str(uuid.uuid4())
   if not _valid_id(reply_id):
     raise HTTPException(status_code=400, detail="Reply id is invalid.")
-  if attachment is not None:
-    # Older hosts may accept board_reply but ignore its new media fields.
-    # Refuse the write until the shared host explicitly advertises support.
-    try:
-      capability_response = await federation_request(
-        "GET", _peer_service_url(host, "board"),
-        params={"limit": 1}, timeout_seconds=OUTBOUND_TIMEOUT_S,
-      )
-      capability_response.raise_for_status()
-      supported = capability_response.json().get("capabilities", {}).get("reply_attachments") is True
-    except Exception as exc:
-      raise HTTPException(status_code=502, detail="Community reply photo support could not be checked.") from exc
-    if not supported:
-      raise HTTPException(status_code=409, detail="Community host does not support reply photos yet.")
-  sent_at = time.time()
-  envelope = {
-    "v": 0,
-    "type": "board_reply",
-    "post_id": post_id,
-    "id": reply_id,
-    "text": text,
-    "from": _own_host(),
-    "sent_at": sent_at,
-  }
-  if attachment is not None:
-    envelope["attachment"] = attachment[0]
-  if thumbnail is not None:
-    envelope["thumbnail"] = thumbnail[0]
-  envelope["sig"] = _sign(envelope, identity["private_key_b64"])
-  _validate_attachment_envelope_size(envelope)
+  write_started = False
   try:
-    response = await _post_signed_envelope(
-      _peer_service_url(host, "board/reply"), envelope,
-      max_response_bytes=MAX_ENVELOPE_BYTES,
+    async with asyncio.timeout(COMMUNITY_REPLY_TIMEOUT_S):
+      if attachment is not None:
+        # Older hosts may accept board_reply but ignore its new media fields.
+        # Refuse the write until the shared host explicitly advertises support.
+        try:
+          capability_response = await federation_request(
+            "GET", _peer_service_url(host, "board"),
+            params={"limit": 1}, timeout_seconds=OUTBOUND_TIMEOUT_S,
+          )
+          capability_response.raise_for_status()
+          supported = capability_response.json().get("capabilities", {}).get("reply_attachments") is True
+        except Exception as exc:
+          raise HTTPException(status_code=502, detail="Community reply photo support could not be checked.") from exc
+        if not supported:
+          raise HTTPException(status_code=409, detail="Community host does not support reply photos yet.")
+      sent_at = time.time()
+      envelope = {
+        "v": 0,
+        "type": "board_reply",
+        "post_id": post_id,
+        "id": reply_id,
+        "text": text,
+        "from": _own_host(),
+        "sent_at": sent_at,
+      }
+      if attachment is not None:
+        envelope["attachment"] = attachment[0]
+      if thumbnail is not None:
+        envelope["thumbnail"] = thumbnail[0]
+      envelope["sig"] = _sign(envelope, identity["private_key_b64"])
+      _validate_attachment_envelope_size(envelope)
+      write_started = True
+      response = await _post_signed_envelope(
+        _peer_service_url(host, "board/reply"), envelope,
+        max_response_bytes=MAX_ENVELOPE_BYTES,
+      )
+      response.raise_for_status()
+      return {**response.json(), "id": reply_id}
+  except (TimeoutError, httpx.TimeoutException) as exc:
+    detail = (
+      "The reply may have been sent, but confirmation timed out. Retry the same reply to confirm."
+      if write_started else "Community reply photo support could not be checked."
     )
-    response.raise_for_status()
-    return {**response.json(), "id": reply_id}
+    raise HTTPException(status_code=502, detail=detail) from exc
+  except HTTPException:
+    raise
   except Exception as exc:
     raise HTTPException(
       status_code=502, detail=_community_write_error(exc, "reply")

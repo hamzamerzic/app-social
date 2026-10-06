@@ -1,5 +1,6 @@
 """Message length, envelope bounds, and notification contracts."""
 
+import asyncio
 import json
 import os
 import tempfile
@@ -235,6 +236,91 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
           db=None, principal=service_runtime.Principal("owner", None, None),
         )
     self.assertEqual(caught.exception.status_code, 409)
+    send.assert_not_awaited()
+
+
+class ReplyDeadlineTests(unittest.IsolatedAsyncioTestCase):
+  def setUp(self):
+    self.body = social_routes.ReplyPost(post_id="abcdef12", id="abcdef34", text="caption",
+      attachment={"mime": "image/png", "data_b64": "eA==", "w": 1, "h": 1})
+    self.principal = service_runtime.Principal("owner", None, None)
+    for name, kwargs in (
+      ("_require_member", {}),
+      ("_load_identity", {"return_value": {"handle": "owner", "private_key_b64": "fixture"}}),
+      ("_require_username", {}),
+      ("_sign", {"return_value": "fixture-signature"}),
+      ("_own_host", {"return_value": "self.example"}),
+    ):
+      self.enterContext(patch.object(social_routes, name, **kwargs))
+    self.capability = httpx.Response(200, json={"capabilities": {"reply_attachments": True}},
+      request=httpx.Request("GET", "https://community.example/board"))
+    self.receipt = httpx.Response(200, json={"status": "ok"},
+      request=httpx.Request("POST", "https://community.example/board/reply"))
+
+  async def test_capability_and_signed_write_share_one_deadline_and_retry_id(self):
+    # Scale time, not the operation: each stage fits, their sum does not.
+    self.assertLess(social_routes.COMMUNITY_REPLY_TIMEOUT_S, 15)
+    async def capability(*args, **kwargs):
+      await asyncio.sleep(0.04)
+      return self.capability
+    cancelled = asyncio.Event()
+    async def write(*args, **kwargs):
+      try:
+        await asyncio.sleep(0.06)
+        return self.receipt
+      except asyncio.CancelledError:
+        cancelled.set()
+        raise
+    with (
+      patch.object(social_routes, "COMMUNITY_REPLY_TIMEOUT_S", 0.08),
+      patch.object(social_routes, "federation_request", new=AsyncMock(side_effect=capability)),
+      patch.object(social_routes, "_post_signed_envelope", new=AsyncMock(side_effect=write)) as send,
+    ):
+      started = asyncio.get_running_loop().time()
+      with self.assertRaises(HTTPException) as caught:
+        await social_routes.reply_to_post(self.body, db=None, principal=self.principal)
+      self.assertLess(asyncio.get_running_loop().time() - started, 0.2)
+      self.assertEqual(caught.exception.status_code, 502)
+      self.assertIn("may have been sent", caught.exception.detail)
+      self.assertTrue(cancelled.is_set())
+      self.assertEqual(send.await_args.args[1]["id"], self.body.id)
+      send.side_effect = None
+      send.return_value = self.receipt
+      result = await social_routes.reply_to_post(self.body, db=None, principal=self.principal)
+      self.assertEqual(result["id"], self.body.id)
+      self.assertEqual(send.await_args.args[1]["id"], self.body.id)
+
+  async def test_capability_deadline_fails_closed_without_sending(self):
+    async def capability(*args, **kwargs):
+      await asyncio.sleep(0.06)
+      return self.capability
+    with (
+      patch.object(social_routes, "COMMUNITY_REPLY_TIMEOUT_S", 0.03),
+      patch.object(social_routes, "federation_request", new=AsyncMock(side_effect=capability)),
+      patch.object(social_routes, "_post_signed_envelope", new=AsyncMock()) as send,
+    ):
+      with self.assertRaises(HTTPException) as caught:
+        await social_routes.reply_to_post(self.body, db=None, principal=self.principal)
+    self.assertEqual(caught.exception.status_code, 502)
+    self.assertIn("support could not be checked", caught.exception.detail)
+    send.assert_not_awaited()
+
+  async def test_transport_write_timeout_reports_unconfirmed_send(self):
+    with (
+      patch.object(social_routes, "federation_request", new=AsyncMock(return_value=self.capability)),
+      patch.object(social_routes, "_post_signed_envelope", new=AsyncMock(side_effect=httpx.ReadTimeout("slow"))),
+    ):
+      with self.assertRaises(HTTPException) as caught:
+        await social_routes.reply_to_post(self.body, db=None, principal=self.principal)
+    self.assertIn("may have been sent", caught.exception.detail)
+
+  async def test_external_cancellation_is_not_relabelled_as_reply_timeout(self):
+    with (
+      patch.object(social_routes, "federation_request", new=AsyncMock(side_effect=asyncio.CancelledError)),
+      patch.object(social_routes, "_post_signed_envelope", new=AsyncMock()) as send,
+    ):
+      with self.assertRaises(asyncio.CancelledError):
+        await social_routes.reply_to_post(self.body, db=None, principal=self.principal)
     send.assert_not_awaited()
 
 
