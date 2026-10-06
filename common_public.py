@@ -542,37 +542,38 @@ class CommonPublicStore:
 
   def reply_image(self, post_id: str, reply_id: str, *, thumbnail: bool = False):
     post_path = self.board_dir() / f"{post_id}.json"
-    if not post_path.is_file():
-      return None
-    replies = self._load_object(post_path).get("replies", [])
-    if not any(isinstance(reply, dict) and reply.get("id") == reply_id
-               and isinstance(reply.get("attachment"), dict) for reply in replies):
-      return None
-    directory = self.reply_thumbnail_dir() if thumbnail else self.reply_media_dir()
-    found = self.find_image(directory / post_id, reply_id)
-    if found is not None or not thumbnail:
-      return found
-    # A transient encoder/write failure may leave an otherwise valid reply
-    # without its rendition. Recheck under the same lock as deletion before
-    # recreating it, so a removed post can never regain media during recovery.
-    with self._mutation_lock(self._board_lock, "board"):
+
+    def committed_attachment():
       if not post_path.is_file():
         return None
       replies = self._load_object(post_path).get("replies", [])
-      if not any(isinstance(reply, dict) and reply.get("id") == reply_id
-                 and isinstance(reply.get("attachment"), dict) for reply in replies):
+      return next((reply["attachment"] for reply in replies
+                   if isinstance(reply, dict) and reply.get("id") == reply_id
+                   and isinstance(reply.get("attachment"), dict)), None)
+
+    attachment = committed_attachment()
+    if attachment is None:
+      return None
+    directory = self.reply_thumbnail_dir() if thumbnail else self.reply_media_dir()
+    mime = "image/webp" if thumbnail else attachment["mime"]
+    target = directory / post_id / f"{reply_id}.{ATTACHMENT_MIME_EXT[mime]}"
+    if target.is_file():
+      return target, mime
+    if not thumbnail:
+      return None
+    # Recheck under the deletion lock before recovering a missing rendition.
+    # The committed metadata, not leftover files, owns the original's type.
+    with self._mutation_lock(self._board_lock, "board"):
+      attachment = committed_attachment()
+      if attachment is None:
         return None
-      found = self.find_image(directory / post_id, reply_id)
-      if found is not None:
-        return found
-      source = self.find_image(self.reply_media_dir() / post_id, reply_id)
-      if source is None:
+      if target.is_file():
+        return target, mime
+      source = self.reply_media_dir() / post_id / f"{reply_id}.{ATTACHMENT_MIME_EXT[attachment['mime']]}"
+      if not source.is_file():
         return None
       try:
-        mime, data = image_thumbnail_bytes(source[0].read_bytes())
-        target_dir = directory / post_id
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / f"{reply_id}.{ATTACHMENT_MIME_EXT[mime]}"
+        mime, data = image_thumbnail_bytes(source.read_bytes())
         atomic_write(target, data)
         return target, mime
       except BoardImageTooLarge as exc:
@@ -1106,6 +1107,11 @@ class CommonPublicStore:
         raise HTTPException(status_code=507, detail="Post reply limit reached.")
       if attachment is not None:
         validate_reply_original_bytes(*attachment)
+      # No reply owns this identity yet. A crashed or failed earlier commit
+      # may have left media behind; none may become this new reply's rendition.
+      for directory in (self.reply_media_dir(), self.reply_thumbnail_dir()):
+        for extension in ATTACHMENT_MIME_EXT.values():
+          (directory / post_id / f"{reply_id}.{extension}").unlink(missing_ok=True)
       record = {
         "id": reply_id,
         "host": host,

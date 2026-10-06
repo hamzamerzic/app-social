@@ -8,6 +8,7 @@ import time
 import unittest
 import uuid
 import zlib
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -19,9 +20,9 @@ from common_public import CommonPublicStore
 from test_community_host import _peer, _signed
 
 
-def photo(size=(24, 16)):
+def photo(size=(24, 16), *, format="PNG", color="red"):
   output = io.BytesIO()
-  Image.new("RGB", size, "red").save(output, format="PNG")
+  Image.new("RGB", size, color).save(output, format=format)
   return output.getvalue()
 
 
@@ -94,17 +95,18 @@ class ReplyPhotoTests(unittest.TestCase):
       with patch("common_public.image_thumbnail_bytes", side_effect=OSError("encoder failed")):
         store.add_reply("post", "reply", "member.example", "member", "Photo", 2,
                         (wire(data), data))
-      find_image = store.find_image
+      is_file = Path.is_file
+      thumbnail_path = store.reply_thumbnail_dir() / "post" / "reply.webp"
       deleted = False
 
-      def delete_after_record_check(directory, stem):
+      def delete_after_record_check(path):
         nonlocal deleted
-        if not deleted and directory == store.reply_thumbnail_dir() / "post":
+        if not deleted and path == thumbnail_path:
           deleted = True
           store.delete_post("post", "author.example")
-        return find_image(directory, stem)
+        return is_file(path)
 
-      with patch.object(store, "find_image", side_effect=delete_after_record_check):
+      with patch.object(Path, "is_file", new=delete_after_record_check):
         self.assertIsNone(store.reply_image("post", "reply", thumbnail=True))
       self.assertTrue(deleted)
       orphan_dir = store.reply_media_dir() / "post"
@@ -114,6 +116,66 @@ class ReplyPhotoTests(unittest.TestCase):
       self.assertIsNone(store.reply_image("post", "reply", thumbnail=True))
       self.assertIsNone(store.reply_image("post", "reply"))
       self.assertFalse((store.reply_thumbnail_dir() / "post" / "reply.webp").exists())
+
+  def test_changed_photo_after_failed_commit_never_reuses_orphaned_media_or_thumbnail(self):
+    for rendition_fails in (False, True):
+      with self.subTest(rendition_fails=rendition_fails), tempfile.TemporaryDirectory() as root:
+        store = CommonPublicStore(root)
+        post_id, reply_id = "abcdef12", "abcdef34"
+        store.store_post({"id": post_id, "host": "author.example", "text": "Post",
+                          "created_at": 1, "replies": []})
+        old = photo(format="JPEG", color="green")
+        new = photo(color="blue")
+        post_path = store.board_dir() / f"{post_id}.json"
+        from common_public import atomic_write, image_thumbnail_bytes
+
+        def fail_reply_commit(path, content):
+          if path == post_path:
+            raise OSError("reply JSON commit failed")
+          return atomic_write(path, content)
+
+        args = (post_id, reply_id, "member.example", "member", "Caption", 2)
+        with patch("common_public.atomic_write", side_effect=fail_reply_commit):
+          with self.assertRaises(OSError):
+            store.add_reply(*args, ({**wire(old), "mime": "image/jpeg"}, old))
+        self.assertEqual(store.get_replies(post_id)["replies"], [])
+        old_path = store.reply_media_dir() / post_id / f"{reply_id}.jpg"
+        self.assertTrue(old_path.is_file(), "failure fixture leaves an uncommitted original")
+        thumb_path = store.reply_thumbnail_dir() / post_id / f"{reply_id}.webp"
+        old_thumbnail = thumb_path.read_bytes()
+        if rendition_fails:
+          with patch("common_public.image_thumbnail_bytes", side_effect=OSError("rendition failed")):
+            store.add_reply(*args, (wire(new), new))
+          self.assertFalse(thumb_path.exists(), "the prior rendition cannot survive a changed photo")
+        else:
+          store.add_reply(*args, (wire(new), new))
+        self.assertFalse(old_path.exists())
+        self.assertEqual(store.get_replies(post_id)["replies"][0]["attachment"]["mime"], "image/png")
+        with TestClient(community_host.create_app(root)) as client:
+          path = f"/api/common/board/{post_id}/replies/{reply_id}/"
+          self.assertEqual(client.get(path + "media.png").content, new)
+          bare = client.get(path + "media")
+          self.assertEqual(bare.headers["content-type"], "image/png")
+          self.assertEqual(bare.content, new)
+          self.assertEqual(client.get(path + "media.jpg").status_code, 404)
+          thumb = client.get(path + "thumbnail.webp")
+          self.assertEqual(thumb.status_code, 200)
+          self.assertEqual(thumb.content, image_thumbnail_bytes(new)[1])
+          self.assertNotEqual(thumb.content, old_thumbnail)
+
+  def test_committed_reply_type_never_falls_back_to_an_unrelated_original(self):
+    with tempfile.TemporaryDirectory() as root:
+      store = CommonPublicStore(root)
+      post_id, reply_id = "abcdef12", "abcdef34"
+      store.store_post({"id": post_id, "host": "author.example", "text": "Post",
+                        "created_at": 1, "replies": []})
+      data = photo(color="blue")
+      store.add_reply(post_id, reply_id, "member.example", "member", "Caption", 2, (wire(data), data))
+      orphan = store.reply_media_dir() / post_id / f"{reply_id}.jpg"
+      orphan.write_bytes(photo(format="JPEG", color="green"))
+      self.assertEqual(store.reply_image(post_id, reply_id)[0].read_bytes(), data)
+      (store.reply_media_dir() / post_id / f"{reply_id}.png").unlink()
+      self.assertIsNone(store.reply_image(post_id, reply_id), "no extension-priority fallback to the orphan")
 
   def test_signed_member_photo_and_text_photo_only_retry_and_scoped_deletion(self):
     with tempfile.TemporaryDirectory() as root:
