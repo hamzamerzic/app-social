@@ -9,7 +9,7 @@ import {
 } from '../api.js'
 import {
   boardRefreshDelay, reactionKey, reconcileReplies, replyActionLabel,
-  threadRefreshDelay,
+  threadRefreshDelay, upsertReplyAttempt,
 } from '../reconciliation.js'
 import { useModalFocus } from './modalFocus.js'
 import { BoardImage, ReplyImage, prepareImage, SelectedImageStrip, SelectedImagesStrip } from './Media.jsx'
@@ -675,7 +675,7 @@ export default function Board({
     markActivity()
     replySendingRef.current = true
     setReplySending(true)
-    setReplies((prior) => [...prior, optimistic])
+    setReplies((prior) => upsertReplyAttempt(prior, optimistic))
     try {
       const receipt = await postReply(post.id, text, {
         id: localId, attachment: image?.payload, thumbnail: image?.thumbnailPayload,
@@ -683,9 +683,9 @@ export default function Board({
       const confirmed = { ...optimistic, id: receipt.id || localId, pending: false }
       replyDrafts.current.delete(post.id)
       if (replyPostIdRef.current === post.id) {
-        setReplies((prior) => prior.map((reply) => (
-          reply.id === localId ? confirmed : reply
-        )))
+        setReplies((prior) => upsertReplyAttempt(
+          prior.filter(reply => reply.id !== localId || !reply.pending), confirmed,
+        ))
         setReplyDraft('')
         setReplyImage(null)
         setReplyMessageId(null)
@@ -694,14 +694,14 @@ export default function Board({
       // if its fresh confirmation read fails or the thread is reopened.
       const key = String(post.id)
       const cached = replyCache.get(key)?.result?.replies || []
-      rememberReplies(key, { replies: [...cached.filter(reply => reply.id !== confirmed.id), confirmed] })
+      rememberReplies(key, { replies: upsertReplyAttempt(cached, confirmed) })
       if (replyPostIdRef.current === post.id) await loadReplies(post, { background: true, force: true })
       window.mobius?.signal?.('item_created', { type: 'board_reply' })
       onCompleteParticipation?.(completedIntent)
       onRefresh(true)
     } catch (error) {
       if (replyPostIdRef.current === post.id) {
-        setReplies((prior) => prior.filter((reply) => reply.id !== localId))
+        setReplies((prior) => prior.filter((reply) => reply.id !== localId || !reply.pending))
       }
       showToast(error.status === 404
         ? 'Replies aren’t available on this server yet.'

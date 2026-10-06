@@ -41,6 +41,8 @@ from PIL import Image, ImageOps
 from common_protocol import (
   ATTACHMENT_MIME_EXT,
   CLOCK_SKEW_S,
+  MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENT_DIMENSION,
   MAX_AVATAR_BYTES,
   MAX_BOARD_ATTACHMENTS,
   MAX_BIO_CHARS,
@@ -186,6 +188,29 @@ def validate_thumbnail_bytes(wire: dict, data: bytes) -> None:
     if image.size != (wire["w"], wire["h"]):
       raise ValueError("Board thumbnail dimensions do not match its data.")
     image.verify()
+
+
+def validate_reply_original_bytes(wire: dict, data: bytes) -> None:
+  """Admit only a complete image whose bytes agree with its reply metadata."""
+  if len(data) > MAX_ATTACHMENT_BYTES:
+    raise HTTPException(status_code=413, detail="Reply photo is too large.")
+  try:
+    with _open_board_image(data) as image:
+      # The header guard must precede either verification or raster decoding.
+      _validate_image_header(image)
+      if (max(image.size) > MAX_ATTACHMENT_DIMENSION
+          or IMAGE_FORMAT_MIME[image.format] != wire["mime"]
+          or image.size != (wire["w"], wire["h"])):
+        raise ValueError("Reply photo metadata does not match its data.")
+      image.verify()
+    # verify() checks the container without decoding pixels; load() also
+    # rejects a truncated or otherwise undecodable raster before persistence.
+    with _open_board_image(data) as image:
+      image.load()
+  except BoardImageTooLarge as exc:
+    raise HTTPException(status_code=400, detail=str(exc)) from exc
+  except (OSError, ValueError, SyntaxError, EOFError, Image.UnidentifiedImageError) as exc:
+    raise HTTPException(status_code=400, detail="Reply photo is invalid.") from exc
 
 
 class CommonPublicStore:
@@ -1035,14 +1060,6 @@ class CommonPublicStore:
     attachment: tuple[dict, bytes] | None = None,
     thumbnail: tuple[dict, bytes] | None = None,
   ) -> dict:
-    if attachment is not None:
-      try:
-        with _open_board_image(attachment[1]) as image:
-          _validate_image_header(image)
-      except BoardImageTooLarge as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-      except (OSError, ValueError, SyntaxError, Image.UnidentifiedImageError):
-        pass
     if thumbnail is not None:
       if attachment is None:
         raise HTTPException(status_code=400, detail="Reply thumbnail needs a photo.")
@@ -1087,6 +1104,8 @@ class CommonPublicStore:
         }
       if len(replies) >= BOARD_REPLY_LIMIT:
         raise HTTPException(status_code=507, detail="Post reply limit reached.")
+      if attachment is not None:
+        validate_reply_original_bytes(*attachment)
       record = {
         "id": reply_id,
         "host": host,

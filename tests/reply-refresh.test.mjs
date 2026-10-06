@@ -4,7 +4,7 @@ import test from 'node:test'
 import vm from 'node:vm'
 import { randomUUID } from 'node:crypto'
 import { createParticipationIntent } from '../participation.js'
-import { reconcileReplies } from '../reconciliation.js'
+import { reconcileReplies, upsertReplyAttempt } from '../reconciliation.js'
 
 const board = readFileSync(new URL('../ui/Board.jsx', import.meta.url), 'utf8')
 
@@ -35,7 +35,7 @@ function thread({ count = 0, read, send, image = null } = {}) {
   const errors = []
   const context = vm.createContext({
     Date, Map, Set, String, Number, Promise, crypto: { randomUUID },
-    createParticipationIntent, reconcileReplies,
+    createParticipationIntent, reconcileReplies, upsertReplyAttempt,
     replyRequest: { current: 0 }, replySendingRef: { current: false },
     replyPost: post, replyDraft: 'My reply', replySending: false,
     replyImage: image, replyMessageId: null, preparingReplyImage: false,
@@ -132,6 +132,46 @@ test('an interrupted photo reply retains caption, attachment and the same retry 
   assert.equal(ids[0], ids[1])
   assert.deepEqual(view.ids, [])
 })
+
+for (const retryFails of [false, true]) {
+  test(`timeout then polling then ${retryFails ? 'failed' : 'successful'} retry preserves one authoritative reply`, async () => {
+    let sends = 0, canonical = null, readFails = false
+    const view = thread({ image: photo,
+      read: () => {
+        if (readFails) throw new Error('Confirmation read unavailable')
+        return { replies: canonical ? [canonical] : [] }
+      },
+      send: async (_post, _text, options) => {
+        sends++
+        if (sends === 1) {
+          canonical = { ...reply(options.id, 'My reply'), created_at: 5,
+            attachment: { mime: 'image/png', w: 40, h: 30 },
+            reactions: [{ emoji: '❤️', count: 1 }] }
+          throw new Error('Delivery confirmation timed out')
+        }
+        assert.deepEqual(view.ids, [canonical.id])
+        assert.equal(view.rows[0], canonical, 'retry never replaces known history with a pending row')
+        readFails = true
+        if (retryFails) throw new Error('Retry confirmation timed out')
+        return { id: options.id }
+      },
+    })
+    await view.send()
+    assert.deepEqual(view.ids, [])
+    await view.load({ background: true })
+    assert.deepEqual(view.ids, [canonical.id])
+    await view.send()
+    assert.deepEqual(view.ids, [canonical.id])
+    assert.equal(view.rows[0], canonical, 'canonical time, image metadata and reactions survive settlement')
+    assert.equal(view.rows[0].pending, undefined)
+    assert.equal(view.context.replyDraft, retryFails ? 'My reply' : '')
+    assert.equal(view.context.replyImage, retryFails ? photo : null)
+    view.rows = []
+    await view.load()
+    assert.deepEqual(view.ids, [canonical.id])
+    assert.equal(view.rows[0], canonical, 'reopening from cache keeps the same authoritative row')
+  })
+}
 
 test('removing the photo preserves its caption and editing starts a new send identity', () => {
   const view = thread({ image: photo })

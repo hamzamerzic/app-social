@@ -67,11 +67,14 @@ class ReplyPhotoTests(unittest.TestCase):
       store = CommonPublicStore(root)
       store.store_post({"id": "post", "host": "author.example", "text": "Post",
                         "created_at": 1, "replies": []})
-      corrupt = b"not an image"
-      store.add_reply("post", "corrupt", "member.example", "member", "Photo", 2,
-                      (wire(corrupt), corrupt))
-      self.assertIsNone(store.reply_image("post", "corrupt", thumbnail=True))
       data = photo()
+      store.add_reply("post", "corrupt", "member.example", "member", "Photo", 2,
+                      (wire(data), data))
+      # Simulate damage in a legacy stored original, not new admission.
+      (store.reply_thumbnail_dir() / "post" / "corrupt.webp").unlink()
+      store.reply_image("post", "corrupt")[0].write_bytes(b"not an image")
+      self.assertEqual(store.reply_image("post", "corrupt")[0].read_bytes(), b"not an image")
+      self.assertIsNone(store.reply_image("post", "corrupt", thumbnail=True))
       store.add_reply("post", "oversized", "member.example", "member", "Photo", 3,
                       (wire(data), data))
       (store.reply_thumbnail_dir() / "post" / "oversized.webp").unlink()
@@ -171,6 +174,35 @@ class ReplyPhotoTests(unittest.TestCase):
         oversized = {**body, "attachment": wire(b"x" * (1024 * 1024 + 1))}
         self.assertEqual(client.post("/api/common/board/reply", json=_signed(key, oversized)).status_code, 413)
         self.assertEqual(store.get_replies(post_id)["replies"], [])
+
+  def test_signed_invalid_original_bytes_never_create_reply_or_media(self):
+    with tempfile.TemporaryDirectory() as root:
+      store = CommonPublicStore(root)
+      store.register("member.example", "member", "")
+      key = _peer(store.data_dir(), "member.example")
+      post_id = str(uuid.uuid4())
+      store.store_post({"id": post_id, "host": "author.example", "text": "Post",
+                        "created_at": time.time(), "replies": []})
+      good = photo()
+      bad_photos = {
+        "non-image": wire(b"not an image"),
+        "truncated": wire(good[:40]),
+        "wrong mime": {**wire(good), "mime": "image/jpeg"},
+        "wrong dimensions": wire(good, (25, 16)),
+      }
+      with TestClient(community_host.create_app(root)) as client:
+        for label, attachment in bad_photos.items():
+          with self.subTest(label=label):
+            reply_id = str(uuid.uuid4())
+            body = {"v": 0, "type": "board_reply", "post_id": post_id,
+                    "id": reply_id, "from": "member.example", "sent_at": time.time(),
+                    "text": "Caption", "attachment": attachment}
+            response = client.post("/api/common/board/reply", json=_signed(key, body))
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertEqual(store.get_replies(post_id)["replies"], [])
+            self.assertIsNone(store.reply_image(post_id, reply_id))
+            self.assertFalse((store.reply_media_dir() / post_id).exists())
+            self.assertFalse((store.reply_thumbnail_dir() / post_id).exists())
 
   def test_stable_reply_cannot_replace_author_photo_metadata_or_thumbnail(self):
     with tempfile.TemporaryDirectory() as root:
