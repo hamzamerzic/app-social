@@ -9,10 +9,10 @@ import {
 } from '../api.js'
 import {
   boardRefreshDelay, reactionKey, reconcileReplies, replyActionLabel,
-  threadRefreshDelay,
+  threadRefreshDelay, upsertReplyAttempt,
 } from '../reconciliation.js'
 import { useModalFocus } from './modalFocus.js'
-import { BoardImage, prepareImage, SelectedImagesStrip } from './Media.jsx'
+import { BoardImage, ReplyImage, prepareImage, SelectedImageStrip, SelectedImagesStrip } from './Media.jsx'
 import RichText from './RichText.jsx'
 import { membershipDuration } from '../profile.js'
 import {
@@ -22,6 +22,7 @@ import ReactionControls, { useBoardReactions } from './ReactionControls.jsx'
 import { boardPostFitsWireLimit } from '../board_payload.js'
 import Composer, { ComposerAttachmentButton, ComposerFooter } from './Composer.jsx'
 import { prependedScrollTop } from './interactionRules.js'
+import { reachedEarlierHistory } from './historyScroll.js'
 
 const MAX_POST_IMAGES = 4
 const GALLERY_BUDGET_BYTES = 960 * 1024
@@ -251,6 +252,7 @@ export default function Board({
   composing, setComposing, canInteract, accountState, participationIntent, intentState,
   participationBusy, onJoin, joinBusy, onRetryIntent, onRequestParticipation,
   onCompleteParticipation, onDiscardParticipation, onPostConfirmed, emojiReactions = false, replyReactions = false,
+  replyAttachments = false,
   boardTarget, onTargetHandled,
   composerMount, scrollRef,
 }) {
@@ -267,6 +269,9 @@ export default function Board({
   const [replyState, setReplyState] = useState('idle')
   const [replyError, setReplyError] = useState('')
   const [replyDraft, setReplyDraft] = useState('')
+  const [replyImage, setReplyImage] = useState(null)
+  const [replyMessageId, setReplyMessageId] = useState(null)
+  const [preparingReplyImage, setPreparingReplyImage] = useState(false)
   const [replySending, setReplySending] = useState(false)
   const [notificationReveal, setNotificationReveal] = useState(null)
   const openedTarget = useRef(null)
@@ -274,6 +279,9 @@ export default function Board({
   const [handoffBusy, setHandoffBusy] = useState(false)
   const [loadingEarlier, setLoadingEarlier] = useState(false)
   const [earlierError, setEarlierError] = useState('')
+  const earlierInFlight = useRef(false)
+  const earlierFailed = useRef(false)
+  const lastScrollTop = useRef(null)
   const replyRequest = useRef(0)
   const replySendingRef = useRef(false)
   // Start relaxed: the launch just delivered the feed, and every early poll
@@ -283,6 +291,8 @@ export default function Board({
   const fileRef = useRef(null)
   const composerInputRef = useRef(null)
   const replyInputRef = useRef(null)
+  const replyFileRef = useRef(null)
+  const replyPostIdRef = useRef(null)
   const stickToBottom = useRef(true)
   const initialScrollDone = useRef(false)
   const threadAnchor = useRef(null)
@@ -292,17 +302,21 @@ export default function Board({
     () => restoreDeleteFocus.current,
   )
   replySendingRef.current = replySending
+  replyPostIdRef.current = replyPost?.id
 
   useEffect(() => {
     const scroller = scrollRef.current
     if (!scroller) return undefined
     const trackPosition = () => {
+      const shouldLoad = reachedEarlierHistory(lastScrollTop.current, scroller)
+      lastScrollTop.current = scroller.scrollTop
       stickToBottom.current = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 96
+      if (shouldLoad && feedState === 'ready' && hasEarlier && !earlierFailed.current) loadEarlierPosts()
     }
-    trackPosition()
+    lastScrollTop.current = scroller.scrollTop
     scroller.addEventListener('scroll', trackPosition, { passive: true })
     return () => scroller.removeEventListener('scroll', trackPosition)
-  }, [scrollRef])
+  }, [scrollRef, feedState, hasEarlier, feed, onLoadEarlier])
 
   useEffect(() => {
     if (!composing) return
@@ -351,11 +365,11 @@ export default function Board({
 
   useEffect(() => {
     if (!replyPost) return
-    replyDrafts.current.set(replyPost.id, replyDraft)
+    replyDrafts.current.set(replyPost.id, { text: replyDraft, image: replyImage, id: replyMessageId })
     while (replyDrafts.current.size > REPLY_CACHE_LIMIT) {
       replyDrafts.current.delete(replyDrafts.current.keys().next().value)
     }
-  }, [replyPost?.id, replyDraft])
+  }, [replyPost?.id, replyDraft, replyImage, replyMessageId])
 
   useEffect(() => {
     if (boardTarget?.status !== 'ready' || openedTarget.current === boardTarget.requestId) return
@@ -367,7 +381,7 @@ export default function Board({
     setNotificationReveal(boardTarget)
     setReplyPost(post)
     setReplies([])
-    setReplyDraft(replyDrafts.current.get(post.id) || '')
+    restoreReplyDraft(post.id)
     setReactionPickerFor(null)
     loadReplies(post, { force: true })
   }, [boardTarget, feed])
@@ -401,7 +415,9 @@ export default function Board({
 
   async function loadEarlierPosts() {
     const before = feed.at(-1)?.created_at
-    if (before === null || before === undefined || loadingEarlier) return
+    if (before === null || before === undefined || !hasEarlier || earlierInFlight.current) return
+    earlierInFlight.current = true
+    earlierFailed.current = false
     const scroller = scrollRef.current
     const previousHeight = scroller?.scrollHeight
     const previousTop = scroller?.scrollTop
@@ -415,8 +431,10 @@ export default function Board({
         })
       }
     } catch {
+      earlierFailed.current = true
       setEarlierError('Earlier posts couldn’t be loaded. The posts already here are unchanged.')
     } finally {
+      earlierInFlight.current = false
       setLoadingEarlier(false)
     }
   }
@@ -459,7 +477,47 @@ export default function Board({
     }
   }
 
-  function openReplies(post, restoredDraft = '') {
+  function restoreReplyDraft(postId, restoredDraft) {
+    const saved = restoredDraft || replyDrafts.current.get(postId)
+    setReplyDraft(saved?.text || '')
+    setReplyImage(saved?.image || null)
+    setReplyMessageId(saved?.id || null)
+  }
+
+  function changeReplyDraft(text) {
+    setReplyDraft(text)
+    setReplyMessageId(null)
+  }
+
+  function removeReplyImage() {
+    setReplyImage(null)
+    setReplyMessageId(null)
+  }
+
+  async function chooseReplyImage(event) {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    const postId = replyPost?.id
+    if (!file || !postId) return
+    setPreparingReplyImage(true)
+    try {
+      const image = await prepareImage(file)
+      if (replyPostIdRef.current === postId) {
+        setReplyImage(image)
+        setReplyMessageId(null)
+      } else {
+        const saved = replyDrafts.current.get(postId) || {}
+        replyDrafts.current.set(postId, { ...saved, image, id: null })
+      }
+    } catch (error) {
+      showToast(error.message, 'error')
+    } finally {
+      setPreparingReplyImage(false)
+      if (replyPostIdRef.current === postId) replyInputRef.current?.focus()
+    }
+  }
+
+  function openReplies(post, restoredDraft) {
     if (replyPost?.id === post.id && !restoredDraft) {
       closeReplies()
       return
@@ -476,7 +534,7 @@ export default function Board({
     setReplyPost(post)
     setReplies(cached?.replies || [])
     setReplyState(cached ? 'ready' : 'idle')
-    setReplyDraft(restoredDraft || replyDrafts.current.get(post.id) || '')
+    restoreReplyDraft(post.id, restoredDraft)
     loadReplies(post, { background: Boolean(cached) })
   }
 
@@ -592,13 +650,16 @@ export default function Board({
   async function sendReply(event) {
     event.preventDefault()
     const completedIntent = createParticipationIntent('reply', {
-      postId: replyPost?.id, text: replyDraft,
+      postId: replyPost?.id, text: replyDraft, attachment: replyImage?.payload,
+      thumbnail: replyImage?.thumbnailPayload,
     })
     const text = replyDraft.trim()
     const post = replyPost
-    if (!canInteract || !text || !post || replySending || handoffBusy) return
+    const image = replyImage
+    if (!canInteract || (!text && !image) || !post || replySending || handoffBusy || preparingReplyImage) return
 
-    const localId = `local-${Date.now()}`
+    const localId = replyMessageId || crypto.randomUUID()
+    setReplyMessageId(localId)
     const optimistic = {
       id: localId,
       host: me?.host,
@@ -606,30 +667,42 @@ export default function Board({
       text,
       created_at: Date.now() / 1000,
       pending: true,
+      ...(image ? { attachment: {
+        mime: image.payload.mime, w: image.payload.w, h: image.payload.h,
+        preview_url: image.previewUrl,
+      } } : {}),
     }
     markActivity()
     replySendingRef.current = true
     setReplySending(true)
-    setReplies((prior) => [...prior, optimistic])
-    setReplyDraft('')
+    setReplies((prior) => upsertReplyAttempt(prior, optimistic))
     try {
-      const receipt = await postReply(post.id, text)
+      const receipt = await postReply(post.id, text, {
+        id: localId, attachment: image?.payload, thumbnail: image?.thumbnailPayload,
+      })
       const confirmed = { ...optimistic, id: receipt.id || localId, pending: false }
-      setReplies((prior) => prior.map((reply) => (
-        reply.id === localId ? confirmed : reply
-      )))
+      replyDrafts.current.delete(post.id)
+      if (replyPostIdRef.current === post.id) {
+        setReplies((prior) => upsertReplyAttempt(
+          prior.filter(reply => reply.id !== localId || !reply.pending), confirmed,
+        ))
+        setReplyDraft('')
+        setReplyImage(null)
+        setReplyMessageId(null)
+      }
       // Replace any pre-write request without discarding the confirmed write
       // if its fresh confirmation read fails or the thread is reopened.
       const key = String(post.id)
       const cached = replyCache.get(key)?.result?.replies || []
-      rememberReplies(key, { replies: [...cached.filter(reply => reply.id !== confirmed.id), confirmed] })
-      await loadReplies(post, { background: true, force: true })
+      rememberReplies(key, { replies: upsertReplyAttempt(cached, confirmed) })
+      if (replyPostIdRef.current === post.id) await loadReplies(post, { background: true, force: true })
       window.mobius?.signal?.('item_created', { type: 'board_reply' })
       onCompleteParticipation?.(completedIntent)
       onRefresh(true)
     } catch (error) {
-      setReplies((prior) => prior.filter((reply) => reply.id !== localId))
-      setReplyDraft(text)
+      if (replyPostIdRef.current === post.id) {
+        setReplies((prior) => prior.filter((reply) => reply.id !== localId || !reply.pending))
+      }
       showToast(error.status === 404
         ? 'Replies aren’t available on this server yet.'
         : error.message, 'error')
@@ -690,6 +763,7 @@ export default function Board({
         postId: intent.post_id,
         text: intent.text,
         attachment: intent.attachment,
+        thumbnail: intent.thumbnail,
         attachments: intent.attachments,
         thumbnails: intent.thumbnails,
         emoji: intent.emoji,
@@ -716,7 +790,11 @@ export default function Board({
       return
     }
     if (intent.kind === 'reply') {
-      openReplies(post, intent.text || '')
+      const image = intent.attachment ? {
+        payload: intent.attachment, thumbnailPayload: intent.thumbnail,
+        previewUrl: `data:${intent.attachment.mime};base64,${intent.attachment.data_b64}`,
+      } : null
+      openReplies(post, { text: intent.text || '', image })
       return
     }
     setReactionPickerFor(reactionKey({ postId: post.id }))
@@ -984,7 +1062,7 @@ export default function Board({
           {loadingEarlier ? 'Loading earlier messages…' : 'Load earlier messages'}
         </button>
       )}
-      {earlierError && <p className="cn-inline-error" role="status">{earlierError}</p>}
+      {earlierError && <p className="cn-inline-error" role="alert">{earlierError} <button className="cn-btn cn-btn-secondary" type="button" onClick={loadEarlierPosts}>Try again</button></p>}
       <div className="cn-feed">
         {chronologicalFeed.map((post) => {
           const replyCount = countFor(post)
@@ -1071,9 +1149,6 @@ export default function Board({
                           <button className="cn-btn cn-btn-secondary" onClick={() => loadReplies(post)}>Try again</button>
                         </div>
                       )}
-                      {replyState === 'ready' && replies.length === 0 && (
-                        <p className="cn-reply-empty">No replies yet.</p>
-                      )}
                       {replies.map((reply) => (
                         <article id={`cn-reply-${reply.id}`} tabIndex={-1} className={`cn-reply-row${reply.pending ? ' is-pending' : ''}`} key={reply.id}>
                           <Avatar name={reply.handle} host={reply.host} size="small" remote />
@@ -1083,6 +1158,8 @@ export default function Board({
                               <span className="cn-time">{reply.pending ? 'Sending…' : timeAgo(reply.created_at)}</span>
                             </div>
                             <RichText text={reply.text} />
+                            <ReplyImage postId={post.id} reply={reply} onOpen={onOpenImage}
+                              onUnavailable={(error) => showToast(error.message, 'error')} />
                             {replyReactions && !reply.pending && !reply.id.startsWith('local-') && <ReactionControls item={reply}
                               target={{ postId: post.id, replyId: reply.id }}
                               override={reactionOverrides[reactionKey({ postId: post.id, replyId: reply.id })]}
@@ -1095,12 +1172,21 @@ export default function Board({
                         </article>
                       ))}
                     </div>
-                    {canInteract ? <Composer className="cn-reply-composer" onSubmit={sendReply}
-                      inputRef={replyInputRef} value={replyDraft} onChange={setReplyDraft}
+                    {canInteract ? <>
+                    <input ref={replyFileRef} className="cn-file-input" type="file" accept="image/*"
+                      onChange={chooseReplyImage} tabIndex={-1} aria-hidden="true" />
+                    <Composer className="cn-reply-composer" onSubmit={sendReply}
+                      inputRef={replyInputRef} value={replyDraft} onChange={changeReplyDraft}
                       maxLength={1000} placeholder="Post your reply" label="Post your reply"
-                      disabled={replySending || handoffBusy || participationBusy}
-                      sendDisabled={replySending || handoffBusy || participationBusy || !replyDraft.trim()}
-                      sendLabel="Send reply" /> : <button className="cn-btn cn-btn-primary cn-reply-join" type="button"
+                      disabled={replySending || handoffBusy || participationBusy || preparingReplyImage}
+                      sendDisabled={replySending || handoffBusy || participationBusy || preparingReplyImage || (!replyDraft.trim() && !replyImage)}
+                      attachmentAction={<ComposerAttachmentButton onClick={() => replyFileRef.current?.click()}
+                        disabled={!replyAttachments || replySending || preparingReplyImage || handoffBusy || participationBusy}
+                        label={!replyAttachments ? 'Photo replies need a Community server update' : preparingReplyImage ? 'Preparing photo…' : 'Attach photo to reply'} />}
+                      sendLabel="Send reply">
+                      {replyImage && <SelectedImageStrip selected={replyImage} onRemove={removeReplyImage}
+                        disabled={replySending || preparingReplyImage} onOpen={onOpenImage} />}
+                    </Composer></> : <button className="cn-btn cn-btn-primary cn-reply-join" type="button"
                                       onClick={onJoin} disabled={joinBusy}>Join Social to reply</button>}
                   </section>
                 )}
@@ -1155,7 +1241,7 @@ export default function Board({
             attachmentAction={<ComposerAttachmentButton onClick={() => fileRef.current?.click()}
               disabled={!canInteract || posting || selectedImages.length >= MAX_POST_IMAGES}
               label={selectedImages.length >= MAX_POST_IMAGES ? `Up to ${MAX_POST_IMAGES} images` : 'Attach photo'} />}>
-            {selectedImages.length > 0 && <SelectedImagesStrip selected={selectedImages} onRemove={removeImage} />}
+            {selectedImages.length > 0 && <SelectedImagesStrip selected={selectedImages} onRemove={removeImage} onOpen={onOpenImage} />}
           </Composer>
         </> : <div className="cn-board-join">
           <button className="cn-btn cn-btn-primary" type="button" onClick={onJoin}

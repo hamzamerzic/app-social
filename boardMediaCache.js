@@ -1,4 +1,4 @@
-import { getBoardMedia } from './api.js'
+import { getBoardMedia, getReplyMedia } from './api.js'
 
 // A board thumbnail never changes for its post and index. Social's frame is a
 // sandboxed, opaque-origin document, and Chrome gives each such document its
@@ -9,8 +9,9 @@ import { getBoardMedia } from './api.js'
 export const THUMBNAIL_LIMIT = 60
 const INDEX_PATH = 'cache/board-thumbnails/index.json'
 const INDEX_WRITE_DELAY_MS = 1000
-const thumbnailPath = (postId, index) =>
-  `cache/board-thumbnails/${encodeURIComponent(postId)}-${index ?? 0}.webp`
+const thumbnailPath = (postId, index, replyId) => replyId
+  ? `cache/board-thumbnails/reply/${encodeURIComponent(postId)}/${encodeURIComponent(replyId)}.webp`
+  : `cache/board-thumbnails/${encodeURIComponent(postId)}-${index ?? 0}.webp`
 
 const appStorage = () => globalThis.window?.mobius?.storage
 const indexes = new WeakMap()
@@ -38,9 +39,9 @@ async function rememberThumbnail(store, path, blob) {
   await Promise.all(expired.map(item => Promise.resolve(store.remove(item)).catch(() => null)))
 }
 
-export async function boardThumbnail(postId, index) {
+export async function boardThumbnail(postId, index, replyId) {
   const store = appStorage()
-  const path = thumbnailPath(postId, index)
+  const path = thumbnailPath(postId, index, replyId)
   const usable = typeof store?.getBlob === 'function' && typeof store?.setBlob === 'function'
     && typeof store?.get === 'function' && typeof store?.set === 'function'
   // Only ask storage for thumbnails this device saved; a miss would cost a
@@ -51,7 +52,9 @@ export async function boardThumbnail(postId, index) {
       if (saved?.size) return saved
     } catch { /* fall through to the service */ }
   }
-  const blob = await getBoardMedia(postId, index, { thumbnail: true })
+  const blob = replyId
+    ? await getReplyMedia(postId, replyId, { thumbnail: true })
+    : await getBoardMedia(postId, index, { thumbnail: true })
   if (blob?.size && usable) rememberThumbnail(store, path, blob).catch(() => {})
   return blob
 }

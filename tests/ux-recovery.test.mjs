@@ -50,7 +50,7 @@ test('conversation recovery is visible and new messages do not steal the reading
   for (const file of ['Thread.jsx', 'GroupThread.jsx']) {
     const source = readFileSync(new URL(`../ui/${file}`, import.meta.url), 'utf8')
     assert.match(source, /Messages couldn’t be refreshed/)
-    assert.match(source, /onClick=\{refresh\}>Try again/)
+    assert.match(source, /onClick=\{\(\) => earlierFailed\.current \? loadEarlier\(\) : refresh\(\)\}>Try again/)
     assert.match(source, /stickToBottom/)
     assert.match(source, /scrollHeight - el\.scrollTop - el\.clientHeight < 72/)
     assert.match(source, /paginationGeneration\.current \+= 1/)
@@ -188,7 +188,7 @@ test('public board startup is not gated by identity and behaves like a chronolog
   assert.doesNotMatch(board, /aria-label="New post"/)
   assert.match(board, /Load earlier messages/)
   assert.doesNotMatch(board, /landingImage/)
-  assert.match(board, /before === null \|\| before === undefined \|\| loadingEarlier/)
+  assert.match(board, /before === null \|\| before === undefined \|\| !hasEarlier \|\| earlierInFlight\.current/)
 })
 
 test('board warms real threads without fetching known empty threads', () => {

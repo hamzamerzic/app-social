@@ -41,6 +41,8 @@ from PIL import Image, ImageOps
 from common_protocol import (
   ATTACHMENT_MIME_EXT,
   CLOCK_SKEW_S,
+  MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENT_DIMENSION,
   MAX_AVATAR_BYTES,
   MAX_BOARD_ATTACHMENTS,
   MAX_BIO_CHARS,
@@ -58,6 +60,7 @@ from common_protocol import (
   valid_host,
   valid_id,
   validate_attachment,
+  validate_attachment_envelope_size,
   validate_attachments,
   validate_text_or_attachment,
 )
@@ -185,6 +188,29 @@ def validate_thumbnail_bytes(wire: dict, data: bytes) -> None:
     if image.size != (wire["w"], wire["h"]):
       raise ValueError("Board thumbnail dimensions do not match its data.")
     image.verify()
+
+
+def validate_reply_original_bytes(wire: dict, data: bytes) -> None:
+  """Admit only a complete image whose bytes agree with its reply metadata."""
+  if len(data) > MAX_ATTACHMENT_BYTES:
+    raise HTTPException(status_code=413, detail="Reply photo is too large.")
+  try:
+    with _open_board_image(data) as image:
+      # The header guard must precede either verification or raster decoding.
+      _validate_image_header(image)
+      if (max(image.size) > MAX_ATTACHMENT_DIMENSION
+          or IMAGE_FORMAT_MIME[image.format] != wire["mime"]
+          or image.size != (wire["w"], wire["h"])):
+        raise ValueError("Reply photo metadata does not match its data.")
+      image.verify()
+    # verify() checks the container without decoding pixels; load() also
+    # rejects a truncated or otherwise undecodable raster before persistence.
+    with _open_board_image(data) as image:
+      image.load()
+  except BoardImageTooLarge as exc:
+    raise HTTPException(status_code=400, detail=str(exc)) from exc
+  except (OSError, ValueError, SyntaxError, EOFError, Image.UnidentifiedImageError) as exc:
+    raise HTTPException(status_code=400, detail="Reply photo is invalid.") from exc
 
 
 class CommonPublicStore:
@@ -503,6 +529,57 @@ class CommonPublicStore:
     path = self.common_dir() / "board-thumbnails"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+  def reply_media_dir(self) -> Path:
+    path = self.common_dir() / "reply-media"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+  def reply_thumbnail_dir(self) -> Path:
+    path = self.common_dir() / "reply-thumbnails"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+  def reply_image(self, post_id: str, reply_id: str, *, thumbnail: bool = False):
+    post_path = self.board_dir() / f"{post_id}.json"
+
+    def committed_attachment():
+      if not post_path.is_file():
+        return None
+      replies = self._load_object(post_path).get("replies", [])
+      return next((reply["attachment"] for reply in replies
+                   if isinstance(reply, dict) and reply.get("id") == reply_id
+                   and isinstance(reply.get("attachment"), dict)), None)
+
+    attachment = committed_attachment()
+    if attachment is None:
+      return None
+    directory = self.reply_thumbnail_dir() if thumbnail else self.reply_media_dir()
+    mime = "image/webp" if thumbnail else attachment["mime"]
+    target = directory / post_id / f"{reply_id}.{ATTACHMENT_MIME_EXT[mime]}"
+    if target.is_file():
+      return target, mime
+    if not thumbnail:
+      return None
+    # Recheck under the deletion lock before recovering a missing rendition.
+    # The committed metadata, not leftover files, owns the original's type.
+    with self._mutation_lock(self._board_lock, "board"):
+      attachment = committed_attachment()
+      if attachment is None:
+        return None
+      if target.is_file():
+        return target, mime
+      source = self.reply_media_dir() / post_id / f"{reply_id}.{ATTACHMENT_MIME_EXT[attachment['mime']]}"
+      if not source.is_file():
+        return None
+      try:
+        mime, data = image_thumbnail_bytes(source.read_bytes())
+        atomic_write(target, data)
+        return target, mime
+      except BoardImageTooLarge as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+      except (OSError, ValueError, SyntaxError, Image.UnidentifiedImageError):
+        return None
 
   def board_media_path(self, post_id: str, mime: str) -> Path:
     return self.board_media_dir() / f"{post_id}.{ATTACHMENT_MIME_EXT[mime]}"
@@ -981,7 +1058,16 @@ class CommonPublicStore:
   def add_reply(
     self, post_id: str, reply_id: str, host: str, handle: str,
     text: str, created_at: float,
+    attachment: tuple[dict, bytes] | None = None,
+    thumbnail: tuple[dict, bytes] | None = None,
   ) -> dict:
+    if thumbnail is not None:
+      if attachment is None:
+        raise HTTPException(status_code=400, detail="Reply thumbnail needs a photo.")
+      try:
+        validate_thumbnail_bytes(*thumbnail)
+      except (OSError, ValueError, Image.UnidentifiedImageError) as exc:
+        raise HTTPException(status_code=400, detail="Reply thumbnail is invalid.") from exc
     try:
       self._ensure_board_index()
     except sqlite3.Error:
@@ -996,20 +1082,61 @@ class CommonPublicStore:
       if not isinstance(replies, list):
         replies = []
         post["replies"] = replies
-      if any(isinstance(reply, dict) and reply.get("id") == reply_id for reply in replies):
+      existing = next((reply for reply in replies if isinstance(reply, dict)
+                       and reply.get("id") == reply_id), None)
+      digest = hashlib.sha256(attachment[1]).hexdigest() if attachment else None
+      thumbnail_digest = hashlib.sha256(thumbnail[1]).hexdigest() if thumbnail else None
+      attachment_meta = (
+        {key: attachment[0][key] for key in ("mime", "w", "h")}
+        if attachment else None
+      )
+      if existing is not None:
+        # A stable retry may confirm the same reply, never replace another
+        # author's text or media under its id.
+        if (existing.get("host") != host or existing.get("text") != text
+            or existing.get("attachment_sha256") != digest
+            or existing.get("attachment") != attachment_meta
+            or existing.get("thumbnail_sha256") != thumbnail_digest):
+          raise HTTPException(status_code=409, detail="Reply id already belongs to different content.")
         return {
           "status": "ok", "reply_count": len(replies),
           "author_host": author_host, "activity": False,
+          "id": reply_id, "attachment": existing.get("attachment"),
         }
       if len(replies) >= BOARD_REPLY_LIMIT:
         raise HTTPException(status_code=507, detail="Post reply limit reached.")
-      replies.append({
+      if attachment is not None:
+        validate_reply_original_bytes(*attachment)
+      # No reply owns this identity yet. A crashed or failed earlier commit
+      # may have left media behind; none may become this new reply's rendition.
+      for directory in (self.reply_media_dir(), self.reply_thumbnail_dir()):
+        for extension in ATTACHMENT_MIME_EXT.values():
+          (directory / post_id / f"{reply_id}.{extension}").unlink(missing_ok=True)
+      record = {
         "id": reply_id,
         "host": host,
         "handle": handle,
         "text": text,
         "created_at": created_at,
-      })
+      }
+      if attachment is not None:
+        wire, data = attachment
+        media_dir = self.reply_media_dir() / post_id
+        media_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write(media_dir / f"{reply_id}.{ATTACHMENT_MIME_EXT[wire['mime']]}", data)
+        record["attachment"] = attachment_meta
+        record["attachment_sha256"] = digest
+        if thumbnail_digest is not None:
+          record["thumbnail_sha256"] = thumbnail_digest
+        try:
+          thumb_data = thumbnail[1] if thumbnail else data
+          _mime, rendered = image_thumbnail_bytes(thumb_data)
+          thumb_dir = self.reply_thumbnail_dir() / post_id
+          thumb_dir.mkdir(parents=True, exist_ok=True)
+          atomic_write(thumb_dir / f"{reply_id}.webp", rendered)
+        except (OSError, ValueError, SyntaxError, Image.UnidentifiedImageError):
+          pass
+      replies.append(record)
       owns_dirty_marker = self._mark_board_index_dirty()
       atomic_write(path, json.dumps(post))
       if self._refresh_board_index(post, path) and owns_dirty_marker:
@@ -1017,6 +1144,7 @@ class CommonPublicStore:
       return {
         "status": "ok", "reply_count": len(replies),
         "author_host": author_host, "activity": True,
+        "id": reply_id, "attachment": record.get("attachment"),
       }
 
   def get_replies(self, post_id: str, viewer: str | None = None) -> dict:
@@ -1035,6 +1163,8 @@ class CommonPublicStore:
       reactions = self._reaction_hosts(item)
       item.pop("likes", None)
       item.pop("_reaction_replays", None)
+      item.pop("attachment_sha256", None)
+      item.pop("thumbnail_sha256", None)
       item["reactions"] = self._public_reactions(reactions, viewer)
       presented.append(item)
     return {
@@ -1081,6 +1211,13 @@ class CommonPublicStore:
             thumb[0].unlink()
           except OSError:
             pass
+      for directory in (self.reply_media_dir(), self.reply_thumbnail_dir()):
+        owned = directory / post_id
+        if owned.is_dir():
+          for asset in owned.iterdir():
+            if asset.is_file():
+              asset.unlink()
+          owned.rmdir()
       try:
         owns_dirty_marker = self._mark_board_index_dirty()
         path.unlink()
@@ -1250,7 +1387,7 @@ def read_board_page(
     if position is not None:
       next_cursor = _encode_board_cursor(*position)
   return {
-    "capabilities": {"emoji_reactions": True, "reply_reactions": True, "image_thumbnails": True},
+    "capabilities": {"emoji_reactions": True, "reply_reactions": True, "image_thumbnails": True, "reply_attachments": True},
     "posts": posts,
     "next_cursor": next_cursor,
   }
@@ -1457,6 +1594,20 @@ def create_public_router(
       raise HTTPException(status_code=400, detail="Post id is invalid.")
     return store.get_replies(post_id)
 
+  @router.get("/board/{post_id}/replies/{name}/media")
+  @router.get("/board/{post_id}/replies/{name}/thumbnail")
+  def get_reply_image(post_id: str, name: str, request: Request):
+    # Prefer the typed /media.ext and /thumbnail.ext routes below; this bare
+    # route remains useful to callers without metadata.
+    return serve_board_image(store.reply_image(checked_post_id(post_id), checked_post_id(name),
+      thumbnail=request.url.path.endswith("/thumbnail")), None, request)
+
+  @router.get("/board/{post_id}/replies/{reply_id}/media.{extension}")
+  @router.get("/board/{post_id}/replies/{reply_id}/thumbnail.{extension}")
+  def get_typed_reply_image(post_id: str, reply_id: str, extension: str, request: Request):
+    return serve_board_image(store.reply_image(checked_post_id(post_id), checked_post_id(reply_id),
+      thumbnail="/thumbnail." in request.url.path), extension, request)
+
   @router.post("/board/{post_id}/replies")
   async def get_member_board_replies(post_id: str, request: Request):
     envelope = await read_envelope(request)
@@ -1513,15 +1664,14 @@ def create_public_router(
     if not valid_id(reply_id):
       raise HTTPException(status_code=400, detail="Reply id is invalid.")
     text = envelope.get("text")
-    if (
-      not isinstance(text, str) or not text.strip()
-      or len(text) > MAX_REPLY_TEXT_CHARS
-    ):
-      raise HTTPException(status_code=400, detail="Reply text is invalid.")
+    attachment = validate_attachment(envelope.get("attachment"))
+    thumbnail = validate_attachment(envelope.get("thumbnail"))
+    validate_text_or_attachment(text, attachment, "Reply text is invalid.", MAX_REPLY_TEXT_CHARS)
+    validate_attachment_envelope_size(envelope)
     actor = await verify_named_member(store, verifier, envelope)
     result = store.add_reply(
       post_id, reply_id, envelope["from"], actor["handle"],
-      text, envelope["sent_at"],
+      text, envelope["sent_at"], attachment, thumbnail,
     )
     author_host = result.pop("author_host", None)
     activity = result.pop("activity", False)

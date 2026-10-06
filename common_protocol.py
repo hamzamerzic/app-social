@@ -67,7 +67,7 @@ ATTACHMENT_MIME_EXT = {
   "image/webp": "webp",
 }
 _CONTENT_ENVELOPE_TYPES = {
-  "message", "group_post", "group_message", "board_post",
+  "message", "group_post", "group_message", "board_post", "board_reply",
 }
 
 

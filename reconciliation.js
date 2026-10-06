@@ -15,6 +15,15 @@ export function reconcileReplies(authoritative, current) {
   return [...landed, ...pending].sort(chronological)
 }
 
+// Sending again may confirm a reply already learned from a server snapshot.
+// Keep that authoritative row (including its timestamp/reactions), and let
+// only an unresolved optimistic row be replaced by a send receipt.
+export function upsertReplyAttempt(current, incoming) {
+  const confirmed = current.find(reply => reply.id === incoming.id && !reply.pending)
+  return [...current.filter(reply => reply.id !== incoming.id), confirmed || incoming]
+    .sort(chronological)
+}
+
 export function replyActionLabel(count) {
   const replies = Math.max(0, Number(count) || 0)
   if (replies === 0) return 'Reply'

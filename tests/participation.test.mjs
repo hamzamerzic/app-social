@@ -58,6 +58,19 @@ test('cancelled or incomplete sign-in leaves the exact reply draft waiting', asy
   assert.deepEqual(await loadParticipationIntent(storage), intent)
 })
 
+test('a combined reply photo and caption survive an account handoff as one draft', async () => {
+  const storage = memoryStorage()
+  const attachment = { mime: 'image/png', data_b64: 'cGhvdG8=', w: 40, h: 30 }
+  const thumbnail = { mime: 'image/webp', data_b64: 'dGh1bWI=', w: 40, h: 30 }
+  const intent = createParticipationIntent('reply', {
+    postId: '12345678-abcd', text: 'Caption stays with its photo', attachment, thumbnail,
+  })
+  await saveParticipationIntent(storage, intent)
+  assert.deepEqual(await loadParticipationIntent(storage), intent)
+  assert.deepEqual(intent.attachment, attachment)
+  assert.deepEqual(intent.thumbnail, thumbnail)
+})
+
 test('a missing Identity installation opens its exact Store listing', () => {
   const messages = []
   assert.equal(accountHandoff({}, (...args) => messages.push(args)), 'store')

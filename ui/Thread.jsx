@@ -15,6 +15,7 @@ import {
   addUnseenMessages, isDefinitePrecommitRejection, reconcileLatestPage,
   reconcileOlderPage, settleMessage,
 } from '../message_ui_state.js'
+import { reachedEarlierHistory } from './historyScroll.js'
 
 export default function Thread({
   peer, peerHandle, me, version, foreground, request, onBack, showToast, onOpenImage,
@@ -22,6 +23,9 @@ export default function Thread({
   const [messages, setMessages] = useState(null)
   const [nextCursor, setNextCursor] = useState(null)
   const [loadingEarlier, setLoadingEarlier] = useState(false)
+  const earlierInFlight = useRef(false)
+  const earlierFailed = useRef(false)
+  const lastScrollTop = useRef(null)
   const [loadError, setLoadError] = useState('')
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
@@ -38,6 +42,7 @@ export default function Thread({
   const refreshRequest = useRef(0)
   const latestPage = useRef(null)
   const paginationGeneration = useRef(0)
+  const conversationEpoch = useRef(0)
   const seenVersion = useRef(version)
   const stickToBottom = useRef(true)
   const inputRef = useRef(null)
@@ -60,10 +65,10 @@ export default function Thread({
         paginationGeneration.current += 1
         setNextCursor(reconciled.nextCursor)
       }
-      setLoadError('')
+      if (!earlierFailed.current) setLoadError('')
       return true
     } catch {
-      if (request === refreshRequest.current) {
+      if (request === refreshRequest.current && !earlierFailed.current) {
         setLoadError('Messages couldn’t be refreshed. Your saved history hasn’t been removed.')
       }
       return false
@@ -73,6 +78,12 @@ export default function Thread({
   useEffect(() => {
     seenVersion.current = version
     paginationGeneration.current += 1
+    conversationEpoch.current += 1
+    earlierInFlight.current = false
+    earlierFailed.current = false
+    lastScrollTop.current = null
+    setLoadError('')
+    setLoadingEarlier(false)
     updateMessages(null)
     setNextCursor(null)
     const watch = watchLatestMessages(peer, (page) => {
@@ -91,6 +102,9 @@ export default function Thread({
       watch.stop()
       latestPage.current = null
       refreshRequest.current += 1
+      paginationGeneration.current += 1
+      conversationEpoch.current += 1
+      earlierInFlight.current = false
     }
   }, [peer])
 
@@ -120,12 +134,16 @@ export default function Thread({
   }, [version])
 
   async function loadEarlier() {
-    if (!nextCursor || loadingEarlier) return
+    if (!nextCursor || earlierInFlight.current) return
+    earlierInFlight.current = true
+    earlierFailed.current = false
+    setLoadError('')
     const el = scrollRef.current
     const previousHeight = el?.scrollHeight || 0
     stickToBottom.current = false
     setLoadingEarlier(true)
     const generation = paginationGeneration.current
+    const epoch = conversationEpoch.current
     try {
       const page = await listMessages(peer, nextCursor)
       const reconciled = reconcileOlderPage(
@@ -136,14 +154,21 @@ export default function Thread({
       setNextCursor(reconciled.nextCursor)
       setLoadError('')
       requestAnimationFrame(() => {
-        if (el) el.scrollTop += el.scrollHeight - previousHeight
+        if (el && el === scrollRef.current && generation === paginationGeneration.current) {
+          el.scrollTop += el.scrollHeight - previousHeight
+          lastScrollTop.current = el.scrollTop
+        }
       })
     } catch {
       if (generation === paginationGeneration.current) {
+        earlierFailed.current = true
         setLoadError('Earlier messages couldn’t be loaded. Your saved history hasn’t been removed.')
       }
     } finally {
-      setLoadingEarlier(false)
+      if (epoch === conversationEpoch.current) {
+        earlierInFlight.current = false
+        setLoadingEarlier(false)
+      }
     }
   }
 
@@ -181,7 +206,10 @@ export default function Thread({
   function trackScroll() {
     const el = scrollRef.current
     if (!el || requestPending) return
+    const shouldLoad = reachedEarlierHistory(lastScrollTop.current, el)
+    lastScrollTop.current = el.scrollTop
     stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 72
+    if (shouldLoad && nextCursor && !earlierFailed.current) loadEarlier()
   }
 
   async function chooseImage(event) {
@@ -397,7 +425,7 @@ export default function Thread({
             {loadingEarlier ? 'Loading earlier messages…' : 'Load earlier messages'}
           </button>
         )}
-        {loadError && <div className="cn-directory-error" role="alert"><p>{loadError}</p><button className="cn-btn cn-btn-secondary" onClick={refresh}>Try again</button></div>}
+        {loadError && <div className="cn-directory-error" role="alert"><p>{loadError}</p><button className="cn-btn cn-btn-secondary" onClick={() => earlierFailed.current ? loadEarlier() : refresh()}>Try again</button></div>}
         {messages === null && !loadError && <div className="cn-center cn-history-loading" role="status"><div className="cn-spinner" /><span>Loading messages…</span></div>}
         {messages !== null && messages.length === 0 && (
           <div className="cn-empty">
@@ -425,7 +453,7 @@ export default function Thread({
                     disabled={sending || processingImage} />}>
           {(replyTarget || selectedImage) && <>
             <ReplyTarget reply={replyTarget} onDismiss={() => setReplyTarget(null)} />
-            <SelectedImageStrip selected={selectedImage} onRemove={() => setSelectedImage(null)} />
+            <SelectedImageStrip selected={selectedImage} onRemove={() => setSelectedImage(null)} onOpen={onOpenImage} />
           </>}
         </Composer>
       </ComposerFooter>}

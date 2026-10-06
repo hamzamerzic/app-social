@@ -152,6 +152,11 @@ export const getBoardMedia = (postId, index, { thumbnail = false, mime } = {}) =
   if (!thumbnail && mime) query.set('mime', mime)
   return call(`${path}?${query}`, {}, 'blob')
 }
+export const getReplyMedia = (postId, replyId, { thumbnail = false, mime } = {}) => {
+  const query = new URLSearchParams({ thumbnail: thumbnail ? 'true' : 'false' })
+  if (!thumbnail && mime) query.set('mime', mime)
+  return call(`reply-media/${encodeURIComponent(postId)}/${encodeURIComponent(replyId)}?${query}`, {}, 'blob')
+}
 export const reactToPost = (postId, emoji, replyId) =>
   call('reaction', { method: 'POST', body: JSON.stringify({
     post_id: postId, emoji, ...(replyId ? { reply_id: replyId } : {}),
@@ -163,8 +168,13 @@ export const getReplies = (postId, { background = false } = {}) =>
     noteAvatarDigests(result?.replies)
     return result
   })
-export const postReply = (postId, text) =>
-  call('reply', { method: 'POST', body: JSON.stringify({ post_id: postId, text }) })
+export const postReply = (postId, text, { id, attachment, thumbnail } = {}) =>
+  call('reply', { method: 'POST', body: JSON.stringify({
+    post_id: postId, text,
+    ...(id ? { id } : {}),
+    ...(attachment ? { attachment } : {}),
+    ...(thumbnail ? { thumbnail } : {}),
+  }) })
 export const searchPeople = (q, signal, { background = false } = {}) =>
   call(`people?q=${encodeURIComponent(q.trim().replace(/^@/, ''))}`, { signal, background })
     .then((result) => {

@@ -66,6 +66,14 @@ export function createParticipationIntent(kind, values = {}) {
       if (attachment) intent.attachment = attachment
     }
   }
+  if (kind === 'reply') {
+    const attachment = normalizedAttachment(values.attachment)
+    if (attachment) {
+      intent.attachment = attachment
+      const thumbnail = normalizedAttachment(values.thumbnail)
+      if (thumbnail) intent.thumbnail = thumbnail
+    }
+  }
   return intent
 }
 

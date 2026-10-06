@@ -2,8 +2,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
+import { randomUUID } from 'node:crypto'
 import { createParticipationIntent } from '../participation.js'
-import { reconcileReplies } from '../reconciliation.js'
+import { reconcileReplies, upsertReplyAttempt } from '../reconciliation.js'
 
 const board = readFileSync(new URL('../ui/Board.jsx', import.meta.url), 'utf8')
 
@@ -25,7 +26,7 @@ const reply = (id, text = id) => ({
   id, text, host: 'member.example', handle: 'member', created_at: 1,
 })
 
-function thread({ count = 0, read, send } = {}) {
+function thread({ count = 0, read, send, image = null } = {}) {
   const post = { id: 'test-post', reply_count: count }
   let rows = []
   let serverRows = []
@@ -33,10 +34,12 @@ function thread({ count = 0, read, send } = {}) {
   let state = 'idle'
   const errors = []
   const context = vm.createContext({
-    Date, Map, Set, String, Number, Promise,
-    createParticipationIntent, reconcileReplies,
+    Date, Map, Set, String, Number, Promise, crypto: { randomUUID },
+    createParticipationIntent, reconcileReplies, upsertReplyAttempt,
     replyRequest: { current: 0 }, replySendingRef: { current: false },
     replyPost: post, replyDraft: 'My reply', replySending: false,
+    replyImage: image, replyMessageId: null, preparingReplyImage: false,
+    replyDrafts: { current: new Map() }, replyPostIdRef: { current: post.id },
     canInteract: true, handoffBusy: false,
     me: { host: 'member.example', handle: 'member' },
     window: { mobius: { signal() {} } },
@@ -45,13 +48,15 @@ function thread({ count = 0, read, send } = {}) {
     setReplies(value) { rows = typeof value === 'function' ? value(rows) : value },
     setReplyState(value) { state = value }, setReplyError() {},
     setReplyDraft(value) { context.replyDraft = value },
+    setReplyImage(value) { context.replyImage = value },
+    setReplyMessageId(value) { context.replyMessageId = value },
     setReplySending(value) { context.replySending = value },
     async getReplies() {
       reads += 1
       return read ? read(reads) : { replies: serverRows }
     },
-    async postReply() {
-      if (send) return send()
+    async postReply(postId, text, options) {
+      if (send) return send(postId, text, options)
       const landed = reply('confirmed', context.replyDraft || 'My reply')
       serverRows = [...serverRows, landed]
       return { id: landed.id, reply_count: serverRows.length }
@@ -61,6 +66,7 @@ function thread({ count = 0, read, send } = {}) {
   return {
     post, context, errors,
     get ids() { return Array.from(rows, row => row.id) },
+    get rows() { return rows },
     get reads() { return reads }, get state() { return state },
     set serverRows(value) { serverRows = value },
     set rows(value) { rows = value },
@@ -75,6 +81,120 @@ test('initially empty threads still open immediately without a network read', as
   assert.equal(view.reads, 0)
   assert.equal(view.state, 'ready')
   assert.deepEqual(view.ids, [])
+})
+
+const photo = {
+  payload: { mime: 'image/png', data_b64: 'cGhvdG8=', w: 40, h: 30 },
+  thumbnailPayload: { mime: 'image/webp', data_b64: 'dGh1bWI=', w: 40, h: 30 },
+  previewUrl: 'data:image/png;base64,cGhvdG8=',
+}
+
+test('a reply sends caption and photo together and clears both only after success', async () => {
+  let sent
+  const view = thread({ image: photo, send: async (...args) => {
+    sent = args
+    assert.equal(view.context.replyDraft, 'My reply')
+    assert.equal(view.context.replyImage, photo)
+    assert.equal(view.rows.at(-1).attachment.preview_url, photo.previewUrl)
+    return { id: args[2].id }
+  } })
+  await view.send()
+  assert.equal(sent[1], 'My reply')
+  assert.equal(sent[2].attachment, photo.payload)
+  assert.equal(sent[2].thumbnail, photo.thumbnailPayload)
+  assert.equal(view.context.replyDraft, '')
+  assert.equal(view.context.replyImage, null)
+})
+
+test('a photo-only reply is valid while an empty reply never sends', async () => {
+  let sends = 0
+  const view = thread({ image: photo, send: async (_post, _text, options) => {
+    sends++
+    return { id: options.id }
+  } })
+  view.context.replyDraft = ''
+  await view.send()
+  assert.equal(sends, 1)
+  await view.send()
+  assert.equal(sends, 1)
+})
+
+test('an interrupted photo reply retains caption, attachment and the same retry identity', async () => {
+  const ids = []
+  const view = thread({ image: photo, send: async (_post, _text, options) => {
+    ids.push(options.id)
+    throw new Error('Connection interrupted')
+  } })
+  await view.send()
+  assert.equal(view.context.replyImage, photo)
+  assert.equal(view.context.replyDraft, 'My reply')
+  await view.send()
+  assert.equal(ids[0], ids[1])
+  assert.deepEqual(view.ids, [])
+})
+
+for (const retryFails of [false, true]) {
+  test(`timeout then polling then ${retryFails ? 'failed' : 'successful'} retry preserves one authoritative reply`, async () => {
+    let sends = 0, canonical = null, readFails = false
+    const view = thread({ image: photo,
+      read: () => {
+        if (readFails) throw new Error('Confirmation read unavailable')
+        return { replies: canonical ? [canonical] : [] }
+      },
+      send: async (_post, _text, options) => {
+        sends++
+        if (sends === 1) {
+          canonical = { ...reply(options.id, 'My reply'), created_at: 5,
+            attachment: { mime: 'image/png', w: 40, h: 30 },
+            reactions: [{ emoji: '❤️', count: 1 }] }
+          throw new Error('Delivery confirmation timed out')
+        }
+        assert.deepEqual(view.ids, [canonical.id])
+        assert.equal(view.rows[0], canonical, 'retry never replaces known history with a pending row')
+        readFails = true
+        if (retryFails) throw new Error('Retry confirmation timed out')
+        return { id: options.id }
+      },
+    })
+    await view.send()
+    assert.deepEqual(view.ids, [])
+    await view.load({ background: true })
+    assert.deepEqual(view.ids, [canonical.id])
+    await view.send()
+    assert.deepEqual(view.ids, [canonical.id])
+    assert.equal(view.rows[0], canonical, 'canonical time, image metadata and reactions survive settlement')
+    assert.equal(view.rows[0].pending, undefined)
+    assert.equal(view.context.replyDraft, retryFails ? 'My reply' : '')
+    assert.equal(view.context.replyImage, retryFails ? photo : null)
+    view.rows = []
+    await view.load()
+    assert.deepEqual(view.ids, [canonical.id])
+    assert.equal(view.rows[0], canonical, 'reopening from cache keeps the same authoritative row')
+  })
+}
+
+test('removing the photo preserves its caption and editing starts a new send identity', () => {
+  const view = thread({ image: photo })
+  view.context.replyMessageId = 'previous-attempt'
+  view.context.removeReplyImage()
+  assert.equal(view.context.replyDraft, 'My reply')
+  assert.equal(view.context.replyImage, null)
+  assert.equal(view.context.replyMessageId, null)
+  view.context.replyMessageId = 'previous-attempt'
+  view.context.changeReplyDraft('Changed caption')
+  assert.equal(view.context.replyMessageId, null)
+})
+
+test('reply drafts restore photo and caption by post without leaking into a different post', () => {
+  const view = thread()
+  view.context.replyDrafts.current.set('one', { text: 'Caption', image: photo, id: 'retry-id' })
+  view.context.restoreReplyDraft('one')
+  assert.equal(view.context.replyImage, photo)
+  assert.equal(view.context.replyDraft, 'Caption')
+  view.context.restoreReplyDraft('two')
+  assert.equal(view.context.replyImage, null)
+  assert.equal(view.context.replyDraft, '')
+  assert.equal(view.context.replyMessageId, null)
 })
 
 test('a confirmed first reply survives successive polls with the original zero feed count', async () => {
