@@ -80,3 +80,24 @@ test('reply buttons look compact while retaining full-size tap targets', {
     }
   } finally { rmSync(folder,{recursive:true,force:true}) }
 })
+
+
+test('inline reply fields scale with compact controls without shrinking targets or mobile text', {
+  skip: !process.env.CHROME_BIN && 'CHROME_BIN is not configured',
+}, async () => {
+  const folder = mkdtempSync(join(tmpdir(), 'social-compact-reply-field-'))
+  const file = join(folder, 'test.html')
+  try {
+    const composer = (id, cls, content = '') => `<form id="${id}" class="cn-composer ${cls}"><button class="cn-composer-attach"><svg></svg></button><div class="cn-composer-pill"><div class="cn-composer-input-line"><textarea rows="1">${content}</textarea><button class="cn-composer-send"><svg></svg></button></div></div></form>`
+    writeFileSync(file, `<style>:root{--font:sans-serif;--bg:#fff;--surface:#fff;--text:#111;--border:#ccc;--accent:#7048e8}*{box-sizing:border-box}body{margin:0}${CSS}</style>${composer('main', '')}<section class="cn-inline-thread">${composer('reply', 'cn-reply-composer')}</section><pre id="result"></pre><script>const rect=n=>n.getBoundingClientRect();document.querySelector('#result').textContent=JSON.stringify(['main','reply'].map(id=>{const form=document.getElementById(id),pill=rect(form.querySelector('.cn-composer-pill')),input=form.querySelector('textarea');return {id,viewportWidth:innerWidth,pillHeight:pill.height,font:parseFloat(getComputedStyle(input).fontSize),overflow:form.scrollWidth>form.clientWidth,targets:[...form.querySelectorAll('button')].map(b=>({w:rect(b).width,h:rect(b).height}))}}))</script>`)
+    for (const width of [320, 426, 1280]) {
+      const [main, reply] = await renderLayout(process.env.CHROME_BIN, file, { width })
+      assert.equal(reply.viewportWidth, width, 'the fixture uses the requested viewport')
+      assert.equal(main.pillHeight, 50, 'the main composer is unchanged')
+      assert.equal(reply.pillHeight, 46, 'reply field fits its 44px controls and border')
+      assert.ok(reply.targets.every(b=>b.w>=44&&b.h>=44))
+      assert.equal(reply.font, 16, 'mobile inputs retain readable non-zooming type')
+      assert.equal(reply.overflow, false)
+    }
+  } finally { rmSync(folder, { recursive: true, force: true }) }
+})

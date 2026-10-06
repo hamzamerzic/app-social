@@ -71,9 +71,18 @@ export async function renderLayout(chrome, file, { width = 320, height = 860 } =
     await spawned
     const { targetId } = await command('Target.createTarget', { url: 'about:blank' })
     const { sessionId } = await command('Target.attachToTarget', { targetId, flatten: true })
+    await command('Emulation.setDeviceMetricsOverride', {
+      width, height, deviceScaleFactor: 1, mobile: false,
+    }, sessionId)
     await command('Page.enable', {}, sessionId)
     const loaded = new Promise((resolve, reject) => events.set(`${sessionId}:Page.loadEventFired`, { resolve, reject }))
     await Promise.all([loaded, command('Page.navigate', { url: pathToFileURL(file).href }, sessionId)])
+    const viewport = await command('Runtime.evaluate', {
+      expression: '({ width: innerWidth, height: innerHeight })', returnByValue: true,
+    }, sessionId)
+    if (viewport.result.value.width !== width || viewport.result.value.height !== height) {
+      throw new Error(`Layout viewport mismatch: requested ${width}x${height}, got ${JSON.stringify(viewport.result.value)}`)
+    }
     const result = await command('Runtime.evaluate', {
       expression: `new Promise(resolve => {
         const observer = new MutationObserver(read)
