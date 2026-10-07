@@ -541,9 +541,12 @@ export const CSS = `
 .cn-message-line > .cn-bubble { align-self: auto; max-width: calc(100% - 50px); }
 .cn-message-line.is-theirs > .cn-bubble { max-width: calc(100% - 86px); }
 .cn-bubble-copy {
-  display: block; white-space: pre-wrap; overflow-wrap: anywhere;
+  display: block; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
   user-select: text; -webkit-user-select: text; cursor: text;
 }
+.cn-bubble-copy * { user-select: text; -webkit-user-select: text; }
+.cn-bubble-copy a { color: inherit; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.cn-bubble-copy a:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
 .cn-bubble.has-attachment {
   width: min(68vw, 340px); padding: 4px; overflow: hidden;
 }

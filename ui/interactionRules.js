@@ -44,3 +44,14 @@ export function pinchLightboxScale(startScale, startDistance, currentDistance) {
   if (!Number.isFinite(initial) || initial <= 0) return clampLightboxScale(startScale)
   return clampLightboxScale(Number(startScale) * (Number(currentDistance) / initial))
 }
+
+// Clipboard images use the same preparation path as the photo picker. Text-only
+// pastes remain native; chat supports one photo per outgoing message.
+export function clipboardImageFile(clipboardData) {
+  for (const item of Array.from(clipboardData?.items || [])) {
+    if (item.kind !== 'file' || !item.type.startsWith('image/')) continue
+    const file = item.getAsFile()
+    if (file) return file
+  }
+  return null
+}

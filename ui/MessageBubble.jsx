@@ -1,5 +1,6 @@
 import { Reply, X } from '@openai/apps-sdk-ui/components/Icon'
 import { MessageImage } from './Media.jsx'
+import RichText from './RichText.jsx'
 
 function handleLabel(handle) {
   const clean = String(handle || 'Unknown').replace(/^@/, '')
@@ -61,7 +62,7 @@ export default function MessageBubble({
         <Quote reply={message.reply_to} />
         <MessageImage attachment={message.attachment} conversationPath={conversationPath}
                       onOpen={onOpenImage} onUnavailable={onImageUnavailable} />
-        {message.text && <span className="cn-bubble-copy">{message.text}</span>}
+        {message.text && <RichText className="cn-bubble-copy" text={message.text} />}
         <span className="cn-bubble-time">{message.time}{tick}</span>
       </div>
       {!mine && replyButton}
