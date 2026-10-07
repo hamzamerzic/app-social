@@ -7,7 +7,6 @@ import fcntl
 import json
 import logging
 import os
-import time
 import shutil
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -234,29 +233,29 @@ async def notify(title: str, body: str, intent: str) -> bool:
 
 
 # ── unread badge ─────────────────────────────────────────────────────────────
-# Social reports its Messages unread total as its Möbius sidebar badge. Every
-# storage mutation already passes through ``_bump_version``, which marks the
-# badge dirty; the service dispatcher then reports once for the request. Each
-# request runs in its own process, so there is no cross-request memory: the
-# total is recomputed from stored metadata and can never drift from what the
-# Messages tab shows. Public deliveries and owner requests run concurrently,
-# so each report carries a nanosecond timestamp taken *before* counting; the
-# platform ignores a report that is not newer than the one it holds. A clock,
-# unlike Social's own storage counter, keeps increasing when Social's data is
-# wiped or restored from a backup.
+# Social reports its Messages unread total as its Möbius sidebar badge. The
+# badge is a projection Social reconciles, persisted in two small files:
+#
+#   state/badge.json      {"revision", "count"}  what the badge should show
+#   state/badge-ack.json  {"revision"}           the last report Möbius accepted
+#
+# ``record_badge`` runs inside every storage transaction (``_bump_version``,
+# under ``app_storage_lock``) and captures the count together with that
+# transaction's version, so the revision is Social's own state order, never a
+# clock. ``reconcile_badge`` runs after every service request, outside the
+# lock: when the acknowledged revision is behind, it reports and acknowledges
+# only on success. A failed report is therefore retried by the next request of
+# any kind, and an installation that already holds unread messages reports
+# them on its first request.
 
-_badge_dirty = False
+BADGE_PATH = ("state", "badge.json")
+BADGE_ACK_PATH = ("state", "badge-ack.json")
+# The same statuses ``api.requestStatus`` hides; anything else is accepted.
+_HIDDEN_REQUEST_STATUSES = frozenset({"pending", "declined", "blocked"})
 
 
-def mark_badge_dirty() -> None:
-  global _badge_dirty
-  _badge_dirty = True
-
-
-def _accepted(meta: dict) -> bool:
-  # Same rule as api.requestStatus: metadata without a state is an
-  # established conversation predating Message Requests.
-  return meta.get("request_status") in (None, "accepted")
+def _counts_toward_badge(meta: dict) -> bool:
+  return meta.get("request_status") not in _HIDDEN_REQUEST_STATUSES
 
 
 def unread_total(storage: Path) -> int:
@@ -272,30 +271,96 @@ def unread_total(storage: Path) -> int:
         meta = json.loads(meta_path.read_text())
       except (OSError, ValueError):
         continue
-      if isinstance(meta, dict) and _accepted(meta):
+      if isinstance(meta, dict) and _counts_toward_badge(meta):
         total += max(0, int(meta.get("unread") or 0))
   return total
 
 
-async def flush_badge() -> None:
-  """Report the unread total if this request changed Social's storage."""
-  global _badge_dirty
-  if not _badge_dirty:
-    return
-  _badge_dirty = False
+def _read_json(path: Path) -> dict | None:
   try:
-    # Version first: a count computed afterwards reflects at least that moment,
-    # so the newest version's report is always the freshest count.
-    version = time.time_ns()
-    total = unread_total(Path(os.environ["APP_STORAGE_DIR"]))
+    value = json.loads(path.read_text())
+  except (OSError, ValueError):
+    return None
+  return value if isinstance(value, dict) else None
+
+
+def _storage_version(storage: Path) -> int:
+  state = _read_json(storage / "state" / "version.json") or {}
+  return int(state.get("v") or 0)
+
+
+def record_badge(storage: Path, version: int) -> None:
+  """Capture the badge for a committed storage version (caller holds the lock).
+
+  Only a changed count advances the badge revision, so writes that do not
+  touch unread state never cause a report.
+  """
+  from service_io import atomic_write
+
+  count = unread_total(storage)
+  current = _read_json(storage.joinpath(*BADGE_PATH))
+  if current is not None and current.get("count") == count:
+    return
+  atomic_write(storage.joinpath(*BADGE_PATH),
+               json.dumps({"revision": version, "count": count}))
+
+
+async def _badge_snapshot(storage: Path) -> tuple[dict, int]:
+  """The badge to show and the last accepted revision, bootstrapping once."""
+  badge = _read_json(storage.joinpath(*BADGE_PATH))
+  if badge is None:
+    async with app_storage_lock(APP.id):
+      badge = _read_json(storage.joinpath(*BADGE_PATH))
+      if badge is None:
+        record_badge(storage, _storage_version(storage))
+        badge = _read_json(storage.joinpath(*BADGE_PATH)) or {}
+  ack = _read_json(storage.joinpath(*BADGE_ACK_PATH)) or {}
+  return badge, int(ack.get("revision") if ack.get("revision") is not None else -1)
+
+
+async def _acknowledge(storage: Path, revision: int) -> None:
+  from service_io import atomic_write
+
+  async with app_storage_lock(APP.id):
+    ack = _read_json(storage.joinpath(*BADGE_ACK_PATH)) or {}
+    if int(ack.get("revision") if ack.get("revision") is not None else -1) < revision:
+      atomic_write(storage.joinpath(*BADGE_ACK_PATH),
+                   json.dumps({"revision": revision}))
+
+
+async def reconcile_badge() -> None:
+  """Bring Möbius's badge up to Social's recorded one; never fail the request."""
+  storage = Path(os.environ["APP_STORAGE_DIR"])
+  try:
+    badge, acknowledged = await _badge_snapshot(storage)
+    revision, count = int(badge.get("revision") or 0), int(badge.get("count") or 0)
+    if acknowledged >= revision:
+      return
+    path = f"/api/apps/{APP.id}/badge"
     response = await platform_request(
-      "PUT", f"/api/apps/{APP.id}/badge",
-      json_body={"count": total, "version": version},
+      "PUT", path, json_body={"count": count, "revision": revision},
     )
-    # A Möbius that predates app badges answers 404/405: nothing to show.
-    if response.status_code not in (404, 405):
+    if response.status_code in (404, 405):
+      # This Möbius predates app badges: there is nothing to keep in sync.
+      await _acknowledge(storage, revision)
+      return
+    response.raise_for_status()
+    stored = response.json()
+    stored_revision = stored.get("revision")
+    if (
+      not stored.get("applied") and stored_revision is not None
+      and stored_revision > _storage_version(storage)
+    ):
+      # Möbius holds a revision Social's storage has never reached: Social's
+      # state went backwards (restored from a backup). Reset the ordering with
+      # the current badge; an unrevisioned report always applies.
+      current, _ = await _badge_snapshot(storage)
+      response = await platform_request(
+        "PUT", path, json_body={"count": int(current.get("count") or 0)},
+      )
       response.raise_for_status()
+    # Otherwise it applied, or Social's own newer report already landed.
+    await _acknowledge(storage, revision)
   except Exception as exc:
-    # Best effort: never fail the user's request. The next change re-sends
-    # the full recomputed total.
+    # Unacknowledged: the next request reports again.
     logging.getLogger("social").warning("Unread badge not updated: %s", exc)

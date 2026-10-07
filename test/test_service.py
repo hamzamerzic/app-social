@@ -870,7 +870,7 @@ asyncio.run(main())
       changed["status"] = "failed"
       latest.write_text(json.dumps(changed))
       version = storage / "state" / "version.json"
-      version.parent.mkdir(parents=True)
+      version.parent.mkdir(parents=True, exist_ok=True)
       version.write_text(json.dumps({"v": 1}))
       newest = {
         "id": "message-125", "dir": "out", "text": "125",

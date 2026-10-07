@@ -1,10 +1,9 @@
-"""Social reports the Messages unread total as its sidebar badge."""
+"""Social keeps its Möbius sidebar badge reconciled with the Messages unread total."""
 
 import asyncio
 import json
 import os
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -19,80 +18,145 @@ for _key, _value in {
 import service_runtime  # noqa: E402
 
 
-
 def _meta(root: Path, kind: str, name: str, meta: dict) -> None:
   path = root / kind / name / "meta.json"
-  path.parent.mkdir(parents=True)
+  path.parent.mkdir(parents=True, exist_ok=True)
   path.write_text(json.dumps(meta))
 
 
-class UnreadBadgeTests(unittest.TestCase):
-  def setUp(self):
-    self.tmp = tempfile.TemporaryDirectory()
-    self.root = Path(self.tmp.name)
-    self.addCleanup(self.tmp.cleanup)
+def _version(root: Path, v: int) -> None:
+  (root / "state").mkdir(parents=True, exist_ok=True)
+  (root / "state" / "version.json").write_text(json.dumps({"v": v}))
 
-  def test_total_counts_accepted_conversations_and_groups_only(self):
-    _meta(self.root, "conversations", "a", {"unread": 3})  # pre-requests legacy
-    _meta(self.root, "conversations", "b", {"unread": 2, "request_status": "accepted"})
-    _meta(self.root, "conversations", "c", {"unread": 4, "request_status": "pending"})
-    _meta(self.root, "conversations", "d", {"unread": 9, "request_status": "blocked"})
+
+class FakePlatform:
+  """Möbius's badge endpoint: ordering by revision, unrevisioned resets."""
+
+  def __init__(self):
+    self.count, self.revision, self.calls, self.fail, self.status = 0, None, [], False, 200
+
+  async def request(self, method, path, *, json_body=None):
+    self.calls.append(json_body)
+    platform = self
+
+    class Response:
+      status_code = platform.status
+
+      def raise_for_status(self):
+        if platform.fail:
+          raise RuntimeError("platform unavailable")
+
+      def json(self):
+        return reply
+
+    if self.fail or self.status != 200:
+      reply = None
+      return Response()
+    revision = json_body.get("revision")
+    applied = revision is None or self.revision is None or revision > self.revision
+    if applied:
+      self.count, self.revision = json_body["count"], revision
+    reply = {"count": self.count, "revision": self.revision, "applied": applied}
+    return Response()
+
+
+class BadgeTests(unittest.TestCase):
+  def setUp(self):
+    tmp = tempfile.TemporaryDirectory()
+    self.addCleanup(tmp.cleanup)
+    self.root = Path(tmp.name)
+    self.platform = FakePlatform()
+    for patcher in (
+      patch.dict(os.environ, {"APP_STORAGE_DIR": str(self.root)}),
+      patch.object(service_runtime, "STORAGE", self.root),
+      patch.object(service_runtime, "platform_request", new=self.platform.request),
+    ):
+      patcher.start()
+      self.addCleanup(patcher.stop)
+
+  def reconcile(self):
+    asyncio.run(service_runtime.reconcile_badge())
+
+  def write(self, version, **metas):
+    """A storage transaction: change metadata, then record at its version."""
+    for name, meta in metas.items():
+      _meta(self.root, "conversations", name, meta)
+    _version(self.root, version)
+    service_runtime.record_badge(self.root, version)
+
+  def test_total_uses_the_same_status_rule_as_the_messages_tab(self):
+    _meta(self.root, "conversations", "legacy", {"unread": 3})
+    _meta(self.root, "conversations", "accepted", {"unread": 2, "request_status": "accepted"})
+    _meta(self.root, "conversations", "future", {"unread": 1, "request_status": "archived"})
+    for hidden in ("pending", "declined", "blocked"):
+      _meta(self.root, "conversations", hidden, {"unread": 9, "request_status": hidden})
     _meta(self.root, "groups", "g", {"unread": 1, "request_status": "accepted"})
     (self.root / "groups" / "broken").mkdir()
     (self.root / "groups" / "broken" / "meta.json").write_text("{not json")
-    self.assertEqual(service_runtime.unread_total(self.root), 6)
+    self.assertEqual(service_runtime.unread_total(self.root), 7)
 
-  def _flush_with(self, status):
-    sent = []
+  def test_existing_unread_messages_are_reported_on_the_first_request(self):
+    # An installation upgraded to this version already holds unread messages;
+    # any request (here a read-only one) brings the sidebar up to date.
+    _meta(self.root, "conversations", "peer", {"unread": 2})
+    _version(self.root, 40)
+    self.reconcile()
+    self.assertEqual((self.platform.count, self.platform.revision), (2, 40))
+    self.reconcile()
+    self.assertEqual(len(self.platform.calls), 1)  # acknowledged: nothing to resend
 
-    class Response:
-      status_code = status
+  def test_a_failed_report_is_retried_by_a_later_request(self):
+    self.write(5, peer={"unread": 2})
+    self.reconcile()
+    self.write(6, peer={"unread": 0})  # the conversation was read
+    self.platform.fail = True
+    self.reconcile()
+    self.assertEqual(self.platform.count, 2)
+    # The platform recovers; the next request of any kind repairs the badge,
+    # even though reading an already-read conversation changes nothing.
+    self.platform.fail = False
+    self.reconcile()
+    self.assertEqual((self.platform.count, self.platform.revision), (0, 6))
 
-      def raise_for_status(self):
-        if status >= 400:
-          raise RuntimeError(f"HTTP {status}")
+  def test_writes_that_do_not_change_the_count_do_not_report(self):
+    self.write(5, peer={"unread": 1})
+    self.reconcile()
+    self.write(6, peer={"unread": 1, "last_text": "edited"})
+    self.reconcile()
+    self.assertEqual(len(self.platform.calls), 1)
 
-    async def fake_request(method, path, *, json_body=None):
-      sent.append((method, path, json_body))
-      return Response()
+  def test_a_stale_snapshot_never_resets_a_newer_count(self):
+    # Another request already reported revision 9 (count 0); this request's
+    # snapshot is revision 8 (count 4). It is stale, not a restore.
+    self.platform.count, self.platform.revision = 0, 9
+    _version(self.root, 9)
+    (self.root / "state" / "badge.json").write_text(json.dumps({"revision": 8, "count": 4}))
+    self.reconcile()
+    self.assertEqual((self.platform.count, self.platform.revision), (0, 9))
+    self.assertEqual(self.platform.calls, [{"count": 4, "revision": 8}])
 
-    original = service_runtime.platform_request
-    service_runtime.platform_request = fake_request
-    env = patch.dict(os.environ, {"APP_STORAGE_DIR": str(self.root)})
-    env.start()
-    try:
-      asyncio.run(service_runtime.flush_badge())
-    finally:
-      env.stop()
-      service_runtime.platform_request = original
-    return sent
+  def test_restored_storage_resets_the_ordering(self):
+    # Möbius last accepted revision 300; Social's data was then restored from
+    # a backup at revision 12, so its own reports would all look stale.
+    self.platform.count, self.platform.revision = 5, 300
+    self.write(12, peer={"unread": 1})
+    self.reconcile()
+    self.assertEqual(self.platform.calls[-1], {"count": 1})
+    self.assertEqual(self.platform.count, 1)
+    self.write(13, peer={"unread": 0})
+    self.reconcile()
+    self.assertEqual((self.platform.count, self.platform.revision), (0, 13))
 
-  def test_only_a_request_that_changed_storage_reports_the_total(self):
-    _meta(self.root, "conversations", "a", {"unread": 2})
-    service_runtime._badge_dirty = False
-    self.assertEqual(self._flush_with(204), [])  # a read-only request
-    service_runtime.mark_badge_dirty()
-    before = time.time_ns()
-    sent = self._flush_with(204)
-    self.assertEqual(len(sent), 1)
-    method, path, body = sent[0]
-    self.assertEqual((method, path), ("PUT", f"/api/apps/{service_runtime.APP.id}/badge"))
-    self.assertEqual(body["count"], 2)
-    # Taken before counting, from a clock: later reports always order after,
-    # even if Social's own data (and its storage counter) is wiped or restored.
-    self.assertGreaterEqual(body["version"], before)
-    self.assertFalse(service_runtime._badge_dirty)
-
-  def test_report_failures_and_older_platforms_never_fail_the_request(self):
-    _meta(self.root, "conversations", "a", {"unread": 1})
-    for status in (404, 500):
-      service_runtime.mark_badge_dirty()
-      self.assertEqual(len(self._flush_with(status)), 1)  # no exception raised
+  def test_an_older_mobius_without_badges_is_not_asked_again(self):
+    self.platform.status = 404
+    self.write(5, peer={"unread": 1})
+    self.reconcile()
+    self.reconcile()
+    self.assertEqual(len(self.platform.calls), 1)
 
 
-
-class DispatchReportsBadgeTests(unittest.TestCase):
-  """A real request through the service entry point reports the new total."""
+class DispatchReconcilesBadgeTests(unittest.TestCase):
+  """A real request through the service entry point updates the sidebar."""
 
   def test_reading_a_conversation_reports_the_cleared_total(self):
     import service
@@ -103,22 +167,11 @@ class DispatchReportsBadgeTests(unittest.TestCase):
     root = Path(tmp.name)
     _meta(root, "conversations", "peer.example", {"unread": 2})
     _meta(root, "groups", "g1", {"unread": 1, "request_status": "accepted"})
-    sent = []
-
-    class Response:
-      status_code = 204
-
-      def raise_for_status(self):
-        pass
-
-    async def fake_request(method, path, *, json_body=None):
-      sent.append((method, path, json_body))
-      return Response()
-
-    service_runtime._badge_dirty = False
+    platform = FakePlatform()
     with (
       patch.dict(os.environ, {"APP_STORAGE_DIR": str(root)}),
-      patch.object(service_runtime, "platform_request", new=fake_request),
+      patch.object(service_runtime, "STORAGE", root),
+      patch.object(service_runtime, "platform_request", new=platform.request),
       patch.object(social_routes, "_require_member", return_value=service_runtime.APP),
       patch.object(service, "migrate_legacy_state"),
     ):
@@ -127,11 +180,8 @@ class DispatchReportsBadgeTests(unittest.TestCase):
         "body": {}, "actor": {"scope": "owner"},
       }))
     self.assertEqual(reply.get("status"), 200, reply)
-    self.assertEqual(len(sent), 1)
-    method, path, body = sent[0]
-    self.assertEqual((method, path), ("PUT", f"/api/apps/{service_runtime.APP.id}/badge"))
-    self.assertEqual(body["count"], 1)  # the read conversation cleared; the group remains
-    self.assertGreaterEqual(body["version"], 1)
+    self.assertEqual(platform.count, 1)  # the read conversation cleared; the group remains
+    self.assertGreaterEqual(platform.revision, 1)
 
 
 if __name__ == "__main__":
