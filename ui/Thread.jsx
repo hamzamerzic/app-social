@@ -215,6 +215,10 @@ export default function Thread({
   async function chooseImage(event) {
     const file = event.target.files?.[0]
     event.target.value = ''
+    await selectImage(file)
+  }
+
+  async function selectImage(file) {
     if (!file) return
     setProcessingImage(true)
     try {
@@ -447,7 +451,7 @@ export default function Thread({
         <input ref={fileRef} className="cn-file-input" type="file" accept="image/*"
                onChange={chooseImage} tabIndex={-1} aria-hidden="true" />
         <Composer inputRef={inputRef} value={draft} onChange={setDraft} onSubmit={send}
-                  disabled={processingImage}
+                  disabled={processingImage} onImagePaste={sending ? undefined : selectImage}
                   sendDisabled={sending || processingImage || (!draft.trim() && !selectedImage)}
                   attachmentAction={<ComposerAttachmentButton onClick={() => fileRef.current?.click()}
                     disabled={sending || processingImage} />}>

@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef } from 'react'
 import { ArrowUp, Plus } from '@openai/apps-sdk-ui/components/Icon'
 import MessageInput, { keepMessageFocus } from './MessageInput.jsx'
+import { clipboardImageFile } from './interactionRules.js'
 
 export function ComposerAttachmentButton({ onClick, disabled, label = 'Attach photo' }) {
   return <button className="cn-composer-attach" type="button" onClick={onClick}
@@ -12,11 +13,18 @@ export function ComposerAttachmentButton({ onClick, disabled, label = 'Attach ph
 export default function Composer({
   value, onChange, onSubmit, disabled, sendDisabled, placeholder = 'Message',
   maxLength, label = placeholder, sendLabel = 'Send', inputRef, attachmentAction,
-  children, className = '',
+  children, className = '', onImagePaste,
 }) {
   const fallbackRef = useRef(null)
   const textareaRef = inputRef || fallbackRef
-  return <form className={`cn-composer ${className}`.trim()} onSubmit={onSubmit}>
+  function onPaste(event) {
+    if (!onImagePaste || disabled) return
+    const file = clipboardImageFile(event.clipboardData)
+    if (!file) return
+    event.preventDefault()
+    onImagePaste(file)
+  }
+  return <form onPaste={onPaste} className={`cn-composer ${className}`.trim()} onSubmit={onSubmit}>
     {attachmentAction}
     <div className={`cn-composer-pill${children ? ' has-children' : ''}`}>
       {children}
