@@ -98,7 +98,7 @@ from message_history import (
 )
 from service_runtime import (
   APP, Principal, fs_locks, get_db, get_principal, get_settings,
-  identity_app_id, notify, owner_profile, public_actor_metadata,
+  identity_app_id, notify, owner_profile, public_actor_metadata, record_badge,
   require_nondelegated_owner_control,
 )
 
@@ -598,6 +598,7 @@ def _bump_version(app, *, history_covered: bool = True) -> int:
   atomic_write(version_path, json.dumps({"v": version, "updated_at": time.time()}))
   if history_covered:
     mark_version_covered(version)
+  record_badge(_app_data_dir(app), version)
   return version
 
 
