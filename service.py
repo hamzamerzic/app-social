@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 import httpx
 from fastapi import FastAPI
 
-from service_runtime import migrate_legacy_state, reset_actor, set_actor
+from service_runtime import flush_badge, migrate_legacy_state, reset_actor, set_actor
 from social_groups import router as groups_router
 from social_objects import router as objects_router
 from social_routes import router as social_router
@@ -50,6 +50,7 @@ async def dispatch(request: dict) -> dict:
       )
   finally:
     reset_actor(token)
+  await flush_badge()
   media_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
   forwarded = {
     name: value for name, value in response.headers.items()

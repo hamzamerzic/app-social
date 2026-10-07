@@ -7,6 +7,7 @@ import fcntl
 import json
 import logging
 import os
+import time
 import shutil
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -230,3 +231,71 @@ async def notify(title: str, body: str, intent: str) -> bool:
   except Exception as exc:
     logging.getLogger("social").warning("Notification not sent: %s", exc)
     return False
+
+
+# ── unread badge ─────────────────────────────────────────────────────────────
+# Social reports its Messages unread total as its Möbius sidebar badge. Every
+# storage mutation already passes through ``_bump_version``, which marks the
+# badge dirty; the service dispatcher then reports once for the request. Each
+# request runs in its own process, so there is no cross-request memory: the
+# total is recomputed from stored metadata and can never drift from what the
+# Messages tab shows. Public deliveries and owner requests run concurrently,
+# so each report carries a nanosecond timestamp taken *before* counting; the
+# platform ignores a report that is not newer than the one it holds. A clock,
+# unlike Social's own storage counter, keeps increasing when Social's data is
+# wiped or restored from a backup.
+
+_badge_dirty = False
+
+
+def mark_badge_dirty() -> None:
+  global _badge_dirty
+  _badge_dirty = True
+
+
+def _accepted(meta: dict) -> bool:
+  # Same rule as api.requestStatus: metadata without a state is an
+  # established conversation predating Message Requests.
+  return meta.get("request_status") in (None, "accepted")
+
+
+def unread_total(storage: Path) -> int:
+  """Unread messages across accepted conversations and groups.
+
+  Matches the Messages tab badge. A group the owner deleted is hidden there,
+  and deleting it already zeroes its unread count.
+  """
+  total = 0
+  for kind in ("conversations", "groups"):
+    for meta_path in (storage / kind).glob("*/meta.json"):
+      try:
+        meta = json.loads(meta_path.read_text())
+      except (OSError, ValueError):
+        continue
+      if isinstance(meta, dict) and _accepted(meta):
+        total += max(0, int(meta.get("unread") or 0))
+  return total
+
+
+async def flush_badge() -> None:
+  """Report the unread total if this request changed Social's storage."""
+  global _badge_dirty
+  if not _badge_dirty:
+    return
+  _badge_dirty = False
+  try:
+    # Version first: a count computed afterwards reflects at least that moment,
+    # so the newest version's report is always the freshest count.
+    version = time.time_ns()
+    total = unread_total(Path(os.environ["APP_STORAGE_DIR"]))
+    response = await platform_request(
+      "PUT", f"/api/apps/{APP.id}/badge",
+      json_body={"count": total, "version": version},
+    )
+    # A Möbius that predates app badges answers 404/405: nothing to show.
+    if response.status_code not in (404, 405):
+      response.raise_for_status()
+  except Exception as exc:
+    # Best effort: never fail the user's request. The next change re-sends
+    # the full recomputed total.
+    logging.getLogger("social").warning("Unread badge not updated: %s", exc)
