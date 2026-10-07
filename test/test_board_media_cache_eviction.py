@@ -8,7 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 with patch.dict(os.environ, {
-  "APP_STORAGE_DIR": tempfile.gettempdir(), "APP_ID": "7", "APP_SLUG": "social",
+  "APP_STORAGE_DIR": os.path.join(tempfile.gettempdir(), "social-board-media-cache-tests"),
+  "APP_ID": "7", "APP_SLUG": "social",
 }):
   import social_routes
 
