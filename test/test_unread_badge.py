@@ -147,12 +147,22 @@ class BadgeTests(unittest.TestCase):
     self.reconcile()
     self.assertEqual((self.platform.count, self.platform.revision), (0, 13))
 
-  def test_an_older_mobius_without_badges_is_not_asked_again(self):
+  def test_an_older_mobius_is_asked_again_hourly_and_gets_the_badge_once_upgraded(self):
     self.platform.status = 404
     self.write(5, peer={"unread": 1})
+    now = 1_000_000.0
+    with patch.object(service_runtime.time, "time", side_effect=lambda: now):
+      self.reconcile()
+      self.reconcile()  # within the hour: not asked again
+      self.assertEqual(len(self.platform.calls), 1)
+      # Möbius is upgraded; unread messages already exist, and the next retry
+      # reports them without waiting for the unread count to change.
+      self.platform.status = 200
+      now += service_runtime.BADGE_UNSUPPORTED_RETRY_SECONDS
+      self.reconcile()
+    self.assertEqual((self.platform.count, self.platform.revision), (1, 5))
     self.reconcile()
-    self.reconcile()
-    self.assertEqual(len(self.platform.calls), 1)
+    self.assertEqual(len(self.platform.calls), 2)  # acknowledged now
 
 
 class DispatchReconcilesBadgeTests(unittest.TestCase):
