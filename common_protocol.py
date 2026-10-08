@@ -9,6 +9,7 @@ implementation.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import math
 import re
@@ -41,6 +42,9 @@ MAX_ENVELOPE_BYTES = 32_768
 MAX_ATTACHMENT_ENVELOPE_BYTES = 2 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 1024 * 1024
 MAX_ATTACHMENT_DIMENSION = 8192
+MAX_GIF_DIMENSION = 1600
+MAX_GIF_FRAMES = 300
+MAX_GIF_CANVAS_PIXELS = 32_000_000
 # One board post may carry a small gallery. The whole envelope still obeys
 # MAX_ATTACHMENT_ENVELOPE_BYTES, so callers keep the images small enough to fit.
 MAX_BOARD_ATTACHMENTS = 4
@@ -65,6 +69,7 @@ ATTACHMENT_MIME_EXT = {
   "image/jpeg": "jpg",
   "image/png": "png",
   "image/webp": "webp",
+  "image/gif": "gif",
 }
 _CONTENT_ENVELOPE_TYPES = {
   "message", "group_post", "group_message", "board_post", "board_reply",
@@ -169,6 +174,103 @@ def verify(payload: dict, sig_b64: str, public_key_b64: str) -> bool:
     return False
 
 
+def validate_gif_bytes(wire: dict, data: bytes) -> None:
+  """Preflight complete GIF framing/budgets, then decode every raster.
+
+  Pillow tolerates a missing trailer and can enlarge its canvas for an image
+  descriptor. Walk GIF87a/89a blocks first, without decoding or allocating any
+  raster. LZW decoding remains Pillow's responsibility; originals are never
+  re-encoded. See https://www.w3.org/Graphics/GIF/spec-gif89a.txt.
+  """
+  from PIL import Image
+
+  if len(data) > MAX_ATTACHMENT_BYTES:
+    raise HTTPException(status_code=413, detail="Attachment is too large.")
+  position = 0
+
+  def take(size: int) -> bytes:
+    nonlocal position
+    end = position + size
+    if end > len(data):
+      raise ValueError("Truncated GIF block.")
+    block = data[position:end]
+    position = end
+    return block
+
+  def subblocks() -> None:
+    while size := take(1)[0]:
+      take(size)
+
+  try:
+    if take(6) not in (b"GIF87a", b"GIF89a") or wire["mime"] != "image/gif":
+      raise ValueError("GIF header does not match its media type.")
+    screen = take(7)
+    width = int.from_bytes(screen[:2], "little")
+    height = int.from_bytes(screen[2:4], "little")
+    if not width or not height or (width, height) != (wire["w"], wire["h"]):
+      raise ValueError("GIF dimensions do not match its metadata.")
+    if max(width, height) > MAX_GIF_DIMENSION:
+      raise HTTPException(status_code=413, detail="GIF dimensions are too large.")
+    global_palette = bool(screen[4] & 0x80)
+    if global_palette:
+      take(3 * (2 ** ((screen[4] & 7) + 1)))
+    frames = 0
+    while True:
+      marker = take(1)[0]
+      if marker == 0x3b:  # Trailer: it must terminate the entire container.
+        if not frames or position != len(data):
+          raise ValueError("GIF trailer is invalid.")
+        break
+      if marker == 0x21:  # Extension; unknown labels are safely skippable.
+        label = take(1)[0]
+        if label in (0xf9, 0xff, 0x01):
+          size = take(1)[0]
+          if size != {0xf9: 4, 0xff: 11, 0x01: 12}[label]:
+            raise ValueError("GIF extension size is invalid.")
+          block = take(size)
+          if label == 0xf9:
+            if block[0] & 0xe0 or ((block[0] >> 2) & 7) > 3 or take(1) != b"\x00":
+              raise ValueError("GIF graphic control is invalid.")
+            continue
+        subblocks()
+        continue
+      if marker != 0x2c:
+        raise ValueError("GIF block is invalid.")
+      descriptor = take(9)
+      left, top, frame_width, frame_height = (
+        int.from_bytes(descriptor[i:i + 2], "little") for i in (0, 2, 4, 6)
+      )
+      if (not frame_width or not frame_height
+          or left + frame_width > width or top + frame_height > height
+          or descriptor[8] & 0x18):
+        raise ValueError("GIF frame dimensions or flags are invalid.")
+      frames += 1
+      if frames > MAX_GIF_FRAMES or width * height * frames > MAX_GIF_CANVAS_PIXELS:
+        raise HTTPException(status_code=413, detail="GIF animation is too large.")
+      if descriptor[8] & 0x80:
+        take(3 * (2 ** ((descriptor[8] & 7) + 1)))
+      elif not global_palette:
+        raise ValueError("GIF frame has no color table.")
+      if not 2 <= take(1)[0] <= 8:
+        raise ValueError("GIF LZW code size is invalid.")
+      subblocks()
+    # No Pillow seek/load happens until the complete container fits every cap.
+    with Image.open(io.BytesIO(data)) as image:
+      if image.format != "GIF" or image.size != (width, height):
+        raise ValueError("GIF header is invalid.")
+      for index in range(frames):
+        image.seek(index)
+        image.load()
+      try:
+        image.seek(frames)
+      except EOFError:
+        pass
+      else:
+        raise ValueError("GIF frame count is invalid.")
+  except (OSError, ValueError, SyntaxError, EOFError, Image.DecompressionBombError) as exc:
+    raise HTTPException(status_code=400, detail="GIF attachment is invalid.") from exc
+
+
 def validate_attachment(value: Any) -> tuple[dict, bytes] | None:
   """Validate and decode the protocol's one supported attachment shape."""
   if value is None:
@@ -200,6 +302,9 @@ def validate_attachment(value: Any) -> tuple[dict, bytes] | None:
     raise HTTPException(status_code=413, detail="Attachment is too large.")
   if not data:
     raise HTTPException(status_code=400, detail="Attachment data is empty.")
+  # A false static MIME must not bypass animation budgets or capability gates.
+  if mime == "image/gif" or data[:6] in (b"GIF87a", b"GIF89a"):
+    validate_gif_bytes(value, data)
   return value, data
 
 
@@ -421,6 +526,7 @@ __all__ = [
   "MAX_BOARD_ATTACHMENTS", "validate_attachments",
   "MAX_ENVELOPE_BYTES", "MAX_NAME_CHARS", "MAX_REPLY_TEXT_CHARS",
   "MAX_MESSAGE_TEXT_CHARS", "MAX_POST_TEXT_CHARS",
+  "MAX_GIF_DIMENSION", "MAX_GIF_FRAMES", "MAX_GIF_CANVAS_PIXELS",
   "OUTBOUND_TIMEOUT_S", "SIGNED_WRITE_TIMEOUT_S",
   "COMMUNITY_HOST", "NEEDS_USERNAME", "PROTOCOL", "PUBLIC_SERVICE_PATH",
   "new_signing_key", "signing_public_key",
@@ -428,6 +534,7 @@ __all__ = [
   "read_envelope", "sign",
   "valid_host", "valid_id",
   "validate_attachment", "validate_attachment_envelope_size",
+  "validate_gif_bytes",
   "validate_reply_to", "validate_text_or_attachment",
   "wire_json_size",
   "verify",

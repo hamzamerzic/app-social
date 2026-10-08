@@ -60,6 +60,7 @@ from common_protocol import (
   valid_host,
   valid_id,
   validate_attachment,
+  validate_gif_bytes,
   validate_attachment_envelope_size,
   validate_attachments,
   validate_text_or_attachment,
@@ -110,6 +111,7 @@ IMAGE_FORMAT_MIME = {
   "JPEG": "image/jpeg",
   "PNG": "image/png",
   "WEBP": "image/webp",
+  "GIF": "image/gif",
 }
 
 
@@ -181,6 +183,8 @@ def validate_thumbnail_bytes(wire: dict, data: bytes) -> None:
   """Verify a client-made thumbnail before it becomes served media."""
   with _open_board_image(data) as image:
     _validate_image_header(image)
+    if image.format == "GIF":
+      raise ValueError("GIF originals need a static thumbnail.")
     if max(image.size) > BOARD_THUMBNAIL_MAX_SIDE:
       raise ValueError("Board thumbnail dimensions are too large.")
     if IMAGE_FORMAT_MIME[image.format] != wire["mime"]:
@@ -192,6 +196,9 @@ def validate_thumbnail_bytes(wire: dict, data: bytes) -> None:
 
 def validate_reply_original_bytes(wire: dict, data: bytes) -> None:
   """Admit only a complete image whose bytes agree with its reply metadata."""
+  if wire["mime"] == "image/gif":
+    validate_gif_bytes(wire, data)
+    return
   if len(data) > MAX_ATTACHMENT_BYTES:
     raise HTTPException(status_code=413, detail="Reply photo is too large.")
   try:
@@ -892,7 +899,10 @@ class CommonPublicStore:
     # Inspect all original headers before writing any media. Optional
     # thumbnail failures still preserve ordinary legacy image posts, but an
     # oversized raster must not leave an orphan image or become a fallback.
-    for _wire, data in attachments or ([attachment] if attachment else []):
+    for wire, data in attachments or ([attachment] if attachment else []):
+      if wire["mime"] == "image/gif" or data[:6] in (b"GIF87a", b"GIF89a"):
+        validate_gif_bytes(wire, data)
+        continue
       try:
         with _open_board_image(data) as image:
           _validate_image_header(image)
@@ -1387,7 +1397,7 @@ def read_board_page(
     if position is not None:
       next_cursor = _encode_board_cursor(*position)
   return {
-    "capabilities": {"emoji_reactions": True, "reply_reactions": True, "image_thumbnails": True, "reply_attachments": True},
+    "capabilities": {"emoji_reactions": True, "reply_reactions": True, "image_thumbnails": True, "reply_attachments": True, "gif_attachments": True},
     "posts": posts,
     "next_cursor": next_cursor,
   }

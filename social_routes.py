@@ -117,9 +117,9 @@ PEER_AVATAR_BATCH_LIMIT = 8
 # Keep each peer inside the app-service's 15-second process ceiling while
 # leaving time to encode and return successful peers from the same batch.
 PEER_AVATAR_BATCH_TIMEOUT_S = 12
-# Capability discovery and a signed reply share one budget, leaving room for
+# Capability discovery and a signed Community write share one budget, leaving room for
 # service startup and a useful error before the 15-second process ceiling.
-COMMUNITY_REPLY_TIMEOUT_S = 13
+COMMUNITY_WRITE_TIMEOUT_S = 13
 # Peer avatars are re-encoded to a small validated raster before caching, so a
 # malicious raster never reaches the browser and cached blobs stay tiny.
 AVATAR_MAX_SIDE = 128
@@ -1724,6 +1724,25 @@ async def retry_direct_message(
   }
 
 
+async def _require_community_media_support(host: str, *, reply: bool = False, gif: bool = False):
+  """Older hosts must explicitly support media before accepting its write."""
+  label = "reply photo" if reply else "GIF"
+  try:
+    response = await federation_request(
+      "GET", _peer_service_url(host, "board"), params={"limit": 1},
+      timeout_seconds=OUTBOUND_TIMEOUT_S,
+    )
+    response.raise_for_status()
+    capabilities = response.json().get("capabilities", {})
+  except Exception as exc:
+    raise HTTPException(status_code=502,
+      detail=f"Community {label} support could not be checked.") from exc
+  if reply and capabilities.get("reply_attachments") is not True:
+    raise HTTPException(status_code=409, detail="Community host does not support reply photos yet.")
+  if gif and capabilities.get("gif_attachments") is not True:
+    raise HTTPException(status_code=409, detail="Community host does not support animated GIFs yet. Your draft is unchanged.")
+
+
 @router.post("/publish")
 async def publish_post(
   post: PublishPost,
@@ -1766,13 +1785,25 @@ async def publish_post(
   envelope["sig"] = _sign(envelope, identity["private_key_b64"])
   _validate_attachment_envelope_size(envelope)
   host = COMMUNITY_HOST
+  has_gif = any(wire["mime"] == "image/gif" for wire, _ in (attachments or ([attachment] if attachment else [])))
+  write_started = False
   try:
-    response = await _post_signed_envelope(
-      _peer_service_url(host, "board"), envelope,
-      max_response_bytes=MAX_ENVELOPE_BYTES,
-    )
-    response.raise_for_status()
-    return {"status": "posted", "id": envelope["id"]}
+    async with asyncio.timeout(COMMUNITY_WRITE_TIMEOUT_S):
+      if has_gif:
+        await _require_community_media_support(host, gif=True)
+      write_started = True
+      response = await _post_signed_envelope(
+        _peer_service_url(host, "board"), envelope,
+        max_response_bytes=MAX_ENVELOPE_BYTES,
+      )
+      response.raise_for_status()
+      return {"status": "posted", "id": envelope["id"]}
+  except (TimeoutError, httpx.TimeoutException) as exc:
+    detail = ("The post may have been sent, but confirmation timed out. Check the feed before sending again."
+      if write_started else "Community GIF support could not be checked.")
+    raise HTTPException(status_code=502, detail=detail) from exc
+  except HTTPException:
+    raise
   except Exception as exc:
     raise HTTPException(
       status_code=502, detail=_community_write_error(exc, "post")
@@ -2092,21 +2123,12 @@ async def reply_to_post(
     raise HTTPException(status_code=400, detail="Reply id is invalid.")
   write_started = False
   try:
-    async with asyncio.timeout(COMMUNITY_REPLY_TIMEOUT_S):
+    async with asyncio.timeout(COMMUNITY_WRITE_TIMEOUT_S):
       if attachment is not None:
         # Older hosts may accept board_reply but ignore its new media fields.
         # Refuse the write until the shared host explicitly advertises support.
-        try:
-          capability_response = await federation_request(
-            "GET", _peer_service_url(host, "board"),
-            params={"limit": 1}, timeout_seconds=OUTBOUND_TIMEOUT_S,
-          )
-          capability_response.raise_for_status()
-          supported = capability_response.json().get("capabilities", {}).get("reply_attachments") is True
-        except Exception as exc:
-          raise HTTPException(status_code=502, detail="Community reply photo support could not be checked.") from exc
-        if not supported:
-          raise HTTPException(status_code=409, detail="Community host does not support reply photos yet.")
+        await _require_community_media_support(host, reply=True,
+          gif=attachment[0]["mime"] == "image/gif")
       sent_at = time.time()
       envelope = {
         "v": 0,

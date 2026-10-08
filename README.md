@@ -71,8 +71,24 @@ with a separate compact thumbnail). Their media is scoped to the parent post
 and reply and removed with the post. The Community host must advertise
 `reply_attachments: true` before the reply attachment button is enabled; the
 personal service checks that capability again before sending. Deploy the
-companion Community host release as well as this app update. This feature does
-not add animated GIF or video support.
+companion Community host release as well as this app update.
+
+Animated GIFs use those same attachment-and-caption controls. Preparation keeps
+original bytes, timing, looping and transparency instead of converting the first
+frame into a JPEG. Feed and conversation previews show a still poster with a GIF
+label; opening it plays the original, so scrolling never starts animation.
+Selected draft previews may animate after deliberate selection.
+
+GIF originals retain the 1 MiB per-image and 2 MiB envelope limits, with at most
+1600 pixels on the longest side, 300 frames, and 32 million logical canvas pixels
+summed across frames. The protocol validates complete GIF framing before decoding
+all frames, on both private and public paths. Oversized animations are rejected,
+not resized or flattened. A gallery may have a smaller per-image budget.
+Community GIF posts/replies require explicit `gif_attachments: true`; discovery
+and the signed write share a bounded deadline. Older private peers can reject
+GIF delivery visibly, and the existing retry keeps the original and caption.
+Private messages and their media remain on personal instances. Video is not
+supported by this change.
 
 ### Group conversations
 
