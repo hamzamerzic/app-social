@@ -66,7 +66,7 @@ test('one-line text is centered, multiline send stays low, and bottom picker cho
   }
 })
 
-test('reply buttons look compact while retaining full-size tap targets', {
+test('reply upload matches the input height while send stays compact with full-size targets', {
   skip: !process.env.CHROME_BIN && 'CHROME_BIN is not configured',
 }, async () => {
   const folder = mkdtempSync(join(tmpdir(), 'social-compact-reply-'))
@@ -76,7 +76,10 @@ test('reply buttons look compact while retaining full-size tap targets', {
     for (const width of [320, 426, 1280]) {
       const buttons = await renderLayout(process.env.CHROME_BIN, file, { width })
       assert.ok(buttons.every(b=>b.w>=44 && b.h>=44),JSON.stringify(buttons))
-      assert.ok(buttons.every(b=>b.circle===32 && b.icon===18),JSON.stringify(buttons))
+      assert.equal(buttons[0].h,46,JSON.stringify(buttons))
+      assert.equal(buttons[0].icon,24)
+      assert.equal(buttons[1].circle,32)
+      assert.equal(buttons[1].icon,18)
     }
   } finally { rmSync(folder,{recursive:true,force:true}) }
 })

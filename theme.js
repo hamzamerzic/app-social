@@ -283,16 +283,15 @@ export const CSS = `
 .cn-profile-preview-close svg { width: 16px; height: 16px; }
 
 .cn-inline-thread {
-  width: 100%; min-width: 0; max-height: min(360px, 48vh);
+  position: relative; width: 100%; min-width: 0; max-height: min(360px, 48vh);
   margin: 4px 0; overflow: hidden;
   display: flex; flex-direction: column;
   border: 1px solid var(--border); border-radius: 14px; background: transparent; cursor: default;
 }
 .cn-inline-replies { flex: 0 1 auto; min-height: 0; overflow-y: auto; padding: 0 8px; overscroll-behavior: contain auto; }
-.cn-inline-replies:not(:empty) { border-bottom: 1px solid color-mix(in srgb, var(--border) 72%, transparent); }
 .cn-inline-replies .cn-reply-row { padding: 8px 0; gap: 8px; }
 .cn-thread-loading { min-height: 48px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 13px; }
-.cn-inline-thread .cn-reply-composer { padding: 6px; background: transparent; }
+.cn-inline-thread .cn-reply-composer { padding: 0; background: transparent; }
 .cn-confirm-sheet { max-width: 420px; }
 .cn-feed-skeleton { padding-top: 2px; }
 .cn-post-skeleton {
@@ -1133,28 +1132,21 @@ export const CSS = `
 .cn-composer-attach:focus-visible,
 .cn-composer-send:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-/* Inline replies use quieter 32px circles inside full-size tap targets. */
-.cn-reply-composer { gap: 4px; }
+/* Replies share the translucent overlay; only the send circle stays compact. */
+.cn-inline-thread .cn-reply-footer { bottom: 0; padding: 6px; }
+.cn-inline-thread .cn-reply-footer::before { top: -40px; bottom: 0; }
+.cn-reply-composer { gap: 6px; }
 .cn-reply-composer .cn-composer-pill { min-height: 44px; padding: 0; border-radius: 22px; }
 .cn-reply-composer .cn-composer-input-line textarea { padding: 4px 2px 4px 10px; line-height: 1.3; }
-.cn-reply-composer .cn-composer-send,
-.cn-reply-composer .cn-composer-attach {
+.cn-reply-composer .cn-composer-attach { width: 46px; height: 46px; }
+.cn-reply-composer .cn-composer-send {
   position: relative; width: 44px; height: 44px; background: transparent; border: 0;
-  backdrop-filter: none; -webkit-backdrop-filter: none;
 }
-.cn-reply-composer .cn-composer-send::before,
-.cn-reply-composer .cn-composer-attach::before {
+.cn-reply-composer .cn-composer-send::before {
   content: ''; position: absolute; inset: 6px; border-radius: 50%; pointer-events: none;
+  background: var(--accent);
 }
-.cn-reply-composer .cn-composer-send::before { background: var(--accent); }
-.cn-reply-composer .cn-composer-attach::before {
-  border: 1px solid var(--border); background: color-mix(in srgb, var(--surface) 60%, transparent);
-  backdrop-filter: blur(16px) saturate(140%); -webkit-backdrop-filter: blur(16px) saturate(140%);
-}
-.cn-reply-composer .cn-composer-attach:hover { background: transparent; }
-.cn-reply-composer .cn-composer-attach:hover::before { background: var(--surface-2, var(--surface)); }
-.cn-reply-composer .cn-composer-send svg,
-.cn-reply-composer .cn-composer-attach svg { position: relative; width: 18px; height: 18px; }
+.cn-reply-composer .cn-composer-send svg { position: relative; width: 18px; height: 18px; }
 
 /* Mobile navigation sits inline with the brand and account, not in a dock. */
 @media (max-width: 719px) {

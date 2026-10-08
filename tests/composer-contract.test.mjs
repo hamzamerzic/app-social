@@ -26,7 +26,9 @@ test('empty replies show the composer without redundant empty-state copy', () =>
   assert.doesNotMatch(board, /No replies yet|cn-reply-empty/)
   assert.match(board, /replyState === 'loading'/)
   assert.match(board, /replyState === 'error'/)
-  assert.match(css, /\.cn-inline-replies:not\(:empty\)\s*\{[^}]*border-bottom:/)
+  assert.match(board, /<ComposerFooter scrollRef=\{replyScrollRef\} className="cn-reply-footer">/)
+  assert.match(board, /<div ref=\{replyScrollRef\} className="cn-inline-replies"/)
+  assert.doesNotMatch(css, /\.cn-inline-replies:not\(:empty\)\s*\{[^}]*border-bottom:/)
 })
 
 test('Community shares the shell-owned scroller for reading, anchoring and composer clearance', () => {
@@ -69,4 +71,10 @@ test('footer is transparent and measured, while only long inline replies scroll'
   assert.doesNotMatch(css, /\.cn-inline-thread\s*\{[^}]*[;\s]height:\s*min\(/s)
   assert.match(css, /\.cn-inline-replies\s*\{[^}]*overflow-y:\s*auto/s)
   assert.match(css, /\.cn-reactions\.is-reply \.cn-reaction-picker\s*\{[^}]*position:\s*relative/s)
+})
+
+
+test('reply overlay inherits shared opacity instead of adding a darker local treatment', () => {
+  assert.doesNotMatch(css, /\.cn-inline-thread \.cn-reply-footer::before\s*\{[^}]*background:/s)
+  assert.doesNotMatch(css, /\.cn-reply-composer \.cn-composer-pill\s*\{[^}]*background:/s)
 })

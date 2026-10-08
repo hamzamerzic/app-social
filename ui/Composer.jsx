@@ -50,11 +50,14 @@ export function ComposerFooter({ scrollRef, children, className = '' }) {
     const scroll = scrollRef?.current
     if (!footer || !scroll) return
     const previous = scroll.style.paddingBottom
+    const previousScrollPadding = scroll.style.scrollPaddingBottom
     const base = parseFloat(getComputedStyle(scroll).paddingBottom) || 0
     const update = () => {
       const pinned = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 72
       const safeBottom = parseFloat(getComputedStyle(footer).bottom) || 0
       scroll.style.paddingBottom = `${base + footer.getBoundingClientRect().height + safeBottom + 8}px`
+      // Native focus scrolling must treat the overlay as outside the visible area.
+      scroll.style.scrollPaddingBottom = scroll.style.paddingBottom
       if (pinned) scroll.scrollTop = scroll.scrollHeight
     }
     update()
@@ -63,6 +66,7 @@ export function ComposerFooter({ scrollRef, children, className = '' }) {
     return () => {
       observer.disconnect()
       scroll.style.paddingBottom = previous
+      scroll.style.scrollPaddingBottom = previousScrollPadding
     }
   }, [scrollRef])
   return <div ref={footerRef} className={`cn-composer-footer ${className}`.trim()}>{children}</div>

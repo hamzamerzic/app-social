@@ -291,6 +291,7 @@ export default function Board({
   const fileRef = useRef(null)
   const composerInputRef = useRef(null)
   const replyInputRef = useRef(null)
+  const replyScrollRef = useRef(null)
   const replyFileRef = useRef(null)
   const replyPostIdRef = useRef(null)
   const stickToBottom = useRef(true)
@@ -1141,7 +1142,7 @@ export default function Board({
                 {threadOpen && (
                   <section className="cn-inline-thread" id={`cn-thread-${post.id}`}
                            aria-label="Replies" onClick={(event) => event.stopPropagation()}>
-                    <div className="cn-inline-replies" aria-live="polite">
+                    <div ref={replyScrollRef} className="cn-inline-replies" aria-live="polite">
                       {replyState === 'loading' && <div className="cn-thread-loading" role="status">Loading replies…</div>}
                       {replyState === 'error' && (
                         <div className="cn-thread-loading">
@@ -1175,6 +1176,7 @@ export default function Board({
                     {canInteract ? <>
                     <input ref={replyFileRef} className="cn-file-input" type="file" accept="image/*"
                       onChange={chooseReplyImage} tabIndex={-1} aria-hidden="true" />
+                    <ComposerFooter scrollRef={replyScrollRef} className="cn-reply-footer">
                     <Composer className="cn-reply-composer" onSubmit={sendReply}
                       inputRef={replyInputRef} value={replyDraft} onChange={changeReplyDraft}
                       maxLength={1000} placeholder="Post your reply" label="Post your reply"
@@ -1186,7 +1188,7 @@ export default function Board({
                       sendLabel="Send reply">
                       {replyImage && <SelectedImageStrip selected={replyImage} onRemove={removeReplyImage}
                         disabled={replySending || preparingReplyImage} onOpen={onOpenImage} />}
-                    </Composer></> : <button className="cn-btn cn-btn-primary cn-reply-join" type="button"
+                    </Composer></ComposerFooter></> : <button className="cn-btn cn-btn-primary cn-reply-join" type="button"
                                       onClick={onJoin} disabled={joinBusy}>Join Social to reply</button>}
                   </section>
                 )}
