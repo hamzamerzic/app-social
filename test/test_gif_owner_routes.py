@@ -3,6 +3,7 @@ import asyncio
 import base64
 import io
 import os
+import random
 import unittest
 from unittest.mock import AsyncMock, patch
 import httpx
@@ -34,6 +35,28 @@ class GifOwnerRoutes(unittest.IsolatedAsyncioTestCase):
 
   def response(self, body):
     return httpx.Response(200, json=body, request=httpx.Request("GET", "https://community.example/board"))
+
+  async def test_existing_reply_posters_above_new_output_budget_remain_readable(self):
+    original = Image.frombytes("RGB", (640, 640), random.Random(1).randbytes(640 * 640 * 3))
+    output = io.BytesIO()
+    original.save(output, format="WEBP", quality=72, method=4)
+    legacy_poster = output.getvalue()
+    self.assertGreater(len(legacy_poster), routes.MAX_THUMBNAIL_BYTES)
+    self.assertLess(len(legacy_poster), 1024 * 1024)
+
+    async def download(method, url, **kwargs):
+      if len(legacy_poster) > kwargs["max_response_bytes"]:
+        raise ValueError("Response exceeds transfer budget")
+      return httpx.Response(200, content=legacy_poster,
+        headers={"content-type": "image/webp"}, request=httpx.Request(method, url))
+
+    with patch.object(routes, "_require_owner_or_common_app"):
+      self.discover.side_effect = download
+      result = await routes.get_reply_media_for_owner(
+        "abcdef12", "abcdef34", thumbnail=True, db=None, principal=self.principal)
+    self.assertEqual(result.status_code, 200)
+    self.assertLessEqual(len(result.body), routes.MAX_THUMBNAIL_BYTES)
+    self.assertEqual(result.media_type, "image/webp")
 
   async def submit(self, kind, gallery=False):
     if kind == "reply":
@@ -68,6 +91,31 @@ class GifOwnerRoutes(unittest.IsolatedAsyncioTestCase):
         await self.submit(kind)
       self.assertEqual(caught.exception.status_code, 502)
       self.send.assert_not_awaited()
+
+  async def test_legacy_boolean_gif_capability_does_not_admit_large_media(self):
+    self.discover.return_value = self.response({"capabilities": {
+      "gif_attachments": True, "reply_attachments": True,
+    }})
+    large = {**self.attachment, "data_b64": base64.b64encode(b"x" * (1024 * 1024 + 1)).decode()}
+    with self.assertRaises(HTTPException) as caught:
+      await routes._require_community_media_support(
+        "community.example", gif=True, originals=[(large, b"x" * (1024 * 1024 + 1))],
+        envelope_bytes=1024 * 1024,
+      )
+    self.assertEqual(caught.exception.status_code, 409)
+    self.send.assert_not_awaited()
+    self.discover.return_value = self.response({"capabilities": {
+      "gif_attachments": True,
+    }, "media_limits": {"gif_bytes": 20 * 1024 * 1024,
+                        "static_bytes": 5 * 1024 * 1024,
+                        "combined_bytes": 20 * 1024 * 1024,
+                        "thumbnail_bytes": 120 * 1024,
+                        "max_images": 4,
+                        "envelope_bytes": 60 * 1024 * 1024}})
+    await routes._require_community_media_support(
+      "community.example", gif=True, originals=[(large, b"x" * (1024 * 1024 + 1))],
+      envelope_bytes=2 * 1024 * 1024 + 1,
+    )
 
   async def test_gif_post_discovery_and_write_share_the_service_deadline(self):
     self.assertLess(routes.COMMUNITY_WRITE_TIMEOUT_S, 15)

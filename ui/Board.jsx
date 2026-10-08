@@ -20,12 +20,12 @@ import {
 } from '../avatarCache.js'
 import ReactionControls, { useBoardReactions } from './ReactionControls.jsx'
 import { boardPostFitsWireLimit } from '../board_payload.js'
+import { galleryFitsMediaLimits } from '../media_limits.js'
 import Composer, { ComposerAttachmentButton, ComposerFooter } from './Composer.jsx'
 import { prependedScrollTop } from './interactionRules.js'
 import { reachedEarlierHistory } from './historyScroll.js'
 
 const MAX_POST_IMAGES = 4
-const GALLERY_BUDGET_BYTES = 960 * 1024
 import {
   createParticipationIntent, participationActionLabel, participationStep,
 } from '../participation.js'
@@ -863,23 +863,20 @@ export default function Board({
     })
   }
 
-  // Compress each selected image now, sharing a byte budget so the whole
-  // gallery (plus the first image kept for old hosts) fits one federation
-  // envelope. Items resumed from a saved draft already carry a payload.
+  // Photos each have their own compression budget; GIFs retain their bytes.
+  // The gallery's original-byte limit does not count the compatibility copy
+  // on the wire. Items resumed from a saved draft already carry a payload.
   async function collectImagePayloads(images, text = '') {
     if (!images.length) return {
       attachment: undefined, attachments: undefined, thumbnails: undefined, previews: [],
     }
-    const budget = images.length <= 1
-      ? undefined
-      : Math.floor(GALLERY_BUDGET_BYTES / (images.length + 1))
     const payloads = []
     const thumbnails = []
     const previews = []
     for (const image of images) {
       const prepared = image.payload
         ? { payload: image.payload, thumbnailPayload: image.thumbnailPayload, previewUrl: image.previewUrl }
-        : await prepareImage(image.file, budget)
+        : await prepareImage(image.file)
       payloads.push(prepared.payload)
       if (prepared.thumbnailPayload) thumbnails.push(prepared.thumbnailPayload)
       previews.push({
@@ -892,8 +889,8 @@ export default function Board({
     const result = payloads.length === 1
       ? { attachment: payloads[0], attachments: undefined, thumbnails, previews }
       : { attachment: undefined, attachments: payloads, thumbnails, previews }
-    if (!boardPostFitsWireLimit({ text, ...result })) {
-      throw new Error('These photos are too large to send together. Remove one or choose smaller images.')
+    if (!galleryFitsMediaLimits(payloads) || !boardPostFitsWireLimit({ text, ...result })) {
+      throw new Error('These attachments exceed the 20 MB combined limit. Remove one or choose smaller images.')
     }
     return result
   }

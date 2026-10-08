@@ -66,8 +66,9 @@ text-only and photo-only replies both work. A selected photo can be removed
 without losing the caption. Reply drafts retain both on a failed send, and an
 unchanged retry reuses the reply identity rather than publishing twice.
 
-Reply photos use the existing image preparation and limits (a 1 MiB image,
-with a separate compact thumbnail). Their media is scoped to the parent post
+Static photos are prepared at up to 5 MiB and 1600 pixels on their longest
+side, with JPEG quality 0.82 for opaque photos and PNG for transparency.
+They have a separate compact thumbnail (at most 120 KiB). Reply media is scoped to the parent post
 and reply and removed with the post. The Community host must advertise
 `reply_attachments: true` before the reply attachment button is enabled; the
 personal service checks that capability again before sending. Deploy the
@@ -79,13 +80,19 @@ frame into a JPEG. Feed and conversation previews show a still poster with a GIF
 label; opening it plays the original, so scrolling never starts animation.
 Selected draft previews may animate after deliberate selection.
 
-GIF originals retain the 1 MiB per-image and 2 MiB envelope limits, with at most
+GIF originals allow up to 20 MiB, with at most
 1600 pixels on the longest side, 300 frames, and 32 million logical canvas pixels
 summed across frames. The protocol validates complete GIF framing before decoding
 all frames, on both private and public paths. Oversized animations are rejected,
-not resized or flattened. A gallery may have a smaller per-image budget.
+not resized or flattened. Community galleries allow up to four images and
+20 MiB of originals combined; no GIF is flattened to fit a gallery. Signed
+content envelopes allow 60 MiB for base64, encryption, thumbnails and the
+legacy first-image compatibility copy. The app declares that reviewed service
+transfer allowance; other apps retain the platform's 8 MiB default.
 Community GIF posts/replies require explicit `gif_attachments: true`; discovery
-and the signed write share a bounded deadline. Older private peers can reject
+and the signed write share a bounded deadline. Numeric media-limit discovery
+also checks that the Community host accepts the selected original and total
+sizes; older hosts retain their earlier allowances. Older private peers can reject
 GIF delivery visibly, and the existing retry keeps the original and caption.
 Private messages and their media remain on personal instances. Video is not
 supported by this change.

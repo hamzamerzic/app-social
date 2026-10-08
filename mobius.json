@@ -18,6 +18,7 @@
     "id": "social",
     "entry": "service.py",
     "access": "public",
+    "max_bytes": 62914560,
     "aliases": [
       "common"
     ]
@@ -31,6 +32,7 @@
     "community.js",
     "participation.js",
     "board_payload.js",
+    "media_limits.js",
     "profile.js",
     "links.js",
     "emoji_art.js",

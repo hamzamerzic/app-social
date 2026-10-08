@@ -2,6 +2,7 @@
 
 import base64
 import io
+import random
 import os
 import tempfile
 import time
@@ -55,6 +56,24 @@ def tiny_container(size=(1, 1), frames=1, *, broken_last=False):
     # A complete sub-block containing a bad LZW stream, not a framing error.
     last[12:15] = b"\xff\xff\xff"
   return bytes(header) + frame * (frames - 1) + bytes(last) + b";"
+
+
+def padded_gif(total_bytes):
+  """A fully framed, decodable GIF with legal comment sub-block padding."""
+  original = tiny_container()
+  overhead = 3  # extension introducer, comment label, terminator
+  room = total_bytes - len(original) - overhead
+  blocks = bytearray()
+  while room:
+    take = min(255, room - 1)
+    if room - take - 1 == 1:
+      take -= 1
+    if take <= 0:
+      raise ValueError("Cannot represent padding length")
+    blocks.append(take)
+    blocks.extend(b"x" * take)
+    room -= take + 1
+  return original[:-1] + b"\x21\xfe" + bytes(blocks) + b"\x00;"
 
 
 def invalid_gifs():
@@ -132,7 +151,7 @@ class CanonicalGifTests(unittest.TestCase):
     value = wire(data)
     cases = [({**value, "frames": 2}, 400), ({**value, "w": True}, 400),
              ({**value, "h": 0}, 400), ({**value, "data_b64": "!"}, 400),
-             (wire(b"x" * (1024 * 1024 + 1)), 413)]
+             (wire(b"x" * (20 * 1024 * 1024 + 1)), 413)]
     output = io.BytesIO()
     Image.new("RGB", (24, 16)).save(output, format="PNG")
     cases.append((wire(output.getvalue()), 400))
@@ -141,8 +160,65 @@ class CanonicalGifTests(unittest.TestCase):
         common_protocol.validate_attachment(malformed)
       self.assertEqual(caught.exception.status_code, status)
     with self.assertRaises(HTTPException) as caught:
-      common_protocol.validate_attachment_envelope_size({"text": "x" * (2 * 1024 * 1024)})
+      common_protocol.validate_attachment_envelope_size({"text": "x" * (60 * 1024 * 1024)})
     self.assertEqual(caught.exception.status_code, 413)
+
+  def test_large_gif_and_static_boundaries_and_gallery_total(self):
+    mb = 1024 * 1024
+    for size in (mb + 1, 20 * mb):
+      data = padded_gif(size)
+      self.assertEqual(len(data), size)
+      self.assertEqual(common_protocol.validate_attachment(wire(data, (1, 1)))[1], data)
+    mime, poster = image_thumbnail_bytes(data)
+    self.assertEqual(mime, "image/webp")
+    self.assertLessEqual(len(poster), common_protocol.MAX_THUMBNAIL_BYTES)
+    with self.assertRaises(HTTPException) as caught:
+      common_protocol.validate_attachment(wire(padded_gif(20 * mb + 1), (1, 1)))
+    self.assertEqual(caught.exception.status_code, 413)
+    static = lambda size: {"mime": "image/jpeg", "data_b64": base64.b64encode(b"a" * size).decode(), "w": 1, "h": 1}
+    common_protocol.validate_attachment(static(5 * mb))
+    with self.assertRaises(HTTPException) as caught:
+      common_protocol.validate_attachment(static(5 * mb + 1))
+    self.assertEqual(caught.exception.status_code, 413)
+    common_protocol.validate_attachments([static(5 * mb)] * 4)
+    with self.assertRaises(HTTPException) as caught:
+      common_protocol.validate_attachments([static(5 * mb)] * 4 + [static(1)])
+    self.assertEqual(caught.exception.status_code, 400)  # four-image cap
+    with self.assertRaises(HTTPException) as caught:
+      common_protocol.validate_attachments([wire(data, (1, 1)), static(1)])
+    self.assertEqual(caught.exception.status_code, 413)
+    with self.assertRaises(HTTPException) as caught:
+      common_protocol.validate_attachment(static(120 * 1024 + 1), thumbnail=True)
+    self.assertEqual(caught.exception.status_code, 413)
+
+  def test_large_original_fits_signed_plaintext_and_encrypted_transport(self):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    import social_routes
+    original = wire(padded_gif(1024 * 1024 + 1), (1, 1))
+    key = common_protocol.new_signing_key()
+    plain = {"v": 0, "type": "message", "id": "abcdef12", "from": "a.example",
+             "to": "b.example", "text": "", "sent_at": time.time(),
+             "attachment": original}
+    plain["sig"] = common_protocol.sign(plain, key)
+    common_protocol.validate_attachment_envelope_size(plain)
+    self.assertTrue(common_protocol.verify(
+      {k: v for k, v in plain.items() if k != "sig"}, plain["sig"],
+      common_protocol.signing_public_key(key)))
+    recipient = X25519PrivateKey.generate()
+    private = base64.b64encode(recipient.private_bytes(
+      serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+      serialization.NoEncryption())).decode()
+    public = base64.b64encode(recipient.public_key().public_bytes(
+      serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+    sealed = social_routes._seal_dm("abcdef12", public, text="", attachment=original, reply_to=None)
+    encrypted = {k: v for k, v in plain.items() if k not in ("attachment", "sig")}
+    encrypted["enc"] = sealed
+    encrypted["sig"] = common_protocol.sign(encrypted, key)
+    common_protocol.validate_attachment_envelope_size(encrypted)
+    opened = social_routes._open_dm("abcdef12", sealed, private)
+    self.assertEqual(common_protocol.validate_attachment(opened["attachment"])[1],
+                     base64.b64decode(original["data_b64"]))
 
   def test_first_frame_thumbnail_is_a_static_transparent_poster(self):
     data = animation()
@@ -387,6 +463,18 @@ class MessageGifSeamTests(unittest.IsolatedAsyncioTestCase):
         dm_app.assert_not_called()
         commit.assert_not_called()
         store.assert_not_called()
+
+
+class GeneratedPosterBudgetTests(unittest.TestCase):
+  def test_high_detail_generated_poster_fits_media_download_budget(self):
+    original = io.BytesIO()
+    Image.frombytes('RGB', (640, 640), random.Random(1).randbytes(640 * 640 * 3)).save(original, format='PNG')
+    mime, poster = image_thumbnail_bytes(original.getvalue())
+    self.assertEqual(mime, 'image/webp')
+    self.assertLessEqual(len(poster), common_protocol.MAX_THUMBNAIL_BYTES)
+    with Image.open(io.BytesIO(poster)) as image:
+      self.assertLessEqual(max(image.size), 640)
+      image.load()
 
 
 if __name__ == "__main__":

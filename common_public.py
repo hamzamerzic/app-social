@@ -42,6 +42,10 @@ from common_protocol import (
   ATTACHMENT_MIME_EXT,
   CLOCK_SKEW_S,
   MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENT_ENVELOPE_BYTES,
+  MAX_STATIC_ATTACHMENT_BYTES,
+  MAX_THUMBNAIL_BYTES,
+  MAX_BOARD_TOTAL_ATTACHMENT_BYTES,
   MAX_ATTACHMENT_DIMENSION,
   MAX_AVATAR_BYTES,
   MAX_BOARD_ATTACHMENTS,
@@ -161,6 +165,15 @@ def image_thumbnail_bytes(
   a smaller cap). The same header/decompression-bomb guards run either way, so
   every caller re-encodes untrusted image bytes through one validated path.
   """
+  if data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
+    # Pillow concatenates comment metadata quadratically for a large legal
+    # comment chain. Validate the original, then render a comment-free view;
+    # the stored original and its signed bytes are never rewritten.
+    data = validate_gif_bytes({
+      "mime": "image/gif",
+      "w": int.from_bytes(data[6:8], "little"),
+      "h": int.from_bytes(data[8:10], "little"),
+    }, data)
   with _open_board_image(data) as opened:
     # Reject oversized inputs from their header before EXIF transposition or
     # decoding can allocate the full raster.
@@ -174,13 +187,23 @@ def image_thumbnail_bytes(
       image.mode == "P" and "transparency" in image.info
     )
     prepared = image.convert("RGBA" if has_alpha else "RGB")
-    output = io.BytesIO()
-    prepared.save(output, format="WEBP", quality=72, method=4)
-    return "image/webp", output.getvalue()
+    while True:
+      output = io.BytesIO()
+      prepared.save(output, format="WEBP", quality=72, method=4)
+      if output.tell() <= MAX_THUMBNAIL_BYTES:
+        return "image/webp", output.getvalue()
+      if max(prepared.size) <= 96:
+        raise ValueError("Board thumbnail is too detailed.")
+      prepared.thumbnail(
+        (max(1, int(prepared.width * 0.84)), max(1, int(prepared.height * 0.84))),
+        Image.Resampling.LANCZOS,
+      )
 
 
 def validate_thumbnail_bytes(wire: dict, data: bytes) -> None:
   """Verify a client-made thumbnail before it becomes served media."""
+  if len(data) > MAX_THUMBNAIL_BYTES:
+    raise HTTPException(status_code=413, detail="Board thumbnail is too large.")
   with _open_board_image(data) as image:
     _validate_image_header(image)
     if image.format == "GIF":
@@ -199,7 +222,7 @@ def validate_reply_original_bytes(wire: dict, data: bytes) -> None:
   if wire["mime"] == "image/gif":
     validate_gif_bytes(wire, data)
     return
-  if len(data) > MAX_ATTACHMENT_BYTES:
+  if len(data) > MAX_STATIC_ATTACHMENT_BYTES:
     raise HTTPException(status_code=413, detail="Reply photo is too large.")
   try:
     with _open_board_image(data) as image:
@@ -896,6 +919,10 @@ class CommonPublicStore:
     ``<id>.<ext>``. `attachments` also records a single `attachment` (its first
     image) so a reader that only understands one image still shows something.
     """
+    if attachment is not None and attachments and attachment[0] != attachments[0][0]:
+      raise HTTPException(status_code=400, detail="First post image does not match its gallery copy.")
+    if sum(len(data) for _, data in (attachments or ([attachment] if attachment else []))) > MAX_BOARD_TOTAL_ATTACHMENT_BYTES:
+      raise HTTPException(status_code=413, detail="Post images are too large together.")
     # Inspect all original headers before writing any media. Optional
     # thumbnail failures still preserve ordinary legacy image posts, but an
     # oversized raster must not leave an orphan image or become a fallback.
@@ -1398,6 +1425,14 @@ def read_board_page(
       next_cursor = _encode_board_cursor(*position)
   return {
     "capabilities": {"emoji_reactions": True, "reply_reactions": True, "image_thumbnails": True, "reply_attachments": True, "gif_attachments": True},
+    "media_limits": {
+      "gif_bytes": MAX_ATTACHMENT_BYTES,
+      "static_bytes": MAX_STATIC_ATTACHMENT_BYTES,
+      "combined_bytes": MAX_BOARD_TOTAL_ATTACHMENT_BYTES,
+      "thumbnail_bytes": MAX_THUMBNAIL_BYTES,
+      "max_images": MAX_BOARD_ATTACHMENTS,
+      "envelope_bytes": MAX_ATTACHMENT_ENVELOPE_BYTES,
+    },
     "posts": posts,
     "next_cursor": next_cursor,
   }
@@ -1675,7 +1710,7 @@ def create_public_router(
       raise HTTPException(status_code=400, detail="Reply id is invalid.")
     text = envelope.get("text")
     attachment = validate_attachment(envelope.get("attachment"))
-    thumbnail = validate_attachment(envelope.get("thumbnail"))
+    thumbnail = validate_attachment(envelope.get("thumbnail"), thumbnail=True)
     validate_text_or_attachment(text, attachment, "Reply text is invalid.", MAX_REPLY_TEXT_CHARS)
     validate_attachment_envelope_size(envelope)
     actor = await verify_named_member(store, verifier, envelope)
@@ -1712,7 +1747,9 @@ def create_public_router(
       raise HTTPException(status_code=400, detail="Unsupported envelope type.")
     attachment = validate_attachment(envelope.get("attachment"))
     attachments = validate_attachments(envelope.get("attachments"))
-    thumbnails = validate_attachments(envelope.get("thumbnails"))
+    if attachment is not None and attachments and attachment[0] != attachments[0][0]:
+      raise HTTPException(status_code=400, detail="First post image does not match its gallery copy.")
+    thumbnails = validate_attachments(envelope.get("thumbnails"), thumbnail=True)
     image_count = len(attachments) if attachments else (1 if attachment else 0)
     if thumbnails and len(thumbnails) != image_count:
       raise HTTPException(status_code=400, detail="Post thumbnails are invalid.")

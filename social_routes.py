@@ -72,7 +72,8 @@ from pydantic import BaseModel
 
 from common_protocol import (
   ATTACHMENT_MIME_EXT as _ATTACHMENT_MIME_EXT,
-  MAX_ATTACHMENT_BYTES, MAX_AVATAR_BYTES, MAX_BIO_CHARS,
+  MAX_ATTACHMENT_BYTES, MAX_STATIC_ATTACHMENT_BYTES, MAX_THUMBNAIL_BYTES,
+  MAX_AVATAR_BYTES, MAX_BIO_CHARS,
   COMMUNITY_HOST, MAX_BOARD_ATTACHMENTS as _MAX_BOARD_ATTACHMENTS,
   MAX_ENVELOPE_BYTES, MAX_NAME_CHARS, MAX_POST_TEXT_CHARS, MAX_REPLY_TEXT_CHARS,
   CLOCK_SKEW_S,
@@ -87,6 +88,7 @@ from common_protocol import (
   validate_attachments as _validate_attachments,
   validate_reply_to as _validate_reply_to,
   validate_text_or_attachment as _validate_text_or_attachment,
+  wire_json_size as _wire_json_size,
 )
 from common_public import (
   AVATAR_DIGEST, BOARD_REACTION_EMOJIS, CommonPublicStore, image_thumbnail_bytes,
@@ -320,10 +322,12 @@ async def _download_avatar(url: str) -> bytes:
   return response.content
 
 
-async def _download_board_media(url: str) -> tuple[str, bytes]:
+async def _download_board_media(url: str, *, thumbnail: bool = False) -> tuple[str, bytes]:
   """Fetch one hosted board image without buffering more than the wire cap."""
   response = await federation_request(
-    "GET", url, max_response_bytes=MAX_ATTACHMENT_BYTES,
+    # Existing hosts stored posters up to 1 MiB. Read that bounded legacy
+    # allowance, then re-encode to the current thumbnail output budget.
+    "GET", url, max_response_bytes=(1024 * 1024 if thumbnail else MAX_ATTACHMENT_BYTES),
     response_format="binary", timeout_seconds=OUTBOUND_TIMEOUT_S,
   )
   response.raise_for_status()
@@ -739,6 +743,8 @@ def _stored_attachment(app, peer_host: str, record: dict) -> tuple[dict, bytes] 
   path = (conversation / relative).resolve()
   if not path.is_relative_to(conversation) or not path.is_file():
     raise ValueError("Stored attachment is unavailable.")
+  if path.stat().st_size > MAX_ATTACHMENT_BYTES:
+    raise ValueError("Stored attachment is too large.")
   data = path.read_bytes()
   wire = {
     "mime": metadata.get("mime"),
@@ -1724,7 +1730,12 @@ async def retry_direct_message(
   }
 
 
-async def _require_community_media_support(host: str, *, reply: bool = False, gif: bool = False):
+async def _require_community_media_support(
+  host: str, *, reply: bool = False, gif: bool = False,
+  originals: list[tuple[dict, bytes]] | None = None,
+  thumbnails: list[tuple[dict, bytes]] | None = None,
+  envelope_bytes: int = 0,
+):
   """Older hosts must explicitly support media before accepting its write."""
   label = "reply photo" if reply else "GIF"
   try:
@@ -1733,7 +1744,9 @@ async def _require_community_media_support(host: str, *, reply: bool = False, gi
       timeout_seconds=OUTBOUND_TIMEOUT_S,
     )
     response.raise_for_status()
-    capabilities = response.json().get("capabilities", {})
+    feed = response.json()
+    capabilities = feed.get("capabilities", {})
+    limits = feed.get("media_limits")
   except Exception as exc:
     raise HTTPException(status_code=502,
       detail=f"Community {label} support could not be checked.") from exc
@@ -1741,6 +1754,32 @@ async def _require_community_media_support(host: str, *, reply: bool = False, gi
     raise HTTPException(status_code=409, detail="Community host does not support reply photos yet.")
   if gif and capabilities.get("gif_attachments") is not True:
     raise HTTPException(status_code=409, detail="Community host does not support animated GIFs yet. Your draft is unchanged.")
+  # Older hosts advertise only booleans. Their real caps are 1 MiB per
+  # original and 2 MiB per signed envelope, even if gif_attachments is true.
+  if not isinstance(limits, dict):
+    limits = {"gif_bytes": 1024 * 1024, "static_bytes": 1024 * 1024,
+              "combined_bytes": 2 * 1024 * 1024, "thumbnail_bytes": 1024 * 1024,
+              "envelope_bytes": 2 * 1024 * 1024, "max_images": 4}
+  try:
+    if any(not isinstance(limits[key], int) or isinstance(limits[key], bool) or limits[key] <= 0
+           for key in ("gif_bytes", "static_bytes", "combined_bytes",
+                       "thumbnail_bytes", "envelope_bytes", "max_images")):
+      raise ValueError()
+    if len(originals or []) > limits["max_images"]:
+      raise ValueError()
+    for wire, data in originals or []:
+      key = "gif_bytes" if wire["mime"] == "image/gif" else "static_bytes"
+      if len(data) > limits[key]:
+        raise ValueError()
+    if sum(len(data) for _, data in originals or []) > limits["combined_bytes"]:
+      raise ValueError()
+    if any(len(data) > limits["thumbnail_bytes"] for _, data in thumbnails or []):
+      raise ValueError()
+    if envelope_bytes > limits["envelope_bytes"]:
+      raise ValueError()
+  except (KeyError, TypeError, ValueError):
+    raise HTTPException(status_code=409, detail="Community host media limit is smaller than this draft. Your draft is unchanged.")
+  return limits
 
 
 @router.post("/publish")
@@ -1755,7 +1794,9 @@ async def publish_post(
   text = post.text.strip()
   attachment = _validate_attachment(post.attachment)
   attachments = _validate_attachments(post.attachments)
-  thumbnails = _validate_attachments(post.thumbnails)
+  if attachment is not None and attachments and attachment[0] != attachments[0][0]:
+    raise HTTPException(status_code=400, detail="First post image does not match its gallery copy.")
+  thumbnails = _validate_attachments(post.thumbnails, thumbnail=True)
   image_count = len(attachments) if attachments else (1 if attachment else 0)
   if thumbnails and len(thumbnails) != image_count:
     raise HTTPException(status_code=400, detail="Post thumbnails are invalid.")
@@ -1789,8 +1830,12 @@ async def publish_post(
   write_started = False
   try:
     async with asyncio.timeout(COMMUNITY_WRITE_TIMEOUT_S):
-      if has_gif:
-        await _require_community_media_support(host, gif=True)
+      if first is not None:
+        await _require_community_media_support(
+          host, gif=has_gif,
+          originals=attachments or [attachment], envelope_bytes=_wire_json_size(envelope),
+          thumbnails=thumbnails,
+        )
       write_started = True
       response = await _post_signed_envelope(
         _peer_service_url(host, "board"), envelope,
@@ -1889,7 +1934,7 @@ async def _serve_owner_board_media(
   )
   try:
     try:
-      mime, data = await _download_board_media(_peer_service_url(host, suffix))
+      mime, data = await _download_board_media(_peer_service_url(host, suffix), thumbnail=thumbnail)
     except Exception:
       # A full image's typed link names what the host stored, so a miss means
       # it is gone; only a thumbnail has something else to fall back to.
@@ -1971,7 +2016,9 @@ async def get_reply_media_for_owner(
   if extension:
     path += f".{extension}"
   try:
-    found_mime, data = await _download_board_media(_peer_service_url(COMMUNITY_HOST, path))
+    found_mime, data = await _download_board_media(
+      _peer_service_url(COMMUNITY_HOST, path), thumbnail=thumbnail,
+    )
     if thumbnail:
       found_mime, data = image_thumbnail_bytes(data)
   except Exception as exc:
@@ -2111,7 +2158,7 @@ async def reply_to_post(
     raise HTTPException(status_code=400, detail="Post id is invalid.")
   text = body.text.strip()
   attachment = _validate_attachment(body.attachment)
-  thumbnail = _validate_attachment(body.thumbnail)
+  thumbnail = _validate_attachment(body.thumbnail, thumbnail=True)
   _validate_text_or_attachment(text, attachment, "Reply text is invalid.", MAX_REPLY_TEXT_CHARS)
   if thumbnail is not None and attachment is None:
     raise HTTPException(status_code=400, detail="Reply thumbnail needs a photo.")
@@ -2124,11 +2171,14 @@ async def reply_to_post(
   write_started = False
   try:
     async with asyncio.timeout(COMMUNITY_WRITE_TIMEOUT_S):
+      limits = None
       if attachment is not None:
-        # Older hosts may accept board_reply but ignore its new media fields.
-        # Refuse the write until the shared host explicitly advertises support.
-        await _require_community_media_support(host, reply=True,
-          gif=attachment[0]["mime"] == "image/gif")
+        # Check compatibility before building a signed reply. This also
+        # preserves the old-host rejection path when no local host is set.
+        limits = await _require_community_media_support(
+          host, reply=True, gif=attachment[0]["mime"] == "image/gif",
+          originals=[attachment], thumbnails=[thumbnail] if thumbnail else None,
+        )
       sent_at = time.time()
       envelope = {
         "v": 0,
@@ -2145,6 +2195,8 @@ async def reply_to_post(
         envelope["thumbnail"] = thumbnail[0]
       envelope["sig"] = _sign(envelope, identity["private_key_b64"])
       _validate_attachment_envelope_size(envelope)
+      if limits is not None and _wire_json_size(envelope) > limits["envelope_bytes"]:
+        raise HTTPException(status_code=409, detail="Community host media limit is smaller than this draft. Your draft is unchanged.")
       write_started = True
       response = await _post_signed_envelope(
         _peer_service_url(host, "board/reply"), envelope,
