@@ -40,6 +40,20 @@ function hasTransparency(context, width, height) {
 
 export async function prepareImage(file, maxBytes = MAX_BYTES) {
   if (!file?.type?.startsWith('image/')) throw new Error('Choose an image file.')
+  const header = await file.slice(0, 10).arrayBuffer()
+  const signature = new TextDecoder().decode(header.slice(0, 6))
+  const gif = file.type === 'image/gif' || signature === 'GIF87a' || signature === 'GIF89a'
+  // Never resize an animation by drawing its first frame as the original.
+  // The signed service validates the complete container and decoded frames.
+  if (gif && file.size > maxBytes) {
+    throw new Error('This GIF is too large. Choose a smaller GIF or attach it on its own.')
+  }
+  if (gif && header.byteLength === 10) {
+    const dimensions = new DataView(header)
+    if (Math.max(dimensions.getUint16(6, true), dimensions.getUint16(8, true)) > MAX_SIDE) {
+      throw new Error('This GIF is too wide or tall. Choose one up to 1600 pixels on its longest side.')
+    }
+  }
 
   let bitmap
   try {
@@ -52,6 +66,9 @@ export async function prepareImage(file, maxBytes = MAX_BYTES) {
     const originalWidth = bitmap.width
     const originalHeight = bitmap.height
     if (!originalWidth || !originalHeight) throw new Error('That image has no visible content.')
+    if (gif && Math.max(originalWidth, originalHeight) > MAX_SIDE) {
+      throw new Error('This GIF is too wide or tall. Choose one up to 1600 pixels on its longest side.')
+    }
 
     let scale = Math.min(1, MAX_SIDE / Math.max(originalWidth, originalHeight))
     let width = Math.max(1, Math.round(originalWidth * scale))
@@ -75,9 +92,10 @@ export async function prepareImage(file, maxBytes = MAX_BYTES) {
     // checking the decoded pixels rather than trusting the source mime; only a
     // fully opaque image is flattened to JPEG for size.
     draw()
-    const mime = hasTransparency(context, width, height) ? 'image/png' : 'image/jpeg'
+    const transparent = hasTransparency(context, width, height)
+    const mime = gif ? 'image/gif' : transparent ? 'image/png' : 'image/jpeg'
     if (mime === 'image/jpeg') draw(true)
-    let blob = await canvasBlob(canvas, mime)
+    let blob = gif ? file : await canvasBlob(canvas, mime)
 
     // Keep within the (possibly per-image) byte budget without changing the
     // promised JPEG quality. Very detailed images get progressively smaller.
@@ -100,7 +118,6 @@ export async function prepareImage(file, maxBytes = MAX_BYTES) {
     let thumbWidth = Math.max(1, Math.round(width * thumbScale))
     let thumbHeight = Math.max(1, Math.round(height * thumbScale))
     const thumbCanvas = document.createElement('canvas')
-    const transparent = mime === 'image/png'
     const thumbContext = thumbCanvas.getContext('2d', { alpha: transparent })
     if (!thumbContext) throw new Error('This image couldn’t be prepared.')
     const drawThumbnail = () => {
@@ -136,9 +153,27 @@ export async function prepareImage(file, maxBytes = MAX_BYTES) {
   }
 }
 
+async function gifPoster(blob) {
+  const bitmap = await createImageBitmap(blob)
+  try {
+    const canvas = document.createElement('canvas')
+    const scale = Math.min(1, 640 / Math.max(bitmap.width, bitmap.height))
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale))
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale))
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('This GIF preview couldn’t be prepared.')
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+    return await canvasBlob(canvas, 'image/webp', 0.74)
+  } finally {
+    bitmap.close?.()
+  }
+}
+
 function ManagedImage({ attachment, storagePath, postId, replyId, index, className, alt, onOpen, onUnavailable, square }) {
   const directUrl = attachment?.preview_url || null
-  const [url, setUrl] = useState(directUrl)
+  const gif = attachment?.mime === 'image/gif'
+  const [url, setUrl] = useState(gif ? null : directUrl)
+  const [fullUrl, setFullUrl] = useState(null)
   const [failed, setFailed] = useState(false)
   const reported = useRef(false)
   const width = Number(attachment?.w) || 4
@@ -146,15 +181,18 @@ function ManagedImage({ attachment, storagePath, postId, replyId, index, classNa
 
   useEffect(() => {
     let active = true
-    let objectUrl = null
+    const objectUrls = []
     setFailed(false)
     reported.current = false
-    if (directUrl) {
+    setFullUrl(null)
+    if (directUrl && !gif) {
       setUrl(directUrl)
       return () => { active = false }
     }
     setUrl(null)
-    const load = postId
+    const load = directUrl
+      ? fetch(directUrl).then(response => response.blob())
+      : postId
       ? boardThumbnail(postId, index, replyId)
       : window.mobius?.storage?.getBlob?.(storagePath)
     if (!load?.then) {
@@ -164,7 +202,7 @@ function ManagedImage({ attachment, storagePath, postId, replyId, index, classNa
       return () => { active = false }
     }
     load
-      .then((blob) => {
+      .then(async (blob) => {
         if (!active || !blob?.size) {
           if (active) {
             setFailed(true)
@@ -173,7 +211,17 @@ function ManagedImage({ attachment, storagePath, postId, replyId, index, classNa
           }
           return
         }
-        objectUrl = URL.createObjectURL(blob)
+        // Public posters come from the host. Private originals stay local;
+        // show a still frame until the owner explicitly opens the animation.
+        const poster = gif && (!postId || directUrl) ? await gifPoster(blob) : blob
+        if (!active) return
+        const objectUrl = URL.createObjectURL(poster)
+        objectUrls.push(objectUrl)
+        if (poster !== blob) {
+          const originalUrl = URL.createObjectURL(blob)
+          objectUrls.push(originalUrl)
+          setFullUrl(originalUrl)
+        }
         setUrl(objectUrl)
       })
       .catch((error) => {
@@ -184,9 +232,9 @@ function ManagedImage({ attachment, storagePath, postId, replyId, index, classNa
       })
     return () => {
       active = false
-      if (objectUrl) URL.revokeObjectURL(objectUrl)
+      objectUrls.forEach(objectUrl => URL.revokeObjectURL(objectUrl))
     }
-  }, [directUrl, postId, replyId, index, storagePath])
+  }, [directUrl, postId, replyId, index, storagePath, gif])
 
   return (
     <button
@@ -196,7 +244,7 @@ function ManagedImage({ attachment, storagePath, postId, replyId, index, classNa
       onClick={async () => {
         if (!url) return
         if (!postId || directUrl) {
-          onOpen(url, alt)
+          onOpen(fullUrl || url, gif ? 'GIF attachment' : alt)
           return
         }
         try {
@@ -205,12 +253,16 @@ function ManagedImage({ attachment, storagePath, postId, replyId, index, classNa
             : await getBoardMedia(postId, index, { mime: attachment?.mime })
           const fullUrl = URL.createObjectURL(full)
           onOpen(fullUrl, alt, () => URL.revokeObjectURL(fullUrl))
-        } catch {
+        } catch (error) {
+          if (gif) {
+            onUnavailable?.(error)
+            return
+          }
           onOpen(url, alt)
         }
       }}
       disabled={!url}
-      aria-label={url ? `Open ${alt}` : failed ? `${alt} unavailable` : `Loading ${alt}`}
+      aria-label={url ? gif ? 'Play GIF attachment' : `Open ${alt}` : failed ? `${alt} unavailable` : `Loading ${alt}`}
     >
       {url && (
         <img
@@ -225,6 +277,7 @@ function ManagedImage({ attachment, storagePath, postId, replyId, index, classNa
           }}
         />
       )}
+      {url && gif && <span className="cn-media-gif" aria-hidden="true">GIF</span>}
       {!url && (
         <span className="cn-media-state" aria-hidden="true">
           {failed && <ImageSquare />}

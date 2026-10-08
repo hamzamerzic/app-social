@@ -259,7 +259,7 @@ class ReplyDeadlineTests(unittest.IsolatedAsyncioTestCase):
 
   async def test_capability_and_signed_write_share_one_deadline_and_retry_id(self):
     # Scale time, not the operation: each stage fits, their sum does not.
-    self.assertLess(social_routes.COMMUNITY_REPLY_TIMEOUT_S, 15)
+    self.assertLess(social_routes.COMMUNITY_WRITE_TIMEOUT_S, 15)
     async def capability(*args, **kwargs):
       await asyncio.sleep(0.04)
       return self.capability
@@ -272,7 +272,7 @@ class ReplyDeadlineTests(unittest.IsolatedAsyncioTestCase):
         cancelled.set()
         raise
     with (
-      patch.object(social_routes, "COMMUNITY_REPLY_TIMEOUT_S", 0.08),
+      patch.object(social_routes, "COMMUNITY_WRITE_TIMEOUT_S", 0.08),
       patch.object(social_routes, "federation_request", new=AsyncMock(side_effect=capability)),
       patch.object(social_routes, "_post_signed_envelope", new=AsyncMock(side_effect=write)) as send,
     ):
@@ -295,7 +295,7 @@ class ReplyDeadlineTests(unittest.IsolatedAsyncioTestCase):
       await asyncio.sleep(0.06)
       return self.capability
     with (
-      patch.object(social_routes, "COMMUNITY_REPLY_TIMEOUT_S", 0.03),
+      patch.object(social_routes, "COMMUNITY_WRITE_TIMEOUT_S", 0.03),
       patch.object(social_routes, "federation_request", new=AsyncMock(side_effect=capability)),
       patch.object(social_routes, "_post_signed_envelope", new=AsyncMock()) as send,
     ):

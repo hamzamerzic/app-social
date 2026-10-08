@@ -616,6 +616,11 @@ export const CSS = `
 }
 .cn-media-state { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
 .cn-media-state svg { width: 24px; height: 24px; opacity: 0.55; }
+.cn-media-gif {
+  position: absolute; bottom: 8px; left: 8px; padding: 3px 6px;
+  border-radius: 5px; background: var(--surface); color: var(--text);
+  font: 650 11px var(--font); pointer-events: none;
+}
 .cn-message-image { max-height: 320px; border-radius: 15px; }
 .cn-board-image { max-height: 520px; margin-top: 12px; border-radius: 14px; }
 .cn-board-image img { object-fit: contain; }
