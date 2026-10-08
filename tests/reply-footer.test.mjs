@@ -35,3 +35,26 @@ test('reply overlay reserves growing draft clearance, stays transparent and rest
     }
   } finally { rmSync(folder, { recursive: true, force: true }) }
 })
+
+test('native focus scrolling clears the overlay in partially read reply and main histories', {
+  skip: !process.env.CHROME_BIN && 'CHROME_BIN is not configured',
+}, async () => {
+  const folder = mkdtempSync(join(tmpdir(), 'social-footer-focus-'))
+  const file = join(folder, 'test.html')
+  try {
+    for (const reply of [true, false]) {
+      for (const tall of [false, true]) {
+        writeFileSync(file, `<style>:root{--font:sans-serif;--bg:#111;--surface:#222;--text:#fff;--border:#555;--mobius-safe-bottom:0px}*{box-sizing:border-box}body{margin:0}${CSS}</style>
+          <section class="${reply ? 'cn-inline-thread' : ''}" style="position:relative;height:343px;display:flex;flex-direction:column;overflow:hidden"><div class="cn-inline-replies" style="flex:1;scroll-padding-bottom:3px">${'<article style="height:80px;padding-top:36px"><button style="height:44px">React</button></article>'.repeat(12)}</div><div class="cn-composer-footer ${reply ? 'cn-reply-footer' : ''}"><form class="cn-composer ${reply ? 'cn-reply-composer' : ''}"><button class="cn-composer-attach">Attach</button><div class="cn-composer-pill"><div class="cn-composer-input-line"><textarea rows="1" ${tall ? 'style="height:100px"' : ''}></textarea><button class="cn-composer-send">Send</button></div></div></form></div></section><pre id="result"></pre>
+          <script>(async()=>{const scroll=document.querySelector('.cn-inline-replies'),footer=document.querySelector('.cn-composer-footer');const scrollRef={current:scroll},footerRef={current:footer};const cleanup=(()=>{${effect}})();scroll.scrollTop=600;const action=scroll.lastElementChild.querySelector('button');action.focus();await new Promise(requestAnimationFrame);const rect=action.getBoundingClientRect(),f=footer.getBoundingClientRect();const clear=rect.bottom<=f.top;const hit=document.elementFromPoint(rect.x+rect.width/2,rect.y+rect.height/2)===action;const padding=scroll.style.paddingBottom,focusPadding=scroll.style.scrollPaddingBottom;cleanup();document.querySelector('#result').textContent=JSON.stringify({clear,hit,padding,focusPadding,restored:scroll.style.scrollPaddingBottom})})()</script>`)
+        for (const width of [320, 426, 1280]) {
+          const result = await renderLayout(process.env.CHROME_BIN, file, { width })
+          assert.equal(result.clear, true, `focused action clears ${reply ? 'reply' : 'main'} overlay at ${width}px`)
+          assert.equal(result.hit, true, 'composer controls cannot intercept the focused action')
+          assert.equal(result.focusPadding, result.padding, 'one measured clearance owns native focus and bottom reachability')
+          assert.equal(result.restored, '3px', 'unmount restores prior native clearance')
+        }
+      }
+    }
+  } finally { rmSync(folder, { recursive: true, force: true }) }
+})
