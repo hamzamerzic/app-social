@@ -1708,12 +1708,12 @@ def create_public_router(
       raise HTTPException(status_code=400, detail="Post id is invalid.")
     if not valid_id(reply_id):
       raise HTTPException(status_code=400, detail="Reply id is invalid.")
+    validate_attachment_envelope_size(envelope)
+    actor = await verify_named_member(store, verifier, envelope)
     text = envelope.get("text")
     attachment = validate_attachment(envelope.get("attachment"))
     thumbnail = validate_attachment(envelope.get("thumbnail"), thumbnail=True)
     validate_text_or_attachment(text, attachment, "Reply text is invalid.", MAX_REPLY_TEXT_CHARS)
-    validate_attachment_envelope_size(envelope)
-    actor = await verify_named_member(store, verifier, envelope)
     result = store.add_reply(
       post_id, reply_id, envelope["from"], actor["handle"],
       text, envelope["sent_at"], attachment, thumbnail,
@@ -1745,6 +1745,10 @@ def create_public_router(
     envelope = await read_envelope(request)
     if envelope.get("v") != 0 or envelope.get("type") != "board_post":
       raise HTTPException(status_code=400, detail="Unsupported envelope type.")
+    post_id = envelope.get("id")
+    if not valid_id(post_id):
+      raise HTTPException(status_code=400, detail="Post id is invalid.")
+    actor = await verify_named_member(store, verifier, envelope)
     attachment = validate_attachment(envelope.get("attachment"))
     attachments = validate_attachments(envelope.get("attachments"))
     if attachment is not None and attachments and attachment[0] != attachments[0][0]:
@@ -1758,10 +1762,6 @@ def create_public_router(
     validate_text_or_attachment(
       text, first, "Post text is invalid.", MAX_POST_TEXT_CHARS,
     )
-    post_id = envelope.get("id")
-    if not valid_id(post_id):
-      raise HTTPException(status_code=400, detail="Post id is invalid.")
-    actor = await verify_named_member(store, verifier, envelope)
     store.store_post({
       "id": post_id,
       "host": envelope["from"],

@@ -234,6 +234,36 @@ class CanonicalGifTests(unittest.TestCase):
 
 
 class CommunityGifTests(unittest.TestCase):
+  def test_public_media_decoding_requires_signed_named_membership(self):
+    with tempfile.TemporaryDirectory() as root:
+      store = CommonPublicStore(root)
+      store.register("member.example", "member", "")
+      member_key = _peer(Path(root), "member.example")
+      outsider_key = _peer(Path(root), "outsider.example")
+      post_id = str(uuid.uuid4())
+      store.store_post({"id": post_id, "host": "member.example", "text": "Post",
+                        "created_at": time.time(), "replies": []})
+      with TestClient(community_host.create_app(root)) as client:
+        for kind, path in (("board_post", "/api/common/board"),
+                           ("board_reply", "/api/common/board/reply")):
+          body = {"v": 0, "type": kind, "from": "member.example", "id": str(uuid.uuid4()),
+                  "post_id": post_id, "text": "Caption", "sent_at": time.time(),
+                  "attachment": wire(animation())}
+          if kind == "board_post":
+            body["attachments"] = [body["attachment"]]
+          invalid_signature = _signed(member_key, body)
+          invalid_signature["text"] = "Tampered caption"
+          outsider = _signed(outsider_key, {**body, "from": "outsider.example"})
+          for rejected in (body, invalid_signature, outsider):
+            with self.subTest(kind=kind, sender=rejected["from"], signed="sig" in rejected), \
+                 patch("common_protocol.validate_gif_bytes",
+                       wraps=common_protocol.validate_gif_bytes) as decoded:
+              response = client.post(path, json=rejected)
+              self.assertIn(response.status_code, (400, 401, 403), response.text)
+              self.assertEqual(decoded.call_count, 0)
+        self.assertEqual(store.get_replies(post_id)["replies"], [])
+        self.assertEqual(list(store.board_media_dir().iterdir()), [])
+
   def test_failed_reply_commit_cannot_reuse_a_different_gif_original_or_poster(self):
     from common_public import atomic_write
 
