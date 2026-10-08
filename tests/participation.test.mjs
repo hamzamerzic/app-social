@@ -3,6 +3,7 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 
 import { setToken, postReply } from '../api.js'
+import { GIF_MAX_BYTES, IMAGE_MAX_BYTES, THUMBNAIL_MAX_BYTES } from '../media_limits.js'
 import {
   PARTICIPATION_INTENT_PATH, accountHandoff, clearParticipationIntent,
   createParticipationIntent, loadParticipationIntent, participationActionLabel, participationStep,
@@ -30,6 +31,83 @@ function memoryStorage() {
     async remove(path) { values.delete(path) },
   }
 }
+
+function media(mime, bytes) {
+  return { mime, data_b64: Buffer.alloc(bytes, 65).toString('base64'), w: 40, h: 30 }
+}
+
+test('a maximum-size GIF and caption survive account handoff, reload and exact matching', async () => {
+  const storage = memoryStorage()
+  const attachment = media('image/gif', GIF_MAX_BYTES)
+  const draft = createParticipationIntent('reply', {
+    postId: '12345678-abcd', text: 'Caption stays', attachment,
+    thumbnail: media('image/webp', THUMBNAIL_MAX_BYTES),
+  })
+  assert.ok(draft)
+  assert.equal(await saveParticipationIntent(storage, draft), true)
+  accountHandoff({ identity_app_id: 42 }, () => {})
+  const loaded = await loadParticipationIntent(storage)
+  assert.deepEqual(loaded, draft)
+  assert.equal(participationIntentMatches(loaded, draft), true)
+  assert.equal(participationIntentMatches(loaded, {
+    ...draft, attachment: media('image/gif', GIF_MAX_BYTES - 1),
+  }), false)
+  assert.equal(await clearParticipationIntent(storage, { ...draft, attachment: null }), false)
+  assert.deepEqual(await loadParticipationIntent(storage), draft)
+})
+
+test('four maximum-size photos remain one exact gallery draft across save and load', async () => {
+  const storage = memoryStorage()
+  const photos = Array.from({ length: 4 }, () => media('image/jpeg', IMAGE_MAX_BYTES))
+  const draft = createParticipationIntent('post', { text: 'Four photos', attachments: photos })
+  assert.ok(draft)
+  await saveParticipationIntent(storage, draft)
+  assert.deepEqual(await loadParticipationIntent(storage), draft)
+  assert.equal(participationIntentMatches(draft, { ...draft, attachments: photos.slice(0, 3) }), false)
+})
+
+test('oversize originals and thumbnails never collapse into matching text-only drafts', async () => {
+  const storage = memoryStorage()
+  const textOnly = createParticipationIntent('post', { text: 'Keep photo' })
+  await saveParticipationIntent(storage, textOnly)
+  const badPhoto = { ...textOnly, attachment: media('image/jpeg', IMAGE_MAX_BYTES + 1) }
+  const badGif = { ...textOnly, attachment: media('image/gif', GIF_MAX_BYTES + 1) }
+  const badThumbnail = { ...textOnly, attachment: media('image/jpeg', 100),
+    thumbnails: [media('image/webp', THUMBNAIL_MAX_BYTES + 1)] }
+  for (const invalid of [badPhoto, badGif, badThumbnail]) {
+    assert.equal(createParticipationIntent('post', invalid), null)
+    assert.equal(participationIntentMatches(invalid, textOnly), false)
+    assert.equal(await saveParticipationIntent(storage, invalid), false)
+  }
+  assert.deepEqual(await loadParticipationIntent(storage), textOnly)
+})
+
+test('legacy saved thumbnail stays loadable while new oversized thumbnails are refused', async () => {
+  const storage = memoryStorage()
+  const old = { version: 1, kind: 'reply', post_id: '12345678-abcd', text: 'Old draft',
+    attachment: media('image/png', 100), thumbnail: media('image/webp', 200_000) }
+  await storage.set(PARTICIPATION_INTENT_PATH, old)
+  assert.deepEqual(await loadParticipationIntent(storage), old)
+  assert.equal(createParticipationIntent('reply', {
+    postId: old.post_id, text: old.text, attachment: old.attachment, thumbnail: old.thumbnail,
+  }), null)
+})
+
+test('concurrent large drafts preserve the CAS winner without losing media', async () => {
+  const storage = memoryStorage()
+  const first = createParticipationIntent('post', {
+    text: 'First', attachment: media('image/gif', GIF_MAX_BYTES),
+  })
+  const second = createParticipationIntent('reply', {
+    postId: '12345678-abcd', text: 'Second', attachment: media('image/jpeg', IMAGE_MAX_BYTES),
+  })
+  const outcomes = await Promise.allSettled([
+    saveParticipationIntent(storage, first), saveParticipationIntent(storage, second),
+  ])
+  assert.equal(outcomes.filter(result => result.status === 'fulfilled').length, 1)
+  assert.deepEqual(await loadParticipationIntent(storage), first)
+  assert.equal(await clearParticipationIntent(storage, second), false)
+})
 
 test('a post draft and attachment survive an account handoff without being submitted', async () => {
   const storage = memoryStorage()
