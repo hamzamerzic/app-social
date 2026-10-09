@@ -40,6 +40,10 @@ MAX_NAME_CHARS = 80
 MAX_BIO_CHARS = 400
 MAX_ENVELOPE_BYTES = 32_768
 MAX_ATTACHMENT_ENVELOPE_BYTES = 60 * 1024 * 1024
+# Media grows scalar strings, not JSON structure. Bound container/entry
+# amplification independently of the wire-byte allowance, including extras.
+MAX_ENVELOPE_STRUCTURE_TOKENS = 32_768
+MAX_ENVELOPE_DEPTH = 64
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_STATIC_ATTACHMENT_BYTES = 5 * 1024 * 1024
 MAX_BOARD_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024
@@ -76,6 +80,8 @@ ATTACHMENT_MIME_EXT = {
 _CONTENT_ENVELOPE_TYPES = {
   "message", "group_post", "group_message", "board_post", "board_reply",
 }
+_JSON_STRUCTURE_RE = re.compile(r'["{}\[\]:,]')
+_JSON_STRING_BOUNDARY_RE = re.compile(r'["\\]')
 
 
 def valid_host(host: Any) -> bool:
@@ -386,11 +392,50 @@ def validate_text_or_attachment(
     raise HTTPException(status_code=400, detail=detail)
 
 
+def _preflight_envelope_structure(document: str) -> None:
+  """Bound JSON allocation shape, without parsing values or rewriting source.
+
+  Count the six structural punctuation characters outside quoted strings.
+  Commas/colons also bound scalar entries and object keys (including duplicates),
+  not just containers. Escaped quotes cannot hide structure. Regex searches skip
+  large media strings in C without allocating slices or a token list. Grammar,
+  escapes, Unicode and value semantics remain exclusively stdlib JSON's job.
+  Resource overruns take precedence over any later malformed-JSON error.
+  """
+  position = tokens = depth = 0
+  while match := _JSON_STRUCTURE_RE.search(document, position):
+    token = match[0]
+    position = match.end()
+    if token == '"':
+      while boundary := _JSON_STRING_BOUNDARY_RE.search(document, position):
+        position = boundary.end()
+        if boundary[0] == '"':
+          break
+        position += 1  # Skip exactly one escaped source character.
+      else:
+        return  # Unterminated string: let json.loads give the usual 400.
+      continue
+    tokens += 1
+    if token in "{[":
+      depth += 1
+    elif token in "}]":
+      depth -= 1
+    if tokens > MAX_ENVELOPE_STRUCTURE_TOKENS or depth > MAX_ENVELOPE_DEPTH:
+      raise HTTPException(status_code=413, detail="Envelope JSON is too complex.")
+
+
 async def read_envelope(request: Request) -> dict:
   """Read one bounded envelope without letting Starlette buffer it first."""
   body = await read_capped_body(request, MAX_ATTACHMENT_ENVELOPE_BYTES)
   try:
-    envelope = json.loads(body)
+    # Match json.loads(bytes)' UTF-8/16/32 handling exactly, and retain only
+    # one decoded source. No containers exist until the resource check passes.
+    document = body.decode(json.detect_encoding(body), "surrogatepass")
+  except (UnicodeError, LookupError) as exc:
+    raise HTTPException(status_code=400, detail="Envelope is not JSON.") from exc
+  _preflight_envelope_structure(document)
+  try:
+    envelope = json.loads(document)
   except Exception as exc:
     raise HTTPException(status_code=400, detail="Envelope is not JSON.") from exc
   if not isinstance(envelope, dict):
@@ -548,6 +593,7 @@ __all__ = [
   "MAX_ATTACHMENT_ENVELOPE_BYTES", "MAX_AVATAR_BYTES", "MAX_BIO_CHARS",
   "MAX_BOARD_ATTACHMENTS", "validate_attachments",
   "MAX_ENVELOPE_BYTES", "MAX_NAME_CHARS", "MAX_REPLY_TEXT_CHARS",
+  "MAX_ENVELOPE_STRUCTURE_TOKENS", "MAX_ENVELOPE_DEPTH",
   "MAX_MESSAGE_TEXT_CHARS", "MAX_POST_TEXT_CHARS",
   "MAX_GIF_DIMENSION", "MAX_GIF_FRAMES", "MAX_GIF_CANVAS_PIXELS",
   "OUTBOUND_TIMEOUT_S", "SIGNED_WRITE_TIMEOUT_S",

@@ -89,6 +89,15 @@ not resized or flattened. Community galleries allow up to four images and
 content envelopes allow 60 MiB for base64, encryption, thumbnails and the
 legacy first-image compatibility copy. The app declares that reviewed service
 transfer allowance; other apps retain the platform's 8 MiB default.
+Before JSON container decoding or authentication, every Common envelope also
+allows at most 32,768 structural punctuation characters (`{}[]:,` outside
+strings) and 64 nested containers. This separately bounds containers, scalar
+entries and object keys, including unknown compatible fields and duplicate keys;
+large media/ciphertext strings do not spend this structural budget. Exceeding
+either resource bound returns HTTP 413 (`Envelope JSON is too complex.`), even
+if the over-budget document is also malformed. Within budget, stdlib JSON stays
+authoritative and malformed JSON returns HTTP 400. Source, signing and original
+image bytes are not rewritten. Control envelopes still have their 32 KiB cap.
 Community GIF posts/replies require explicit `gif_attachments: true`; discovery
 and the signed write share a bounded deadline. Numeric media-limit discovery
 also checks that the Community host accepts the selected original and total

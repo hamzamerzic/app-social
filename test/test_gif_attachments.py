@@ -2,17 +2,19 @@
 
 import base64
 import io
+import json
 import random
 import os
 import tempfile
 import time
+import tracemalloc
 import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -106,6 +108,207 @@ def invalid_gifs():
     )
     for mime in ("image/png", "image/jpeg", "image/webp")
   ] + [(wire(tiny_container(frames=2, broken_last=True), (1, 1)), 400)]
+
+
+def envelope_request(raw, chunk_size=64 * 1024):
+  position = 0
+
+  async def receive():
+    nonlocal position
+    chunk = raw[position:position + chunk_size]
+    position += len(chunk)
+    return {"type": "http.request", "body": chunk,
+            "more_body": position < len(raw)}
+
+  return Request({"type": "http", "method": "POST", "path": "/"}, receive)
+
+
+class EnvelopeAdmissionTests(unittest.IsolatedAsyncioTestCase):
+  async def assert_predecode_rejected(self, raw):
+    with patch.object(common_protocol.json, "loads") as decoded:
+      with self.assertRaises(HTTPException) as caught:
+        await common_protocol.read_envelope(envelope_request(raw))
+      self.assertEqual(caught.exception.status_code, 413)
+      self.assertEqual(caught.exception.detail, "Envelope JSON is too complex.")
+      decoded.assert_not_called()
+
+  async def test_dense_arrays_reject_before_decode_with_bounded_actual_read_memory(self):
+    # Allocate the original input before tracing, matching the reported attack.
+    raw = b'{"type":"board_post","extra":[' + b'[],' * 699999 + b'[]]}'
+    self.assertEqual(len(raw), 2_100_031)
+    tracemalloc.start()
+    try:
+      await self.assert_predecode_rejected(raw)
+      _, peak = tracemalloc.get_traced_memory()
+    finally:
+      tracemalloc.stop()
+    # Includes capped-body assembly and source decoding, not just the scanner.
+    # The old actual read materialized 700k lists and peaked at 49.3 MB.
+    self.assertLess(peak, 4 * len(raw) + 2 * 1024 * 1024)
+
+  async def test_entries_containers_and_duplicate_keys_all_spend_structure_budget(self):
+    for element in (b'[]', b'{}', b'0', b'1.25', b'true', b'null', b'"x"'):
+      raw = b'{"type":"board_post","extra":[' + (element + b',') * 33000 + element + b']}'
+      with self.subTest(element=element):
+        await self.assert_predecode_rejected(raw)
+    for entries in (
+      b'"duplicate":0,' * 17000,
+      b','.join(('"key%d":0' % n).encode() for n in range(17000)) + b',',
+    ):
+      await self.assert_predecode_rejected(b'{"type":"board_post","extra":{' + entries + b'"last":0}}')
+
+  async def test_exact_structure_and_depth_boundaries_are_inclusive(self):
+    # This wrapper uses seven punctuation characters; N scalars use N-1 commas.
+    count = common_protocol.MAX_ENVELOPE_STRUCTURE_TOKENS - 6
+    raw = b'{"type":"board_post","extra":[' + b'0,' * (count - 1) + b'0]}'
+    result = await common_protocol.read_envelope(envelope_request(raw))
+    self.assertEqual(len(result["extra"]), count)
+    await self.assert_predecode_rejected(raw[:-2] + b',0]}')
+    # The root object is container depth one.
+    for depth in (common_protocol.MAX_ENVELOPE_DEPTH, common_protocol.MAX_ENVELOPE_DEPTH + 1):
+      raw = b'{"type":"board_post","extra":' + b'[' * (depth - 1) + b'0' + b']' * (depth - 1) + b'}'
+      if depth == common_protocol.MAX_ENVELOPE_DEPTH:
+        await common_protocol.read_envelope(envelope_request(raw))
+      else:
+        await self.assert_predecode_rejected(raw)
+
+  async def test_admitted_dense_containers_have_a_small_allocation_ceiling(self):
+    count = (common_protocol.MAX_ENVELOPE_STRUCTURE_TOKENS - 6) // 3
+    raw = b'{"type":"board_post","extra":[' + b'[],' * (count - 1) + b'[]]}'
+    tracemalloc.start()
+    try:
+      result = await common_protocol.read_envelope(envelope_request(raw))
+      _, peak = tracemalloc.get_traced_memory()
+    finally:
+      tracemalloc.stop()
+    self.assertEqual(len(result["extra"]), count)
+    self.assertLess(peak, 3 * 1024 * 1024)
+
+  async def test_strings_escaping_unicode_and_stdlib_encodings_cannot_hide_structure(self):
+    value = {"type": "board_post", "extra": {
+      "escaped key \\\" {}[]:, 🪐": "{}[]:," * 6000 + '\\"\\\\🪐é\n\t',
+      "nested": [[], {}, [1, "\\\\\"", None]],
+    }}
+    for ensure_ascii in (True, False):
+      source = json.dumps(value, ensure_ascii=ensure_ascii)
+      for encoding in ("utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be",
+                       "utf-32", "utf-32-le", "utf-32-be"):
+        with self.subTest(ensure_ascii=ensure_ascii, encoding=encoding):
+          raw = source.encode(encoding)
+          self.assertEqual(await common_protocol.read_envelope(envelope_request(raw, 7)), value)
+    # Surrogate escapes and literal surrogate code units keep stdlib semantics.
+    for raw in (b'{"extra":"\\ud800"}', '{"extra":"\ud800"}'.encode("utf-16-le", "surrogatepass")):
+      self.assertEqual(await common_protocol.read_envelope(envelope_request(raw)), json.loads(raw))
+    attack = '{"type":"board_post","quoted":"\\\\\\\"[]{}:,","extra":[' + '[],' * 12000 + '[]]}'
+    for encoding in ("utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be",
+                     "utf-32", "utf-32-le", "utf-32-be"):
+      with self.subTest(attack_encoding=encoding):
+        await self.assert_predecode_rejected(attack.encode(encoding))
+
+  async def test_stdlib_remains_authoritative_for_malformed_and_compatible_json(self):
+    for raw in (b'', b'{', b'{"x":}', b'{"x":[}}', b'{"x":1,}', b'{} {}',
+                b'{"x":"unterminated}', b'{"x":"\\q"}', b'{"x":"\\u00xz"}',
+                b'{"x":"\x01"}', b'{"x":"\xff"}', b'{"x":01}', b'{"x":true false}',
+                b'[]', b'null', b'"scalar"'):
+      with self.subTest(raw=raw), self.assertRaises(HTTPException) as caught:
+        await common_protocol.read_envelope(envelope_request(raw))
+      self.assertEqual(caught.exception.status_code, 400)
+    for raw in (b'{"x":NaN,"y":Infinity,"z":-Infinity}',
+                b'{"type":"register","type":"board_post","extra":{}}',
+                b'{"\\u0074ype":"board_post","extra":[true,null,1.2e3]}'):
+      with patch.object(common_protocol.json, "loads", wraps=json.loads) as decoded:
+        result = await common_protocol.read_envelope(envelope_request(raw))
+        decoded.assert_called_once_with(raw.decode())
+      self.assertIsInstance(result, dict)
+    # A resource failure wins over later grammar errors; no unsafe fallback parse.
+    await self.assert_predecode_rejected(b'{"extra":[' + b'[],' * 12000 + b'bad JSON')
+
+  async def test_control_byte_cap_remains_32_kib_even_for_large_scalars(self):
+    for size in (common_protocol.MAX_ENVELOPE_BYTES, common_protocol.MAX_ENVELOPE_BYTES + 1):
+      prefix, suffix = b'{"type":"register","extra":"', b'"}'
+      raw = prefix + b'x' * (size - len(prefix) - len(suffix)) + suffix
+      if size == common_protocol.MAX_ENVELOPE_BYTES:
+        await common_protocol.read_envelope(envelope_request(raw))
+      else:
+        with self.assertRaises(HTTPException) as caught:
+          await common_protocol.read_envelope(envelope_request(raw))
+        self.assertEqual(caught.exception.status_code, 413)
+
+  async def test_large_legal_scalar_and_signed_maximum_media_are_not_rewritten(self):
+    key = common_protocol.new_signing_key()
+
+    async def roundtrip(value):
+      value = {"v": 0, "id": "abcdef12", "from": "member.example",
+               "text": "x" * common_protocol.MAX_POST_TEXT_CHARS,
+               "sent_at": time.time(), **value}
+      signed = {**value, "sig": common_protocol.sign(value, key)}
+      source = json.dumps(signed, ensure_ascii=False, separators=(",", ":"))
+      self.assertLessEqual(len(source.encode()), common_protocol.MAX_ATTACHMENT_ENVELOPE_BYTES)
+      with patch.object(common_protocol.json, "loads", wraps=json.loads) as decoded:
+        result = await common_protocol.read_envelope(envelope_request(source.encode()))
+        decoded.assert_called_once_with(source)
+      self.assertEqual(result, signed)
+      self.assertTrue(common_protocol.verify(
+        {k: v for k, v in result.items() if k != "sig"}, result["sig"],
+        common_protocol.signing_public_key(key)))
+      return result
+
+    await roundtrip({"type": "message", "enc": {"ciphertext": "a" * (8 * 1024 * 1024)},
+                     "extra": "[]{}:,\\\"🪐" * 10000})
+    photo = io.BytesIO()
+    Image.new("RGB", (1, 1)).save(photo, format="JPEG")
+    thumbnail = {"mime": "image/jpeg", "w": 1, "h": 1,
+                 "data_b64": base64.b64encode(photo.getvalue().ljust(common_protocol.MAX_THUMBNAIL_BYTES, b'\0')).decode()}
+    original = padded_gif(common_protocol.MAX_ATTACHMENT_BYTES)
+    attachment = wire(original, (1, 1))
+    result = await roundtrip({"type": "board_post", "attachments": [attachment],
+                              "attachment": attachment, "thumbnails": [thumbnail]})
+    self.assertEqual(common_protocol.validate_attachment(result["attachment"])[1], original)
+    del result, original, attachment
+    data = photo.getvalue().ljust(common_protocol.MAX_STATIC_ATTACHMENT_BYTES, b'\0')
+    attachment = {"mime": "image/jpeg", "data_b64": base64.b64encode(data).decode(), "w": 1, "h": 1}
+    result = await roundtrip({"type": "board_post", "attachments": [attachment] * 4,
+                              "attachment": attachment, "thumbnails": [thumbnail] * 4})
+    self.assertEqual([decoded for _, decoded in common_protocol.validate_attachments(result["attachments"])], [data] * 4)
+
+
+class PublicEnvelopeAdmissionTests(unittest.TestCase):
+  def test_actual_public_handlers_reject_dense_json_before_auth_media_or_commit(self):
+    raw = b'{"type":"board_post","extra":[' + b'[],' * 699999 + b'[]]}'
+    with tempfile.TemporaryDirectory() as root, TestClient(community_host.create_app(root)) as client:
+      before = sorted(p.relative_to(root) for p in Path(root).rglob('*') if p.is_file())
+      for path in ("/api/common/board", "/api/common/board/reply", "/api/common/directory"):
+        with self.subTest(path=path), \
+             patch.object(common_protocol.json, "loads") as decoded, \
+             patch.object(common_protocol.ActorVerifier, "verify_envelope", new_callable=AsyncMock) as verified, \
+             patch("common_protocol.validate_gif_bytes") as gif:
+          tracemalloc.start()
+          try:
+            response = client.post(path, content=raw, headers={"Content-Type": "application/json"})
+            _, peak = tracemalloc.get_traced_memory()
+          finally:
+            tracemalloc.stop()
+          self.assertEqual(response.status_code, 413)
+          decoded.assert_not_called()
+          verified.assert_not_awaited()
+          gif.assert_not_called()
+          self.assertLess(peak, 6 * len(raw) + 2 * 1024 * 1024)
+        self.assertEqual(response.json()["detail"], "Envelope JSON is too complex.")
+      self.assertEqual(sorted(p.relative_to(root) for p in Path(root).rglob('*') if p.is_file()), before)
+
+  def test_public_handler_keeps_malformed_400_and_signed_unknown_fields(self):
+    with tempfile.TemporaryDirectory() as root, TestClient(community_host.create_app(root)) as client:
+      store = CommonPublicStore(root)
+      store.register("member.example", "member", "")
+      key = _peer(Path(root), "member.example")
+      response = client.post("/api/common/board", content=b'{"type":"board_post","extra": [}')
+      self.assertEqual(response.status_code, 400)
+      body = {"v": 0, "type": "board_post", "from": "member.example", "id": str(uuid.uuid4()),
+              "text": "Caption", "sent_at": time.time(), "attachment": wire(animation()),
+              "extra": {"future": [{"key": "{}[]:,\\\"🪐"}] * 1000}}
+      response = client.post("/api/common/board", json=_signed(key, body))
+      self.assertEqual(response.status_code, 200, response.text)
+      self.assertEqual(store.board_image(body["id"])[0].read_bytes(), animation())
 
 
 class CanonicalGifTests(unittest.TestCase):
