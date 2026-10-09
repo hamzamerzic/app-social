@@ -110,6 +110,29 @@ Busy capacity returns HTTP 503 (`Community request capacity is busy.`) with
 after capacity is released. No automatic retry is added. GET/media reads use no
 reservation. These are per-router/process bounds, not a deployment-wide RSS cap;
 decoded scalars, image work and multiple server processes need their own headroom.
+Envelope receiving has a 12-second absolute budget, not a per-chunk idle timeout;
+an expired receive returns HTTP 408 (`Envelope receive deadline exceeded.`) before
+JSON decoding or authentication. Every admitted public POST also has a 75-second
+absolute lifetime budget, including verification and response sending. Capacity
+remains reserved until cancellation has unwound a stalled operation; at lifetime
+expiry the app returns without another app error send or a traceback retaining
+media. This is **not** a generic ASGI transport abort: if response start never
+completed, Uvicorn may send its small fallback 500, whose flow-control wait is
+outside this app-owned decoded-data/admission bound. That residual server task
+retains no decoded envelope or reservation. Server socket/task caps and transport
+deadlines remain the server owner's responsibility. This leaves the existing
+12-second signed write and each 10-second actor-fetch allowance unchanged,
+including up to five fetches during named-member key/handle refresh with a full
+cache. Both content and control slots recover from unauthenticated one-byte
+drip/stalled streams without requiring a restart.
+Deadlines use cooperative asyncio cancellation; bounded synchronous JSON/image
+work is not preempted.
+Quoted scalars are advanced using stdlib's C JSON string scanner, discarding its
+temporary scalar before container decoding. There is no Python loop per escape,
+escape-count cap, source rewrite, or loss of maximally escaped legal media/text.
+At most 32,768 quoted scalars may be advanced, also returning 413 on excess;
+this bounds scanner calls even for malformed adjacent strings without separators.
+Valid within-budget entries already consume the punctuation allowance.
 The strict lifetime contract covers the frozen standalone host's default
 `debug=False` error policy. Debug HTML may be rendered again by outer error
 middleware after release. Custom 500/error hooks likewise require admission

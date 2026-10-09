@@ -8,6 +8,7 @@ implementation.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -40,6 +41,9 @@ MAX_NAME_CHARS = 80
 MAX_BIO_CHARS = 400
 MAX_ENVELOPE_BYTES = 32_768
 MAX_ATTACHMENT_ENVELOPE_BYTES = 60 * 1024 * 1024
+# Match the existing signed-write allowance, as a total receive budget rather
+# than an idle timeout that an unauthenticated drip stream can keep refreshing.
+MAX_ENVELOPE_RECEIVE_SECONDS = 12.0
 # Media grows scalar strings, not JSON structure. Bound container/entry
 # amplification independently of the wire-byte allowance, including extras.
 MAX_ENVELOPE_STRUCTURE_TOKENS = 32_768
@@ -81,7 +85,6 @@ _CONTENT_ENVELOPE_TYPES = {
   "message", "group_post", "group_message", "board_post", "board_reply",
 }
 _JSON_STRUCTURE_RE = re.compile(r'["{}\[\]:,]')
-_JSON_STRING_BOUNDARY_RE = re.compile(r'["\\]')
 
 
 def valid_host(host: Any) -> bool:
@@ -393,27 +396,33 @@ def validate_text_or_attachment(
 
 
 def _preflight_envelope_structure(document: str) -> None:
-  """Bound JSON allocation shape, without parsing values or rewriting source.
+  """Bound JSON allocation shape, without decoding containers or rewriting source.
 
   Count the six structural punctuation characters outside quoted strings.
   Commas/colons also bound scalar entries and object keys (including duplicates),
-  not just containers. Escaped quotes cannot hide structure. Regex searches skip
-  large media strings in C without allocating slices or a token list. Grammar,
-  escapes, Unicode and value semantics remain exclusively stdlib JSON's job.
+  not just containers. Stdlib's string scanner advances over quoted strings in
+  C, including arbitrary escaping; its temporary scalar is discarded immediately.
+  This avoids Python work per escape without narrowing legitimate media/text
+  encodings or materializing any containers. No source slices or token list are
+  made. Grammar, escapes, Unicode and value semantics remain stdlib JSON's job.
   Resource overruns take precedence over any later malformed-JSON error.
   """
-  position = tokens = depth = 0
+  position = tokens = depth = strings = 0
   while match := _JSON_STRUCTURE_RE.search(document, position):
     token = match[0]
     position = match.end()
     if token == '"':
-      while boundary := _JSON_STRING_BOUNDARY_RE.search(document, position):
-        position = boundary.end()
-        if boundary[0] == '"':
-          break
-        position += 1  # Skip exactly one escaped source character.
-      else:
-        return  # Unterminated string: let json.loads give the usual 400.
+      strings += 1
+      if strings > MAX_ENVELOPE_STRUCTURE_TOKENS:
+        # Valid entries already spend punctuation. Malformed adjacent strings
+        # must not buy unbounded Python/C calls by omitting those separators.
+        raise HTTPException(status_code=413, detail="Envelope JSON is too complex.")
+      try:
+        position = json.decoder.scanstring(document, position)[1]
+      except ValueError:
+        # Parsing must fail at this string before any later containers. The
+        # bounded prefix is safe; let json.loads report the ordinary JSON400.
+        return
       continue
     tokens += 1
     if token in "{[":
@@ -432,11 +441,22 @@ async def read_envelope(request: Request) -> dict:
   state = getattr(request, "state", None)
   limit = getattr(state, "common_envelope_max_bytes", MAX_ATTACHMENT_ENVELOPE_BYTES)
   body = bytearray()
-  async for chunk in request.stream():
-    # Reject even one oversized chunk before copying it into our body buffer.
-    if len(chunk) > limit - len(body):
-      raise HTTPException(status_code=413, detail="Request body is too large.")
-    body.extend(chunk)
+  receive_budget = asyncio.timeout(MAX_ENVELOPE_RECEIVE_SECONDS)
+  try:
+    async with receive_budget:
+      async for chunk in request.stream():
+        # Also enforce the absolute budget for immediately-ready chunks, which
+        # need not suspend to deliver asyncio's deadline cancellation.
+        if asyncio.get_running_loop().time() >= receive_budget.when():
+          raise HTTPException(status_code=408, detail="Envelope receive deadline exceeded.")
+        # Reject even one oversized chunk before copying it into our body buffer.
+        if len(chunk) > limit - len(body):
+          raise HTTPException(status_code=413, detail="Request body is too large.")
+        body.extend(chunk)
+  except TimeoutError:
+    if not receive_budget.expired():
+      raise
+    raise HTTPException(status_code=408, detail="Envelope receive deadline exceeded.") from None
   body = bytes(body)
   try:
     # Match json.loads(bytes)' UTF-8/16/32 handling exactly, and retain only
@@ -605,6 +625,7 @@ __all__ = [
   "MAX_BOARD_ATTACHMENTS", "validate_attachments",
   "MAX_ENVELOPE_BYTES", "MAX_NAME_CHARS", "MAX_REPLY_TEXT_CHARS",
   "MAX_ENVELOPE_STRUCTURE_TOKENS", "MAX_ENVELOPE_DEPTH",
+  "MAX_ENVELOPE_RECEIVE_SECONDS",
   "MAX_MESSAGE_TEXT_CHARS", "MAX_POST_TEXT_CHARS",
   "MAX_GIF_DIMENSION", "MAX_GIF_FRAMES", "MAX_GIF_CANVAS_PIXELS",
   "OUTBOUND_TIMEOUT_S", "SIGNED_WRITE_TIMEOUT_S",

@@ -31,7 +31,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
@@ -80,6 +80,11 @@ BOARD_LIKE_LIMIT = 2000
 DIRECTORY_LIMIT = 2000
 MAX_PUBLIC_CONTENT_REQUESTS = 2
 MAX_PUBLIC_CONTROL_REQUESTS = 8
+# Named-member verification can fetch five times when a key/handle changes and
+# the cache is full: two initial, one named-card refresh, two re-verification.
+# 12s receiving + five existing 10s fetch grants leaves 13s for bounded local
+# validation and response sending. Do not shorten any existing network grant.
+MAX_PUBLIC_REQUEST_SECONDS = 75.0
 # A member avatar URL is its content hash, so it never changes. A board image
 # never changes either, but its post can be deleted or moderated: a browser may
 # keep what it already showed for a day, while shared caches such as the site's
@@ -1530,8 +1535,8 @@ class _PublicEnvelopeAdmission:
     }
     self._used = dict.fromkeys(self._limits, 0)
 
-  @contextmanager
-  def reserve(self, body_limit: int):
+  @asynccontextmanager
+  async def reserve(self, body_limit: int):
     with self._lock:
       if self._used[body_limit] >= self._limits[body_limit]:
         raise HTTPException(
@@ -1539,8 +1544,20 @@ class _PublicEnvelopeAdmission:
           headers={"Retry-After": "1"},
         )
       self._used[body_limit] += 1
+    lifetime = asyncio.timeout(MAX_PUBLIC_REQUEST_SECONDS)
     try:
-      yield
+      try:
+        async with lifetime:
+          yield
+      except TimeoutError:
+        if not lifetime.expired():
+          raise
+        # The absolute reservation budget is exhausted. Cancellation has already
+        # unwound the endpoint/response and freed its envelope. Return without
+        # another app error send or a media-retaining exception traceback.
+        # This bounds app data, not the server connection: Uvicorn may attempt
+        # its small fallback500 if response.start never completed. That server
+        # task holds neither our envelope nor a reservation; no app retry occurs.
     finally:
       with self._lock:
         self._used[body_limit] -= 1
@@ -1567,7 +1584,7 @@ def create_public_router(
         return await super().handle(scope, receive, send)
       body_limit = (MAX_ATTACHMENT_ENVELOPE_BYTES if self.path in content_paths
                     else MAX_ENVELOPE_BYTES)
-      with admission.reserve(body_limit):
+      async with admission.reserve(body_limit):
         state = scope.setdefault("state", {})
         state["common_envelope_max_bytes"] = body_limit
         try:

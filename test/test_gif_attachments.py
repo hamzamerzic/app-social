@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import gc
 import io
 import json
 import random
@@ -11,9 +12,10 @@ import time
 import tracemalloc
 import unittest
 import uuid
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 from fastapi import HTTPException, Request
@@ -62,7 +64,7 @@ def tiny_container(size=(1, 1), frames=1, *, broken_last=False):
   return bytes(header) + frame * (frames - 1) + bytes(last) + b";"
 
 
-def padded_gif(total_bytes):
+def padded_gif(total_bytes, padding=b"x"):
   """A fully framed, decodable GIF with legal comment sub-block padding."""
   original = tiny_container()
   overhead = 3  # extension introducer, comment label, terminator
@@ -75,7 +77,7 @@ def padded_gif(total_bytes):
     if take <= 0:
       raise ValueError("Cannot represent padding length")
     blocks.append(take)
-    blocks.extend(b"x" * take)
+    blocks.extend(padding * take)
     room -= take + 1
   return original[:-1] + b"\x21\xfe" + bytes(blocks) + b"\x00;"
 
@@ -225,6 +227,64 @@ class EnvelopeAdmissionTests(unittest.IsolatedAsyncioTestCase):
     # A resource failure wins over later grammar errors; no unsafe fallback parse.
     await self.assert_predecode_rejected(b'{"extra":[' + b'[],' * 12000 + b'bad JSON')
 
+  async def test_escape_dense_scalars_use_stdlib_string_work_not_python_per_escape(self):
+    # Inputs are prepared outside timing; each used to block the event loop for
+    # approximately 3.3-3.7s before any identity/content validation.
+    size = 16 * 1024 * 1024
+    for pair, value in ((b'\\n', '\n'), (b'\\"', '"'), (b'\\\\', '\\'), (b'\\/', '/')):
+      source = b'{"type":"board_post","extra":"' + pair * (size // 2) + b'"}'
+      with self.subTest(pair=pair), \
+           patch.object(json.decoder, "scanstring", wraps=json.decoder.scanstring) as strings, \
+           patch.object(json, "loads", wraps=json.loads) as decoded:
+        started = time.perf_counter()
+        result = await common_protocol.read_envelope(envelope_request(source))
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(strings.call_count, 4)  # Two keys and two values.
+        decoded.assert_called_once_with(source.decode())
+        self.assertEqual(len(result["extra"]), size // 2)
+        self.assertEqual(result["extra"][:3], value * 3)
+
+  async def test_maximum_text_and_slash_escaped_20_mib_gif_keep_signed_original(self):
+    # A legal comment filled with FF produces tens of millions of base64 '/'
+    # characters. JSON senders may legally escape each '/' without changing it.
+    data = padded_gif(common_protocol.MAX_ATTACHMENT_BYTES, padding=b'\xff')
+    key = common_protocol.new_signing_key()
+    value = {"v": 0, "type": "message", "from": "member.example", "id": "abcdef12",
+             "text": '🪐' * common_protocol.MAX_MESSAGE_TEXT_CHARS,
+             "sent_at": time.time(), "attachment": wire(data, (1, 1))}
+    signed = {**value, "sig": common_protocol.sign(value, key)}
+    source = json.dumps(signed, separators=(",", ":")).replace('/', '\\/')
+    self.assertGreater(source.count('\\/'), 20 * 1024 * 1024)
+    self.assertLessEqual(len(source.encode()), common_protocol.MAX_ATTACHMENT_ENVELOPE_BYTES)
+    with patch.object(json, "loads", wraps=json.loads) as decoded:
+      result = await common_protocol.read_envelope(envelope_request(source.encode()))
+      decoded.assert_called_once_with(source)
+    self.assertEqual(result, signed)
+    self.assertTrue(common_protocol.verify(
+      {k: v for k, v in result.items() if k != "sig"}, result["sig"],
+      common_protocol.signing_public_key(key)))
+    self.assertEqual(common_protocol.validate_attachment(result["attachment"])[1], data)
+
+  async def test_malformed_adjacent_strings_cannot_buy_unbounded_scanner_calls(self):
+    # Missing commas are malformed, but the preflight must not synchronously
+    # advance a million scalars before stdlib can report the first syntax error.
+    source = b'{"type":"board_post","extra":' + b'""' * (1024 * 1024) + b'}'
+    started = time.perf_counter()
+    await self.assert_predecode_rejected(source)
+    self.assertLess(time.perf_counter() - started, 1.0)
+    with self.assertRaises(HTTPException) as malformed:
+      await common_protocol.read_envelope(envelope_request(b'{"type":"board_post","extra":""""}'))
+    self.assertEqual(malformed.exception.status_code, 400)
+    for count in (common_protocol.MAX_ENVELOPE_STRUCTURE_TOKENS,
+                  common_protocol.MAX_ENVELOPE_STRUCTURE_TOKENS + 1):
+      with self.subTest(count=count), patch.object(json, "loads", wraps=json.loads) as decoded:
+        with self.assertRaises(HTTPException) as result:
+          await common_protocol.read_envelope(envelope_request(b'""' * count))
+        self.assertEqual(result.exception.status_code,
+                         400 if count == common_protocol.MAX_ENVELOPE_STRUCTURE_TOKENS else 413)
+        self.assertEqual(decoded.call_count, int(count == common_protocol.MAX_ENVELOPE_STRUCTURE_TOKENS))
+
   async def test_control_byte_cap_remains_32_kib_even_for_large_scalars(self):
     for size in (common_protocol.MAX_ENVELOPE_BYTES, common_protocol.MAX_ENVELOPE_BYTES + 1):
       prefix, suffix = b'{"type":"register","extra":"', b'"}'
@@ -348,6 +408,295 @@ class PublicRequestLifetimeTests(unittest.IsolatedAsyncioTestCase):
         yield chunk
 
     return stream(), reads
+
+  async def test_one_byte_stalls_expire_before_decode_for_content_and_control_slots(self):
+    import common_public
+    for path, capacity in (("/api/common/board", 2), ("/api/common/directory/search", 8)):
+      entered = 0
+      ready, stall = asyncio.Event(), asyncio.Event()
+
+      async def stream():
+        nonlocal entered
+        yield b'{'
+        entered += 1
+        if entered == capacity:
+          ready.set()
+        await stall.wait()
+
+      with patch.object(common_protocol, "MAX_ENVELOPE_RECEIVE_SECONDS", .15), \
+           patch.object(common_public, "MAX_PUBLIC_REQUEST_SECONDS", 2.0):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+          with patch.object(json, "loads") as decoded, \
+               patch.object(common_protocol.ActorVerifier, "verify_envelope", new_callable=AsyncMock) as verified:
+            tasks = [asyncio.create_task(client.post(path, content=stream())) for _ in range(capacity)]
+            try:
+              await asyncio.wait_for(ready.wait(), 1)
+              body, reads = self.observed_body(b'{}')
+              self.assertEqual((await client.post(path, content=body)).status_code, 503)
+              self.assertEqual(reads, [])
+              responses = await asyncio.wait_for(asyncio.gather(*tasks), 1)
+              self.assertTrue(all(response.status_code == 408 for response in responses))
+              self.assertTrue(all("Envelope receive deadline exceeded." in response.text for response in responses))
+              decoded.assert_not_called()
+              verified.assert_not_awaited()
+            finally:
+              for task in tasks:
+                task.cancel()
+              await asyncio.gather(*tasks, return_exceptions=True)
+          # No restart or modified identity/id/signature is needed after expiry.
+          raw = self.signed_raw() if path.endswith("board") else self.signed_raw(kind="directory_read", q="")
+          self.assertEqual((await client.post(path, content=raw)).status_code, 200)
+
+  async def test_receive_budget_is_absolute_even_when_each_chunk_keeps_arriving(self):
+    chunks = 0
+
+    async def drip():
+      nonlocal chunks
+      while True:
+        chunks += 1
+        yield b' '
+        await asyncio.sleep(.015)
+
+    with patch.object(common_protocol, "MAX_ENVELOPE_RECEIVE_SECONDS", .12):
+      async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+        with patch.object(json, "loads") as decoded:
+          response = await asyncio.wait_for(client.post("/api/common/board", content=drip()), 1)
+          self.assertEqual(response.status_code, 408)
+          self.assertGreater(chunks, 2)
+          self.assertLess(chunks, 20)
+          decoded.assert_not_called()
+
+  async def test_immediately_ready_chunks_cannot_run_past_receive_budget(self):
+    # No await inside this generator: deadline enforcement must not depend on
+    # another task/timer getting event-loop time between stream chunks.
+    async def ready():
+      yield b'{}'
+
+    with patch.object(common_protocol, "MAX_ENVELOPE_RECEIVE_SECONDS", 0.0):
+      async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+        with patch.object(json, "loads") as decoded:
+          self.assertEqual((await client.post("/api/common/board", content=ready())).status_code, 408)
+          decoded.assert_not_called()
+
+  async def test_reservation_expiry_unwinds_identity_before_capacity_is_reused(self):
+    import common_public
+    entered = 0
+    cancelled = 0
+    ready, stall = asyncio.Event(), asyncio.Event()
+
+    async def fetch(host, **kwargs):
+      nonlocal entered, cancelled
+      entered += 1
+      if entered == 2:
+        ready.set()
+      try:
+        await stall.wait()
+      finally:
+        cancelled += 1
+
+    raw = self.signed_raw(extra="a" * (1024 * 1024))
+    with patch.object(common_public, "MAX_PUBLIC_REQUEST_SECONDS", .3):
+      async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+        with patch.object(common_protocol.ActorVerifier, "fetch_actor", side_effect=fetch):
+          tasks = [asyncio.create_task(client.post("/api/common/board", content=raw)) for _ in range(2)]
+          try:
+            await asyncio.wait_for(ready.wait(), 1)
+            stream, reads = self.observed_body(raw)
+            self.assertEqual((await client.post("/api/common/board", content=stream)).status_code, 503)
+            self.assertEqual(reads, [])
+            results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 1)
+            self.assertTrue(all(isinstance(result, AssertionError) for result in results))
+            self.assertEqual(cancelled, 2)
+          finally:
+            for task in tasks:
+              task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertEqual((await client.post("/api/common/board", content=raw)).status_code, 200)
+
+  async def test_reservation_expiry_unwinds_stalled_app_send_then_allows_unchanged_retry(self):
+    import common_public
+    entered = 0
+    ready, stall = asyncio.Event(), asyncio.Event()
+    cancelled = 0
+    sent = []
+
+    async def app(scope, receive, send):
+      async def blocked_send(message):
+        nonlocal entered, cancelled
+        if message["type"] == "http.response.start" and (b'x-stall-send', b'yes') in scope["headers"]:
+          sent.append(message["status"])
+          entered += 1
+          if entered == 2:
+            ready.set()
+          try:
+            await stall.wait()
+          except asyncio.CancelledError:
+            cancelled += 1
+            raise
+        await send(message)
+      await self.app(scope, receive, blocked_send)
+
+    raw = self.signed_raw(extra="a" * (1024 * 1024))
+    with patch.object(common_public, "MAX_PUBLIC_REQUEST_SECONDS", .3):
+      async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        tasks = [asyncio.create_task(client.post("/api/common/board", content=raw,
+                                                headers={"x-stall-send": "yes"})) for _ in range(2)]
+        try:
+          await asyncio.wait_for(ready.wait(), 1)
+          stream, reads = self.observed_body(raw)
+          self.assertEqual((await client.post("/api/common/board", content=stream)).status_code, 503)
+          self.assertEqual(reads, [])
+          # ASGITransport reports the incomplete app response as an assertion.
+          # Unlike Uvicorn it has no server-owned fallback500 (tested below).
+          results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 1)
+          self.assertTrue(all(isinstance(result, AssertionError) for result in results))
+          self.assertEqual(cancelled, 2)
+          self.assertEqual(sent, [200, 200])
+          self.assertEqual((await client.post("/api/common/board", content=raw)).status_code, 200)
+        finally:
+          for task in tasks:
+            task.cancel()
+          await asyncio.gather(*tasks, return_exceptions=True)
+
+  async def test_escape_dense_public_post_preserves_caption_without_event_loop_starvation(self):
+    post_id = str(uuid.uuid4())
+    raw = self.signed_raw(id=post_id, text='Caption 🪐 "kept"', extra='\n' * (8 * 1024 * 1024))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+      started = time.perf_counter()
+      response = await client.post("/api/common/board", content=raw)
+      elapsed = time.perf_counter() - started
+    self.assertEqual(response.status_code, 200, response.text)
+    self.assertLess(elapsed, 1.0)
+    record = json.loads((self.store.board_dir() / f"{post_id}.json").read_text())
+    self.assertEqual(record["text"], 'Caption 🪐 "kept"')
+
+  async def test_uvicorn_fallback_after_expiry_retains_no_envelope_traceback_or_slot(self):
+    import common_public
+    import h11
+    import inspect
+    from uvicorn.protocols.http.h11_impl import RequestResponseCycle
+
+    class TrackedEnvelope(dict):
+      pass
+
+    class TrackedFailure(RuntimeError):
+      pass
+
+    original_read = common_public.read_envelope
+    original_fetch = common_protocol.ActorVerifier.fetch_actor
+    original_store = CommonPublicStore.store_post
+    # FastAPI can retain an included router rather than flatten its routes.
+    routes = [child for route in self.app.routes
+              for child in (getattr(route.original_router, "routes", ())
+                            if hasattr(route, "original_router") else (route,))]
+    route = next(route for route in routes if getattr(route, "path", None) == "/api/common/board"
+                 and "POST" in (getattr(route, "methods", None) or ()))
+    admission = inspect.getclosurevars(type(route).handle).nonlocals["admission"]
+    # Exercise expiry while verifying, sending200, and sending an unhandled500.
+    # The latter's exception traceback used to retain the endpoint's media.
+    for phase in ("identity", "success", "failure"):
+      with self.subTest(phase=phase):
+        envelope_refs, error_refs = [], []
+        fallback_started, unblock = asyncio.Event(), asyncio.Event()
+        drain_calls = 0
+
+        async def tracked_read(request):
+          envelope = TrackedEnvelope(await original_read(request))
+          envelope_refs.append(weakref.ref(envelope))
+          return envelope
+
+        async def identity(host, **kwargs):
+          await asyncio.Event().wait()
+
+        def failure(*args, **kwargs):
+          error = TrackedFailure("fixture failure")
+          error_refs.append(weakref.ref(error))
+          raise error
+
+        class BlockedFlow:
+          write_paused = True
+
+          def resume_reading(self):
+            pass
+
+          async def drain(self):
+            nonlocal drain_calls
+            drain_calls += 1
+            if phase == "identity" or drain_calls == 2:
+              fallback_started.set()
+            await unblock.wait()
+
+        raw = self.signed_raw(extra="a" * (1024 * 1024))
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+                 "method": "POST", "scheme": "http", "path": "/api/common/board",
+                 "raw_path": b"/api/common/board", "root_path": "", "query_string": b"",
+                 "headers": [], "client": ("127.0.0.1", 1), "server": ("test", 80)}
+        conn = h11.Connection(h11.SERVER)
+        conn.receive_data(b'POST /api/common/board HTTP/1.1\r\nHost: test\r\nContent-Length: '
+                          + str(len(raw)).encode() + b'\r\n\r\n')
+        conn.next_event()
+        message_event = asyncio.Event()
+        message_event.set()
+        transport = Mock()
+        cycle = RequestResponseCycle(
+          scope=scope, conn=conn, transport=transport, flow=BlockedFlow(),
+          logger=Mock(), access_logger=Mock(), access_log=False,
+          default_headers=[], message_event=message_event, on_response=lambda: None,
+        )
+        cycle.body = bytearray(raw)
+        cycle.more_body = False
+        with patch.object(common_public, "MAX_PUBLIC_REQUEST_SECONDS", .2), \
+             patch.object(common_public, "read_envelope", side_effect=tracked_read):
+          phase_patch = (patch.object(common_protocol.ActorVerifier, "fetch_actor", side_effect=identity)
+                         if phase == "identity" else
+                         patch.object(CommonPublicStore, "store_post", side_effect=failure)
+                         if phase == "failure" else patch.object(self.app, "debug", False))
+          with phase_patch:
+            task = asyncio.create_task(cycle.run_asgi(self.app))
+            try:
+              await asyncio.wait_for(fallback_started.wait(), 1)
+              gc.collect()
+              self.assertFalse(task.done())  # Native server fallback still waits.
+              self.assertEqual(drain_calls, 1 if phase == "identity" else 2)
+              self.assertEqual(len(envelope_refs), 1)
+              self.assertIsNone(envelope_refs[0]())
+              self.assertTrue(all(ref() is None for ref in error_refs))
+              if phase == "failure":
+                self.assertEqual(len(error_refs), 1)
+              self.assertEqual(len(cycle.body), 0)
+              self.assertNotIn("common_envelope_max_bytes", scope.get("state", {}))
+              # Inspect the actual suspended coroutine chain, not just HTTPX's
+              # incomplete-response assertion: only Uvicorn's small500 remains.
+              current, frames = task.get_coro(), []
+              while current is not None:
+                frame = getattr(current, "cr_frame", None)
+                if frame is not None:
+                  frames.append((frame.f_code.co_name, frame.f_locals))
+                current = getattr(current, "cr_await", None)
+              self.assertTrue(any(name == "send_500_response" for name, _ in frames))
+              self.assertFalse(any(name in ("read_envelope", "post_to_board", "handle", "reserve")
+                                   for name, _ in frames))
+              self.assertFalse(any(isinstance(value, (TrackedEnvelope, TrackedFailure))
+                                   for _, local in frames for value in local.values()))
+              self.assertEqual(list(admission._used.values()), [0, 0])
+              # Retry while the native fallback is STILL flow-control blocked,
+              # not only after the socket task has completed. Restore only our
+              # induced fixture stall/failure for these real signed requests.
+              with patch.object(common_protocol.ActorVerifier, "fetch_actor", original_fetch), \
+                   patch.object(CommonPublicStore, "store_post", original_store):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+                  self.assertEqual((await client.post("/api/common/board", content=raw)).status_code, 200)
+                  self.assertEqual((await client.post("/api/common/directory/search", content=self.signed_raw(
+                    kind="directory_read", q=""))).status_code, 200)
+              self.assertFalse(task.done())
+              self.assertEqual(list(admission._used.values()), [0, 0])
+            finally:
+              unblock.set()
+              await asyncio.wait_for(task, 1)
+          self.assertTrue(cycle.response_complete)
+          self.assertTrue(cycle.response_started)
+          self.assertIn(b'Internal Server Error', b''.join(
+            call.args[0] for call in transport.write.call_args_list))
 
   async def test_two_identity_waits_do_not_queue_third_body_or_block_small_controls(self):
     entered = set()
