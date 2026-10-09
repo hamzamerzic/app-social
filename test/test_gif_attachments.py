@@ -1,5 +1,6 @@
 """Animation originals use one bounded validator across all Common content."""
 
+import asyncio
 import base64
 import io
 import json
@@ -14,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -293,7 +295,9 @@ class PublicEnvelopeAdmissionTests(unittest.TestCase):
           verified.assert_not_awaited()
           gif.assert_not_called()
           self.assertLess(peak, 6 * len(raw) + 2 * 1024 * 1024)
-        self.assertEqual(response.json()["detail"], "Envelope JSON is too complex.")
+        self.assertEqual(response.json()["detail"],
+                         "Request body is too large." if path == "/api/common/directory"
+                         else "Envelope JSON is too complex.")
       self.assertEqual(sorted(p.relative_to(root) for p in Path(root).rglob('*') if p.is_file()), before)
 
   def test_public_handler_keeps_malformed_400_and_signed_unknown_fields(self):
@@ -309,6 +313,253 @@ class PublicEnvelopeAdmissionTests(unittest.TestCase):
       response = client.post("/api/common/board", json=_signed(key, body))
       self.assertEqual(response.status_code, 200, response.text)
       self.assertEqual(store.board_image(body["id"])[0].read_bytes(), animation())
+
+
+class PublicRequestLifetimeTests(unittest.IsolatedAsyncioTestCase):
+  async def asyncSetUp(self):
+    fixture = tempfile.TemporaryDirectory()
+    self.addCleanup(fixture.cleanup)
+    self.root = Path(fixture.name)
+    self.store = CommonPublicStore(self.root)
+    self.keys = {}
+    self.actors = {}
+    for host in ("large-a.example", "large-b.example", "member.example"):
+      self.store.register(host, host.split('.')[0], "")
+      self.keys[host] = _peer(self.root, host)
+      self.actors[host] = common_protocol.ActorVerifier(self.root)._read_cached(host)
+    self.app = community_host.create_app(self.root)
+    self.post_id = str(uuid.uuid4())
+    self.store.store_post({"id": self.post_id, "host": "large-b.example",
+                           "text": "Parent", "created_at": time.time(), "replies": []})
+
+  def signed_raw(self, host="member.example", kind="board_post", **fields):
+    body = {"v": 0, "type": kind, "from": host, "id": str(uuid.uuid4()),
+            "text": "Caption", "sent_at": time.time(), **fields}
+    return json.dumps(_signed(self.keys[host], body), separators=(",", ":")).encode()
+
+  def observed_body(self, raw, chunk_size=None):
+    reads = []
+
+    async def stream():
+      size = chunk_size or len(raw)
+      for start in range(0, len(raw), size):
+        chunk = raw[start:start + size]
+        reads.append(len(chunk))
+        yield chunk
+
+    return stream(), reads
+
+  async def test_two_identity_waits_do_not_queue_third_body_or_block_small_controls(self):
+    entered = set()
+    ready = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetch(host, **kwargs):
+      if host.startswith("large-"):
+        entered.add(host)
+        if len(entered) == 2:
+          ready.set()
+        await release.wait()
+      return self.actors[host]
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+      with patch.object(common_protocol.ActorVerifier, "fetch_actor", side_effect=fetch):
+        first = self.signed_raw("large-a.example", extra="a" * (1024 * 1024))
+        second = self.signed_raw("large-b.example", "board_reply", post_id=self.post_id,
+                                 extra="b" * (1024 * 1024))
+        tasks = [asyncio.create_task(client.post("/api/common/board", content=first)),
+                 asyncio.create_task(client.post("/api/common/board/reply", content=second))]
+        try:
+          await asyncio.wait_for(ready.wait(), 5)
+          raw = self.signed_raw(extra="c" * (1024 * 1024))
+          stream, reads = self.observed_body(raw)
+          response = await client.post("/api/common/board", content=stream)
+          self.assertEqual(response.status_code, 503)
+          self.assertEqual(response.headers["Retry-After"], "1")
+          self.assertEqual(reads, [])
+          # Method mismatches must not become an admission503 or inner-error500.
+          for path in ("/api/common/board/media/abcdef12.gif", "/api/common/directory/avatars/a"):
+            stream, reads = self.observed_body(raw)
+            mismatch = await client.post(path, content=stream)
+            self.assertEqual(mismatch.status_code, 405)
+            self.assertIn("GET", mismatch.headers["Allow"])
+            self.assertEqual(reads, [])
+          control = await client.post("/api/common/directory/search", content=self.signed_raw(
+            kind="directory_read", q=""))
+          self.assertEqual(control.status_code, 200)
+          self.assertEqual((await client.get("/api/common/board")).status_code, 200)
+          self.assertEqual((await client.get("/api/common/board/media/abcdef12.gif")).status_code, 404)
+          # Claimed content type and Content-Length cannot widen a control route.
+          oversize = b'{"type":"board_post","extra":"' + b'a' * (1024 * 1024) + b'"}'
+          for chunk_size in (4096, len(oversize)):
+            stream, reads = self.observed_body(oversize, chunk_size)
+            with patch.object(common_protocol.json, "loads") as decoded:
+              tracemalloc.start()
+              try:
+                rejected = await client.post("/api/common/directory/search", content=stream,
+                                             headers={"Content-Length": "2"})
+                _, peak = tracemalloc.get_traced_memory()
+              finally:
+                tracemalloc.stop()
+              self.assertEqual(rejected.status_code, 413)
+              decoded.assert_not_called()
+            self.assertLess(peak, 512 * 1024)  # Never copy the oversized chunk.
+            self.assertLessEqual(len(reads), 9)
+          tasks[0].cancel()
+          await asyncio.gather(tasks[0], return_exceptions=True)
+          stream, reads = self.observed_body(raw)
+          retried = await client.post("/api/common/board", content=stream)
+          self.assertEqual(retried.status_code, 200, retried.text)
+          self.assertEqual(sum(reads), len(raw))
+          release.set()
+          self.assertEqual((await tasks[1]).status_code, 200)
+        finally:
+          release.set()
+          for task in tasks:
+            task.cancel()
+          await asyncio.gather(*tasks, return_exceptions=True)
+
+  async def test_control_budget_is_finite_and_independent_of_content_reservations(self):
+    import common_public
+    entered = 0
+    ready, release = asyncio.Event(), asyncio.Event()
+
+    async def fetch(host, **kwargs):
+      nonlocal entered
+      if host == "large-a.example":
+        entered += 1
+        if entered == common_public.MAX_PUBLIC_CONTROL_REQUESTS:
+          ready.set()
+        await release.wait()
+      return self.actors[host]
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+      with patch.object(common_protocol.ActorVerifier, "fetch_actor", side_effect=fetch):
+        raw = self.signed_raw("large-a.example", "directory_read", q="")
+        tasks = [asyncio.create_task(client.post("/api/common/directory/search", content=raw))
+                 for _ in range(common_public.MAX_PUBLIC_CONTROL_REQUESTS)]
+        try:
+          await asyncio.wait_for(ready.wait(), 5)
+          stream, reads = self.observed_body(raw)
+          rejected = await client.post("/api/common/directory/search", content=stream)
+          self.assertEqual(rejected.status_code, 503)
+          self.assertEqual(reads, [])
+          response = await client.post("/api/common/board", content=self.signed_raw())
+          self.assertEqual(response.status_code, 200)
+          tasks[0].cancel()
+          await asyncio.gather(tasks[0], return_exceptions=True)
+          release.set()
+          retried = await client.post("/api/common/directory/search", content=raw)
+          self.assertEqual(retried.status_code, 200)
+          self.assertTrue(all(response.status_code == 200 for response in await asyncio.gather(*tasks[1:])))
+        finally:
+          release.set()
+          for task in tasks:
+            task.cancel()
+          await asyncio.gather(*tasks, return_exceptions=True)
+
+  async def test_success_error_and_cancelled_response_sends_hold_then_release_capacity(self):
+    entered = 0
+    statuses = []
+    ready, release = asyncio.Event(), asyncio.Event()
+
+    async def app(scope, receive, send):
+      async def observed_send(message):
+        nonlocal entered
+        if message["type"] == "http.response.start" and (b'x-hold-send', b'yes') in scope["headers"]:
+          statuses.append(message["status"])
+          entered += 1
+          if entered == 2:
+            ready.set()
+          await release.wait()
+        await send(message)
+      await self.app(scope, receive, observed_send)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      tasks = [asyncio.create_task(client.post("/api/common/board", content=self.signed_raw(),
+                                               headers={"x-hold-send": "yes"})),
+               asyncio.create_task(client.post("/api/common/board", content=b'{',
+                                               headers={"x-hold-send": "yes"}))]
+      try:
+        await asyncio.wait_for(ready.wait(), 5)
+        self.assertEqual(sorted(statuses), [200, 400])
+        raw = self.signed_raw()
+        stream, reads = self.observed_body(raw)
+        self.assertEqual((await client.post("/api/common/board", content=stream)).status_code, 503)
+        self.assertEqual(reads, [])
+        tasks[0].cancel()
+        await asyncio.gather(tasks[0], return_exceptions=True)
+        self.assertEqual((await client.post("/api/common/board", content=raw)).status_code, 200)
+        release.set()
+        self.assertEqual((await tasks[1]).status_code, 400)
+        # An unexpected handler exception must release too, without suppressing it.
+        with patch.object(CommonPublicStore, "store_post", side_effect=RuntimeError("fixture failure")):
+          with self.assertRaisesRegex(RuntimeError, "fixture failure"):
+            await client.post("/api/common/board", content=self.signed_raw())
+        self.assertEqual((await client.post("/api/common/board", content=self.signed_raw())).status_code, 200)
+      finally:
+        release.set()
+        for task in tasks:
+          task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+  async def test_unhandled_failure_tracebacks_remain_admitted_until_500_is_sent(self):
+    await self.check_unhandled_failure_response_lifetime(debug=False)
+
+  async def test_debug_failure_tracebacks_remain_admitted_until_500_is_sent(self):
+    await self.check_unhandled_failure_response_lifetime(debug=True)
+
+  async def check_unhandled_failure_response_lifetime(self, *, debug):
+    self.app.debug = debug
+    entered = 0
+    ready, release = asyncio.Event(), asyncio.Event()
+
+    async def app(scope, receive, send):
+      async def blocked_send(message):
+        nonlocal entered
+        if message["type"] == "http.response.start" and (b'x-hold-send', b'yes') in scope["headers"]:
+          self.assertEqual(message["status"], 500)
+          entered += 1
+          if entered == 2:
+            ready.set()
+          await release.wait()
+        await send(message)
+      await self.app(scope, receive, blocked_send)
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+      raw = self.signed_raw(extra="a" * (1024 * 1024))
+      with patch.object(CommonPublicStore, "store_post", side_effect=RuntimeError("fixture failure")):
+        tasks = [asyncio.create_task(client.post("/api/common/board", content=raw,
+                                                headers={"x-hold-send": "yes"})) for _ in range(2)]
+        try:
+          await asyncio.wait_for(ready.wait(), 5)
+          stream, reads = self.observed_body(raw)
+          rejected = await client.post("/api/common/board", content=stream)
+          self.assertEqual(rejected.status_code, 503)
+          self.assertEqual(reads, [])
+          tasks[0].cancel()
+          await asyncio.gather(tasks[0], return_exceptions=True)
+          # A cancelled 500 send also releases its held reservation.
+          retry = await client.post("/api/common/board", content=raw)
+          self.assertEqual(retry.status_code, 500)
+          if debug:
+            self.assertIn("fixture failure", retry.text)
+          else:
+            self.assertEqual(retry.text, "Internal Server Error")
+          release.set()
+          response = await tasks[1]
+          self.assertEqual(response.status_code, 500)
+          if debug:
+            self.assertIn("fixture failure", response.text)
+          else:
+            self.assertEqual(response.text, "Internal Server Error")
+        finally:
+          release.set()
+          for task in tasks:
+            task.cancel()
+          await asyncio.gather(*tasks, return_exceptions=True)
+      self.assertEqual((await client.post("/api/common/board", content=raw)).status_code, 200)
 
 
 class CanonicalGifTests(unittest.TestCase):

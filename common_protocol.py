@@ -22,7 +22,7 @@ from typing import Any
 from fastapi import HTTPException, Request
 
 from common_transport import federation_request
-from service_io import atomic_write, read_capped_body
+from service_io import atomic_write
 
 PROTOCOL = "common/0"
 PUBLIC_SERVICE_PATH = "/api/app-services/social"
@@ -426,7 +426,18 @@ def _preflight_envelope_structure(document: str) -> None:
 
 async def read_envelope(request: Request) -> dict:
   """Read one bounded envelope without letting Starlette buffer it first."""
-  body = await read_capped_body(request, MAX_ATTACHMENT_ENVELOPE_BYTES)
+  # The public router reserves this allowance for the complete request lifetime.
+  # Its route-owned state also caps control streams before JSON materialization;
+  # neither an untrusted Content-Length nor the document's type grants room.
+  state = getattr(request, "state", None)
+  limit = getattr(state, "common_envelope_max_bytes", MAX_ATTACHMENT_ENVELOPE_BYTES)
+  body = bytearray()
+  async for chunk in request.stream():
+    # Reject even one oversized chunk before copying it into our body buffer.
+    if len(chunk) > limit - len(body):
+      raise HTTPException(status_code=413, detail="Request body is too large.")
+    body.extend(chunk)
+  body = bytes(body)
   try:
     # Match json.loads(bytes)' UTF-8/16/32 handling exactly, and retain only
     # one decoded source. No containers exist until the resource check passes.

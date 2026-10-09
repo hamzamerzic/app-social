@@ -98,6 +98,21 @@ either resource bound returns HTTP 413 (`Envelope JSON is too complex.`), even
 if the over-budget document is also malformed. Within budget, stdlib JSON stays
 authoritative and malformed JSON returns HTTP 400. Source, signing and original
 image bytes are not rewritten. Control envelopes still have their 32 KiB cap.
+The standalone Community public router also admits at most two attachment-writing
+POSTs (`/board` and `/board/reply`) and eight independent control POSTs at once.
+It reserves before reading and holds capacity through verification and response
+sending, releasing on completion, error or cancellation. Control bodies are
+stream-capped at 32 KiB regardless of claimed type or Content-Length; each content
+reservation allows 60 MiB. The router therefore admits at most 120 MiB + 256 KiB
+of wire bodies, not an unbounded queue of decoded envelopes awaiting peer keys.
+Busy capacity returns HTTP 503 (`Community request capacity is busy.`) with
+`Retry-After: 1`, before reading the body; a caller may retry its unchanged request
+after capacity is released. No automatic retry is added. GET/media reads use no
+reservation. These are per-router/process bounds, not a deployment-wide RSS cap;
+decoded scalars, image work and multiple server processes need their own headroom.
+The frozen standalone host uses FastAPI's default/debug error policy. Custom 500/error
+hooks require moving lifetime admission outside the outer error-middleware layer;
+they are not covered by this router-local bound.
 Community GIF posts/replies require explicit `gif_attachments: true`; discovery
 and the signed write share a bounded deadline. Numeric media-limit discovery
 also checks that the Community host accepts the selected original and total

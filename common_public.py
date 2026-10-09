@@ -36,6 +36,8 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, Response
+from fastapi.routing import APIRoute
+from starlette.middleware.errors import ServerErrorMiddleware
 from PIL import Image, ImageOps
 
 from common_protocol import (
@@ -76,6 +78,8 @@ BOARD_PAGE_LIMIT = 50
 BOARD_REPLY_LIMIT = 200
 BOARD_LIKE_LIMIT = 2000
 DIRECTORY_LIMIT = 2000
+MAX_PUBLIC_CONTENT_REQUESTS = 2
+MAX_PUBLIC_CONTROL_REQUESTS = 8
 # A member avatar URL is its content hash, so it never changes. A board image
 # never changes either, but its post can be deleted or moderated: a browser may
 # keep what it already showed for a day, while shared caches such as the site's
@@ -1509,6 +1513,39 @@ async def verify_named_member(
   return actor
 
 
+class _PublicEnvelopeAdmission:
+  """Reserve bounded wire capacity without queuing bodies awaiting identity.
+
+  Each public router owns two 60 MiB content reservations and eight independent
+  32 KiB control reservations. Hold the reservation through ASGI response send,
+  not merely decoding: peer verification can await while retaining the envelope.
+  A lock makes the nonwaiting accounting safe across threads and event loops.
+  """
+
+  def __init__(self):
+    self._lock = threading.Lock()
+    self._limits = {
+      MAX_ATTACHMENT_ENVELOPE_BYTES: MAX_PUBLIC_CONTENT_REQUESTS,
+      MAX_ENVELOPE_BYTES: MAX_PUBLIC_CONTROL_REQUESTS,
+    }
+    self._used = dict.fromkeys(self._limits, 0)
+
+  @contextmanager
+  def reserve(self, body_limit: int):
+    with self._lock:
+      if self._used[body_limit] >= self._limits[body_limit]:
+        raise HTTPException(
+          status_code=503, detail="Community request capacity is busy.",
+          headers={"Retry-After": "1"},
+        )
+      self._used[body_limit] += 1
+    try:
+      yield
+    finally:
+      with self._lock:
+        self._used[body_limit] -= 1
+
+
 def create_public_router(
   store: CommonPublicStore, verifier: ActorVerifier, *, prefix: str = "",
   on_activity=None, on_register=None,
@@ -1521,7 +1558,34 @@ def create_public_router(
   changes the peer-facing response. ``on_register(host)`` is likewise awaited
   after each directory registration (the host refreshes the member's avatar).
   """
-  router = APIRouter(prefix=prefix, tags=["common-public"])
+  admission = _PublicEnvelopeAdmission()
+  content_paths = {f"{prefix}/board", f"{prefix}/board/reply"}
+
+  class AdmittedEnvelopeRoute(APIRoute):
+    async def handle(self, scope, receive, send):
+      if scope["method"] != "POST" or "POST" not in (self.methods or ()):
+        return await super().handle(scope, receive, send)
+      body_limit = (MAX_ATTACHMENT_ENVELOPE_BYTES if self.path in content_paths
+                    else MAX_ENVELOPE_BYTES)
+      with admission.reserve(body_limit):
+        state = scope.setdefault("state", {})
+        state["common_envelope_max_bytes"] = body_limit
+        try:
+          # Unhandled exceptions otherwise retain the decoded envelope in an
+          # outer 500-response traceback after releasing this reservation.
+          # Keep Community's default/debug 500 policy inside the reservation;
+          # Starlette re-raises after sending, so failures are not suppressed
+          # and the outer middleware will not send an already-started response.
+          # This host has no custom 500 hooks. Adding one requires moving the
+          # admission outside the app's outer error layer to avoid a second call.
+          await ServerErrorMiddleware(
+            super().handle, debug=scope["app"].debug,
+          )(scope, receive, send)
+        finally:
+          state.pop("common_envelope_max_bytes", None)
+
+  router = APIRouter(prefix=prefix, tags=["common-public"],
+                     route_class=AdmittedEnvelopeRoute)
 
   @router.get("/directory")
   def reject_public_directory():
