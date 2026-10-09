@@ -110,9 +110,10 @@ Busy capacity returns HTTP 503 (`Community request capacity is busy.`) with
 after capacity is released. No automatic retry is added. GET/media reads use no
 reservation. These are per-router/process bounds, not a deployment-wide RSS cap;
 decoded scalars, image work and multiple server processes need their own headroom.
-The frozen standalone host uses FastAPI's default/debug error policy. Custom 500/error
-hooks require moving lifetime admission outside the outer error-middleware layer;
-they are not covered by this router-local bound.
+The strict lifetime contract covers the frozen standalone host's default
+`debug=False` error policy. Debug HTML may be rendered again by outer error
+middleware after release. Custom 500/error hooks likewise require admission
+outside that outer layer; neither is covered by this router-local resource bound.
 Community GIF posts/replies require explicit `gif_attachments: true`; discovery
 and the signed write share a bounded deadline. Numeric media-limit discovery
 also checks that the Community host accepts the selected original and total

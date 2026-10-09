@@ -1573,11 +1573,13 @@ def create_public_router(
         try:
           # Unhandled exceptions otherwise retain the decoded envelope in an
           # outer 500-response traceback after releasing this reservation.
-          # Keep Community's default/debug 500 policy inside the reservation;
+          # Keep Community's default 500 send inside the reservation;
           # Starlette re-raises after sending, so failures are not suppressed
           # and the outer middleware will not send an already-started response.
           # This host has no custom 500 hooks. Adding one requires moving the
           # admission outside the app's outer error layer to avoid a second call.
+          # Native debug rendering is preserved, but outer HTML re-rendering
+          # after release is outside this frozen debug=False resource contract.
           await ServerErrorMiddleware(
             super().handle, debug=scope["app"].debug,
           )(scope, receive, send)
