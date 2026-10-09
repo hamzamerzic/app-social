@@ -35,6 +35,25 @@ for (const [label, list, prefix, record] of [
   })
 }
 
+for (const [label, list, prefix] of [
+  ['groups', listGroups, 'groups/'],
+  ['direct messages', listConversations, 'conversations/'],
+]) {
+  test(`${label} reload the server copy so a delivered message appears without a refresh`, async () => {
+    // A change-counter bump reloads the list; a cache-first read would repaint
+    // the previous metadata (unread 1) and hide the newly delivered message.
+    globalThis.window = { mobius: { storage: {
+      async list() { return [{ name: 'one', type: 'directory' }] },
+      async get() { return { unread: 1, last_text: 'older' } },
+      async getWithVersion(path) {
+        assert.equal(path, `${prefix}one/meta.json`)
+        return { value: { unread: 2, last_text: 'just arrived' }, version: 'v2' }
+      },
+    } } }
+    assert.deepEqual(await list(), [{ unread: 2, last_text: 'just arrived' }])
+  })
+}
+
 test('opening a newly created group reads its exact fresh metadata without a directory refresh', async () => {
   const group = { gid: 'new-group', name: 'Planning', members: [] }
   globalThis.window = { mobius: { storage: {
