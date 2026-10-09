@@ -197,12 +197,24 @@ export const getPeerAvatars = (hosts, { background = false, digests = {} } = {})
 
 // ── conversation storage (each side keeps only its own copy) ────────────────
 
+// Conversation lists reload because the server's change counter moved, so read
+// the server's copy. A cache-first get() would repaint the previous metadata and
+// hand the new copy only to watchers, leaving a delivered message (and its
+// unread count) invisible until a manual refresh. Offline, the versioned read
+// still answers from the device copy.
+function readCurrent(store, path) {
+  if (typeof store.getWithVersion !== 'function') return store.get(path)
+  return store.getWithVersion(path).then(result => result?.value ?? null)
+}
+
 async function listMetadata(prefix) {
   const store = window.mobius?.storage
   if (!store) throw new Error('Conversation storage is unavailable.')
   const entries = await store.list(prefix)
   const directories = entries.filter(entry => entry.type === 'directory')
-  const records = await Promise.all(directories.map(entry => store.get(`${prefix}${entry.name}/meta.json`)))
+  const records = await Promise.all(
+    directories.map(entry => readCurrent(store, `${prefix}${entry.name}/meta.json`)),
+  )
   return records.filter(Boolean)
 }
 
