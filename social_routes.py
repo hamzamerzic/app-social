@@ -62,14 +62,13 @@ import re
 import time
 import uuid
 import weakref
-from email.utils import formatdate
 from pathlib import Path
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from common_protocol import (
@@ -165,8 +164,8 @@ def _serve_image(found):
   return CommonPublicStore.serve_image(found, cache_control=OWNER_BOARD_IMAGE_CACHE)
 
 
-class _PinnedBoardMediaResponse(StreamingResponse):
-  """Stream an opened cache inode, even if its name is evicted before send."""
+class _PinnedBoardMediaResponse(FileResponse):
+  """Keep native file/range responses bound to the opened cache inode."""
 
   def __init__(self, found: tuple[Path, str]):
     path, mime = found
@@ -175,13 +174,12 @@ class _PinnedBoardMediaResponse(StreamingResponse):
       stat = os.fstat(opened.fileno())
       self.fetched_at = stat.st_mtime
       super().__init__(
-        iter(lambda: opened.read(64 * 1024), b""), media_type=mime,
+        f"/proc/self/fd/{opened.fileno()}", media_type=mime,
+        stat_result=stat,
         headers={
           "cache-control": OWNER_BOARD_IMAGE_CACHE,
           "etag": f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"',
-          "last-modified": formatdate(stat.st_mtime, usegmt=True),
           "x-content-type-options": "nosniff",
-          "content-length": str(stat.st_size),
         },
       )
     except BaseException:
@@ -196,6 +194,12 @@ class _PinnedBoardMediaResponse(StreamingResponse):
 
   async def __call__(self, scope, receive, send):
     try:
+      # pathsend can defer opening until after this response releases its fd.
+      if "http.response.pathsend" in scope.get("extensions", {}):
+        scope = {**scope, "extensions": {
+          key: value for key, value in scope["extensions"].items()
+          if key != "http.response.pathsend"
+        }}
       await super().__call__(scope, receive, send)
     finally:
       self.close()

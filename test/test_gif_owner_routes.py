@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 import httpx
 from fastapi import HTTPException
+from fastapi.responses import FileResponse
 from PIL import Image
 
 os.environ.setdefault("APP_STORAGE_DIR", "/tmp/social-gif-owner-tests")
@@ -40,7 +41,7 @@ class GifOwnerRoutes(unittest.IsolatedAsyncioTestCase):
   def response(self, body):
     return httpx.Response(200, json=body, request=httpx.Request("GET", "https://community.example/board"))
 
-  async def send_asgi(self, response, send=None):
+  async def send_asgi(self, response, send=None, *, headers=(), extensions=None):
     messages = []
     async def collect(message):
       messages.append(message)
@@ -48,7 +49,11 @@ class GifOwnerRoutes(unittest.IsolatedAsyncioTestCase):
         await send(message)
     async def receive():
       await asyncio.Event().wait()
-    await response({"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}}, receive, collect)
+    await response({
+      "type": "http", "method": "GET", "headers": list(headers),
+      "asgi": {"version": "3.0", "spec_version": "2.4"},
+      "extensions": extensions or {},
+    }, receive, collect)
     return messages
 
   async def test_evicted_gif_response_streams_exact_bytes_and_releases_its_file(self):
@@ -65,9 +70,10 @@ class GifOwnerRoutes(unittest.IsolatedAsyncioTestCase):
     ):
       first = await routes.get_board_media_for_owner("abcdef12", mime="image/gif", db=None, principal=self.principal)
       self.assertFalse(first._opened.closed)
+      ranged = await routes.get_board_media_for_owner("abcdef12", mime="image/gif", db=None, principal=self.principal)
       second = await routes.get_board_media_for_owner("abcdef34", mime="image/png", db=None, principal=self.principal)
       self.assertFalse((Path(directory) / f"{routes._peer_board_media_name(routes.COMMUNITY_HOST, 'abcdef12')}.gif").exists())
-      messages = await self.send_asgi(first)
+      messages = await self.send_asgi(first, extensions={"http.response.pathsend": {}})
       self.assertEqual(b"".join(m.get("body", b"") for m in messages[1:]), gif)
       self.assertEqual(messages[0]["status"], 200)
       headers = dict(messages[0]["headers"])
@@ -78,8 +84,90 @@ class GifOwnerRoutes(unittest.IsolatedAsyncioTestCase):
       self.assertIn(b"last-modified", headers)
       self.assertEqual(headers[b"x-content-type-options"], b"nosniff")
       self.assertTrue(first._opened.closed)
+      range_messages = await self.send_asgi(ranged, headers=[(b"range", b"bytes=2-5")])
+      self.assertEqual(range_messages[0]["status"], 206)
+      self.assertEqual(b"".join(m.get("body", b"") for m in range_messages[1:]), gif[2:6])
+      self.assertEqual(dict(range_messages[0]["headers"])[b"content-range"], b"bytes 2-5/20")
+      self.assertTrue(ranged._opened.closed)
       await self.send_asgi(second)
       self.assertTrue(second._opened.closed)
+
+  async def test_full_size_gif_stays_byte_exact_after_cache_eviction(self):
+    small = base64.b64decode(self.attachment["data_b64"])
+    target_size = 20 * 1024 * 1024
+    budget = target_size - len(small) - 3  # comment marker and terminator
+    blocks = (budget + 255) // 256
+    payload, extra = divmod(budget - blocks, blocks)
+    comment = (bytes([payload + 1]) + b"g" * (payload + 1)) * extra
+    comment += (bytes([payload]) + b"g" * payload) * (blocks - extra)
+    gif = small[:-1] + b"\x21\xfe" + comment + b"\x00;"
+    self.assertEqual(len(gif), target_size)
+    Image.open(io.BytesIO(gif)).verify()
+    with (
+      tempfile.TemporaryDirectory() as directory,
+      patch.object(routes, "_peer_board_media_dir", return_value=Path(directory)),
+      patch.object(routes, "_require_owner_or_common_app"),
+      patch.object(routes, "_download_board_media", new=AsyncMock(side_effect=[
+        ("image/gif", gif), ("image/png", b"\x89PNG"),
+      ])),
+    ):
+      first = await routes.get_board_media_for_owner("abcdef12", db=None, principal=self.principal)
+      second = await routes.get_board_media_for_owner("abcdef34", db=None, principal=self.principal)
+      self.assertFalse(Path(first._opened.name).exists())
+      messages = await self.send_asgi(first)
+      self.assertEqual(b"".join(m.get("body", b"") for m in messages[1:]), gif)
+      self.assertTrue(first._opened.closed)
+      await self.send_asgi(second)
+
+  async def test_cached_ranges_match_native_file_response(self):
+    data = b"GIF89a" + bytes(range(32))
+    with (
+      tempfile.TemporaryDirectory() as directory,
+      patch.object(routes, "_peer_board_media_dir", return_value=Path(directory)),
+      patch.object(routes, "_require_owner_or_common_app"),
+      patch.object(routes, "_download_board_media", new=AsyncMock(return_value=("image/gif", data))),
+    ):
+      baseline_path = Path(directory) / ".baseline.gif"
+      baseline_path.write_bytes(data)
+      for range_value, if_range in (
+        (None, None), ("bytes=2-5", None), ("bytes=6-", None),
+        ("bytes=-4", None), ("bytes=0-1,5-7", None),
+        ("bytes=2-5", "match"), ("bytes=2-5", "mismatch"),
+        ("bytes=2-5", "date-match"), ("bytes=2-5", "date-mismatch"),
+        ("garbage", None), ("bytes=99-100", None),
+      ):
+        with self.subTest(range=range_value, if_range=if_range):
+          cached = await routes.get_board_media_for_owner("abcdef12", db=None, principal=self.principal)
+          native = FileResponse(baseline_path, media_type="image/gif", headers={
+            "cache-control": routes.OWNER_BOARD_IMAGE_CACHE,
+            "x-content-type-options": "nosniff",
+          })
+          request_headers = [] if range_value is None else [(b"range", range_value.encode())]
+          cached_headers = list(request_headers)
+          native_headers = list(request_headers)
+          if if_range is not None:
+            # Native FileResponse computes its ETag at send time.
+            native.set_stat_headers(baseline_path.stat())
+            if if_range == "match":
+              cached_if_range, native_if_range = cached.headers["etag"], native.headers["etag"]
+            elif if_range == "date-match":
+              cached_if_range, native_if_range = cached.headers["last-modified"], native.headers["last-modified"]
+            elif if_range == "date-mismatch":
+              cached_if_range = native_if_range = "Wed, 01 Jan 2020 00:00:00 GMT"
+            else:
+              cached_if_range = native_if_range = '"other"'
+            cached_headers.append((b"if-range", cached_if_range.encode()))
+            native_headers.append((b"if-range", native_if_range.encode()))
+          with patch("starlette.responses.token_hex", return_value="fixed-boundary"):
+            expected = await self.send_asgi(native, headers=native_headers)
+            actual = await self.send_asgi(cached, headers=cached_headers)
+          self.assertEqual(actual[0]["status"], expected[0]["status"])
+          self.assertEqual(b"".join(m.get("body", b"") for m in actual[1:]),
+                           b"".join(m.get("body", b"") for m in expected[1:]))
+          actual_headers, expected_headers = dict(actual[0]["headers"]), dict(expected[0]["headers"])
+          for header in (b"content-type", b"content-length", b"content-range", b"accept-ranges", b"cache-control"):
+            self.assertEqual(actual_headers.get(header), expected_headers.get(header), header)
+          self.assertTrue(cached._opened.closed)
 
   async def test_cached_response_releases_file_on_failed_or_cancelled_send_and_abandonment(self):
     with (
