@@ -130,6 +130,12 @@ AVATAR_MAX_PIXELS = 8_000_000
 # case the post is deleted.
 OWNER_BOARD_IMAGE_CACHE = "private, max-age=86400"
 BOARD_MEDIA_CACHE_TTL_S = 24 * 3600
+# Peer board media is a regenerable cache. The TTL only decides when a cached
+# file is refreshed while its peer is reachable; an expired copy is still served
+# when the peer is offline, so age alone never evicts. The byte cap bounds
+# growth with the number of peers by evicting least-recently used full-size
+# originals first, then thumbnails (the board's fast path).
+BOARD_MEDIA_CACHE_MAX_BYTES = 16 * 1024 * 1024
 REQUEST_STATES = {"pending", "accepted", "declined", "blocked"}
 
 
@@ -301,6 +307,47 @@ def _peer_board_media_dir() -> Path:
 def _peer_board_media_name(host: str, post_id: str) -> str:
   safe_host = re.sub(r"[^a-z0-9.-]", "_", host)
   return f"{safe_host}-{post_id}"
+
+
+def _mark_board_media_used(path: Path) -> None:
+  """Record a cache hit for LRU eviction without touching freshness.
+
+  Recency lives in atime, set explicitly so relatime/noatime mounts don't hide
+  it; mtime stays the fetch time that the freshness TTL reads.
+  """
+  try:
+    stat = path.stat()
+    os.utime(path, (time.time(), stat.st_mtime))
+  except OSError:
+    pass
+
+
+def _evict_peer_board_media(cache_dir: Path, keep: Path) -> None:
+  """Bring the cache under its byte cap, never on age alone.
+
+  Full-size originals go before thumbnails, least recently used first, so an
+  offline peer's older photos keep serving from cache until space is needed.
+  """
+  entries = []
+  for path in cache_dir.iterdir():
+    if path.name.startswith(".") or not path.is_file() or path == keep:
+      continue
+    try:
+      stat = path.stat()
+    except OSError:
+      continue
+    last_used = max(stat.st_atime, stat.st_mtime)
+    is_thumbnail = path.stem.endswith("-thumb")
+    entries.append((is_thumbnail, last_used, stat.st_size, path))
+  try:
+    total = keep.stat().st_size + sum(entry[2] for entry in entries)
+  except OSError:
+    return
+  for _is_thumbnail, _last_used, size, path in sorted(entries):
+    if total <= BOARD_MEDIA_CACHE_MAX_BYTES:
+      break
+    path.unlink(missing_ok=True)
+    total -= size
 
 
 def _own_host() -> str:
@@ -1925,6 +1972,7 @@ async def _serve_owner_board_media(
     cached is not None
     and time.time() - cached[0].stat().st_mtime < BOARD_MEDIA_CACHE_TTL_S
   ):
+    _mark_board_media_used(cached[0])
     return _serve_image(cached)
   suffix = (
     _board_media_path("thumbnail", post_id, index, "webp") if thumbnail
@@ -1953,10 +2001,16 @@ async def _serve_owner_board_media(
       old = cache_dir / f"{stem}.{ext}"
       if old != target and old.is_file():
         old.unlink()
+    try:
+      _evict_peer_board_media(cache_dir, target)
+    except OSError:
+      pass
     cached = (target, mime)
   except Exception:
     if cached is None:
       raise HTTPException(status_code=404, detail="Board image not found.")
+    # The peer is unreachable: the expired copy is still the best answer.
+    _mark_board_media_used(cached[0])
   return _serve_image(cached)
 
 
