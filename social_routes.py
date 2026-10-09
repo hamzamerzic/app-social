@@ -346,6 +346,23 @@ def _peer_board_media_dir() -> Path:
   return path
 
 
+@asynccontextmanager
+async def _peer_board_media_lock(cache_dir: Path):
+  """Serialize cache writes, eviction, and pinning across service processes."""
+  # Never unlink this inode: two processes could otherwise lock different files.
+  with (cache_dir / ".media.lock").open("a+b") as handle:
+    while True:
+      try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+      except BlockingIOError:
+        await asyncio.sleep(0.02)
+    try:
+      yield
+    finally:
+      fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _peer_board_media_name(host: str, post_id: str) -> str:
   safe_host = re.sub(r"[^a-z0-9.-]", "_", host)
   return f"{safe_host}-{post_id}"
@@ -369,6 +386,7 @@ def _evict_peer_board_media(cache_dir: Path, keep: Path) -> None:
 
   Full-size originals go before thumbnails, least recently used first, so an
   offline peer's older photos keep serving from cache until space is needed.
+  Runtime callers hold _peer_board_media_lock through eviction and response pin.
   """
   entries = []
   for path in cache_dir.iterdir():
@@ -2009,17 +2027,19 @@ async def _serve_owner_board_media(
   stem = base_stem if index is None else f"{base_stem}-{index}"
   if thumbnail:
     stem = f"{stem}-thumb"
-  cached = _find_image(cache_dir, stem)
+  cached = None
   cached_response = None
-  if cached is not None:
-    try:
-      cached_response = _PinnedBoardMediaResponse(cached)
-    except OSError:
-      cached = None
-    else:
-      if time.time() - cached_response.fetched_at < BOARD_MEDIA_CACHE_TTL_S:
-        _mark_board_media_used(cached[0])
-        return cached_response
+  async with _peer_board_media_lock(cache_dir):
+    cached = _find_image(cache_dir, stem)
+    if cached is not None:
+      try:
+        cached_response = _PinnedBoardMediaResponse(cached)
+      except OSError:
+        cached = None
+      else:
+        if time.time() - cached_response.fetched_at < BOARD_MEDIA_CACHE_TTL_S:
+          _mark_board_media_used(cached[0])
+          return cached_response
   suffix = (
     _board_media_path("thumbnail", post_id, index, "webp") if thumbnail
     else _board_media_path(
@@ -2042,16 +2062,17 @@ async def _serve_owner_board_media(
       # Re-encode after the header-size guard before caching or serving them.
       mime, data = image_thumbnail_bytes(data)
     target = cache_dir / f"{stem}.{_ATTACHMENT_MIME_EXT[mime]}"
-    atomic_write(target, data)
-    for _old_mime, ext in _ATTACHMENT_MIME_EXT.items():
-      old = cache_dir / f"{stem}.{ext}"
-      if old != target and old.is_file():
-        old.unlink()
-    try:
-      _evict_peer_board_media(cache_dir, target)
-    except OSError:
-      pass
-    response = _PinnedBoardMediaResponse((target, mime))
+    async with _peer_board_media_lock(cache_dir):
+      atomic_write(target, data)
+      for _old_mime, ext in _ATTACHMENT_MIME_EXT.items():
+        old = cache_dir / f"{stem}.{ext}"
+        if old != target and old.is_file():
+          old.unlink()
+      try:
+        _evict_peer_board_media(cache_dir, target)
+      except OSError:
+        pass
+      response = _PinnedBoardMediaResponse((target, mime))
   except asyncio.CancelledError:
     if cached_response is not None:
       cached_response.close()

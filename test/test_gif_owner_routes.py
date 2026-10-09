@@ -5,6 +5,8 @@ import gc
 import io
 import os
 import random
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -40,6 +42,18 @@ class GifOwnerRoutes(unittest.IsolatedAsyncioTestCase):
 
   def response(self, body):
     return httpx.Response(200, json=body, request=httpx.Request("GET", "https://community.example/board"))
+
+  def full_size_gif(self):
+    small = base64.b64decode(self.attachment["data_b64"])
+    target_size = 20 * 1024 * 1024
+    budget = target_size - len(small) - 3  # comment marker and terminator
+    blocks = (budget + 255) // 256
+    payload, extra = divmod(budget - blocks, blocks)
+    comment = (bytes([payload + 1]) + b"g" * (payload + 1)) * extra
+    comment += (bytes([payload]) + b"g" * payload) * (blocks - extra)
+    gif = small[:-1] + b"\x21\xfe" + comment + b"\x00;"
+    self.assertEqual(len(gif), target_size)
+    return gif
 
   async def send_asgi(self, response, send=None, *, headers=(), extensions=None):
     messages = []
@@ -93,15 +107,7 @@ class GifOwnerRoutes(unittest.IsolatedAsyncioTestCase):
       self.assertTrue(second._opened.closed)
 
   async def test_full_size_gif_stays_byte_exact_after_cache_eviction(self):
-    small = base64.b64decode(self.attachment["data_b64"])
-    target_size = 20 * 1024 * 1024
-    budget = target_size - len(small) - 3  # comment marker and terminator
-    blocks = (budget + 255) // 256
-    payload, extra = divmod(budget - blocks, blocks)
-    comment = (bytes([payload + 1]) + b"g" * (payload + 1)) * extra
-    comment += (bytes([payload]) + b"g" * payload) * (blocks - extra)
-    gif = small[:-1] + b"\x21\xfe" + comment + b"\x00;"
-    self.assertEqual(len(gif), target_size)
+    gif = self.full_size_gif()
     Image.open(io.BytesIO(gif)).verify()
     with (
       tempfile.TemporaryDirectory() as directory,
@@ -118,6 +124,88 @@ class GifOwnerRoutes(unittest.IsolatedAsyncioTestCase):
       self.assertEqual(b"".join(m.get("body", b"") for m in messages[1:]), gif)
       self.assertTrue(first._opened.closed)
       await self.send_asgi(second)
+
+  async def test_other_process_cannot_evict_download_between_write_and_pin(self):
+    gif = self.full_size_gif()
+    child_code = r"""
+import asyncio, sys, time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+import social_routes as routes
+
+root = Path(sys.argv[1])
+written, ready, done = (root / name for name in (".written", ".ready", ".done"))
+real_lock = routes._peer_board_media_lock
+entries = [0]
+@asynccontextmanager
+async def observed_lock(cache_dir):
+    entries[0] += 1
+    if entries[0] == 2:
+        ready.touch()
+    async with real_lock(cache_dir):
+        yield
+async def download(*args, **kwargs):
+    (root / ".download-ready").touch()
+    deadline = time.monotonic() + 10
+    while not written.exists():
+        if time.monotonic() > deadline:
+            raise TimeoutError("parent did not finish cache write")
+        await asyncio.sleep(.005)
+    return "image/png", b"\x89PNG"
+async def run():
+    with patch.object(routes, "_peer_board_media_dir", return_value=root), patch.object(
+        routes, "_download_board_media", side_effect=download
+    ), patch.object(routes, "_peer_board_media_lock", observed_lock):
+        response = await routes._serve_owner_board_media(routes.COMMUNITY_HOST, "abcdef34", None)
+        response.close()
+asyncio.run(run())
+done.touch()
+"""
+    with (
+      tempfile.TemporaryDirectory() as directory,
+      patch.object(routes, "_peer_board_media_dir", return_value=Path(directory)),
+      patch.object(routes, "_download_board_media", new=AsyncMock(return_value=("image/gif", gif))),
+    ):
+      root = Path(directory)
+      original_write = routes.atomic_write
+      interleaved = []
+      def pause_after_write(path, data):
+        original_write(path, data)
+        (root / ".written").touch()
+        deadline = time.monotonic() + 10
+        while not (root / ".ready").exists():
+          if time.monotonic() > deadline:
+            raise TimeoutError("child did not start cache write")
+          time.sleep(.005)
+        # The child has reached the normal writer and would evict this
+        # oversized original without the cross-process critical section.
+        time.sleep(.15)
+        interleaved.append((root / ".done").exists())
+      child = subprocess.Popen(
+        [sys.executable, "-c", child_code, directory],
+        cwd=str(Path(__file__).resolve().parent.parent),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+      )
+      try:
+        deadline = time.monotonic() + 10
+        while not (root / ".download-ready").exists():
+          if time.monotonic() > deadline:
+            raise TimeoutError("child did not reach download barrier")
+          time.sleep(.005)
+        with patch.object(routes, "atomic_write", side_effect=pause_after_write):
+          first = await routes._serve_owner_board_media(routes.COMMUNITY_HOST, "abcdef12", None)
+        stdout, stderr = child.communicate(timeout=15)
+        self.assertEqual(child.returncode, 0, stdout + stderr)
+      finally:
+        if child.poll() is None:
+          child.kill()
+        child.communicate()
+      self.assertEqual(interleaved, [False])
+      self.assertFalse(Path(first._opened.name).exists())
+      messages = await self.send_asgi(first)
+      self.assertEqual(b"".join(m.get("body", b"") for m in messages[1:]), gif)
+      self.assertTrue(first._opened.closed)
 
   async def test_cached_ranges_match_native_file_response(self):
     data = b"GIF89a" + bytes(range(32))
