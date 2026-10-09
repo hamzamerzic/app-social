@@ -61,13 +61,15 @@ import os
 import re
 import time
 import uuid
+import weakref
+from email.utils import formatdate
 from pathlib import Path
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from common_protocol import (
@@ -161,6 +163,42 @@ def _serve_image(found):
   # Social's own sandboxed frame gets a fresh browser cache per launch, so it
   # also keeps thumbnails in app storage (boardMediaCache.js).
   return CommonPublicStore.serve_image(found, cache_control=OWNER_BOARD_IMAGE_CACHE)
+
+
+class _PinnedBoardMediaResponse(StreamingResponse):
+  """Stream an opened cache inode, even if its name is evicted before send."""
+
+  def __init__(self, found: tuple[Path, str]):
+    path, mime = found
+    opened = path.open("rb")
+    try:
+      stat = os.fstat(opened.fileno())
+      self.fetched_at = stat.st_mtime
+      super().__init__(
+        iter(lambda: opened.read(64 * 1024), b""), media_type=mime,
+        headers={
+          "cache-control": OWNER_BOARD_IMAGE_CACHE,
+          "etag": f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"',
+          "last-modified": formatdate(stat.st_mtime, usegmt=True),
+          "x-content-type-options": "nosniff",
+          "content-length": str(stat.st_size),
+        },
+      )
+    except BaseException:
+      opened.close()
+      raise
+    self._opened = opened
+    # An uninvoked response has no ASGI lifecycle to release its descriptor.
+    self._finalizer = weakref.finalize(self, opened.close)
+
+  def close(self) -> None:
+    self._finalizer()
+
+  async def __call__(self, scope, receive, send):
+    try:
+      await super().__call__(scope, receive, send)
+    finally:
+      self.close()
 
 
 def _identity_path() -> Path:
@@ -1968,12 +2006,16 @@ async def _serve_owner_board_media(
   if thumbnail:
     stem = f"{stem}-thumb"
   cached = _find_image(cache_dir, stem)
-  if (
-    cached is not None
-    and time.time() - cached[0].stat().st_mtime < BOARD_MEDIA_CACHE_TTL_S
-  ):
-    _mark_board_media_used(cached[0])
-    return _serve_image(cached)
+  cached_response = None
+  if cached is not None:
+    try:
+      cached_response = _PinnedBoardMediaResponse(cached)
+    except OSError:
+      cached = None
+    else:
+      if time.time() - cached_response.fetched_at < BOARD_MEDIA_CACHE_TTL_S:
+        _mark_board_media_used(cached[0])
+        return cached_response
   suffix = (
     _board_media_path("thumbnail", post_id, index, "webp") if thumbnail
     else _board_media_path(
@@ -2005,13 +2047,20 @@ async def _serve_owner_board_media(
       _evict_peer_board_media(cache_dir, target)
     except OSError:
       pass
-    cached = (target, mime)
+    response = _PinnedBoardMediaResponse((target, mime))
+  except asyncio.CancelledError:
+    if cached_response is not None:
+      cached_response.close()
+    raise
   except Exception:
-    if cached is None:
+    if cached_response is None:
       raise HTTPException(status_code=404, detail="Board image not found.")
     # The peer is unreachable: the expired copy is still the best answer.
     _mark_board_media_used(cached[0])
-  return _serve_image(cached)
+    return cached_response
+  if cached_response is not None:
+    cached_response.close()
+  return response
 
 
 @router.get("/board-media/{post_id}")

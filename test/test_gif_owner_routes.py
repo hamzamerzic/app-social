@@ -1,10 +1,14 @@
 """New animations fail closed against old hosts without weakening write deadlines."""
 import asyncio
 import base64
+import gc
 import io
 import os
 import random
+import tempfile
+import time
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 import httpx
 from fastapi import HTTPException
@@ -35,6 +39,129 @@ class GifOwnerRoutes(unittest.IsolatedAsyncioTestCase):
 
   def response(self, body):
     return httpx.Response(200, json=body, request=httpx.Request("GET", "https://community.example/board"))
+
+  async def send_asgi(self, response, send=None):
+    messages = []
+    async def collect(message):
+      messages.append(message)
+      if send is not None:
+        await send(message)
+    async def receive():
+      await asyncio.Event().wait()
+    await response({"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}}, receive, collect)
+    return messages
+
+  async def test_evicted_gif_response_streams_exact_bytes_and_releases_its_file(self):
+    gif = b"GIF89a" + b"g" * 14
+    png = b"\x89PNG" + b"p" * 8
+    with (
+      tempfile.TemporaryDirectory() as directory,
+      patch.object(routes, "_peer_board_media_dir", return_value=Path(directory)),
+      patch.object(routes, "BOARD_MEDIA_CACHE_MAX_BYTES", 16),
+      patch.object(routes, "_require_owner_or_common_app"),
+      patch.object(routes, "_download_board_media", new=AsyncMock(side_effect=[
+        ("image/gif", gif), ("image/png", png),
+      ])),
+    ):
+      first = await routes.get_board_media_for_owner("abcdef12", mime="image/gif", db=None, principal=self.principal)
+      self.assertFalse(first._opened.closed)
+      second = await routes.get_board_media_for_owner("abcdef34", mime="image/png", db=None, principal=self.principal)
+      self.assertFalse((Path(directory) / f"{routes._peer_board_media_name(routes.COMMUNITY_HOST, 'abcdef12')}.gif").exists())
+      messages = await self.send_asgi(first)
+      self.assertEqual(b"".join(m.get("body", b"") for m in messages[1:]), gif)
+      self.assertEqual(messages[0]["status"], 200)
+      headers = dict(messages[0]["headers"])
+      self.assertEqual(headers[b"content-type"], b"image/gif")
+      self.assertEqual(headers[b"content-length"], str(len(gif)).encode())
+      self.assertEqual(headers[b"cache-control"], routes.OWNER_BOARD_IMAGE_CACHE.encode())
+      self.assertIn(b"etag", headers)
+      self.assertIn(b"last-modified", headers)
+      self.assertEqual(headers[b"x-content-type-options"], b"nosniff")
+      self.assertTrue(first._opened.closed)
+      await self.send_asgi(second)
+      self.assertTrue(second._opened.closed)
+
+  async def test_cached_response_releases_file_on_failed_or_cancelled_send_and_abandonment(self):
+    with (
+      tempfile.TemporaryDirectory() as directory,
+      patch.object(routes, "_peer_board_media_dir", return_value=Path(directory)),
+      patch.object(routes, "_require_owner_or_common_app"),
+      patch.object(routes, "_download_board_media", new=AsyncMock(return_value=("image/gif", b"GIF89a"))),
+    ):
+      async def fail(message):
+        if message["type"] == "http.response.body":
+          raise RuntimeError("send failed")
+      response = await routes.get_board_media_for_owner("abcdef12", db=None, principal=self.principal)
+      with self.assertRaises(RuntimeError):
+        await self.send_asgi(response, fail)
+      self.assertTrue(response._opened.closed)
+
+      blocked = asyncio.Event()
+      async def stall(message):
+        if message["type"] == "http.response.body":
+          blocked.set()
+          await asyncio.Event().wait()
+      response = await routes.get_board_media_for_owner("abcdef12", db=None, principal=self.principal)
+      task = asyncio.create_task(self.send_asgi(response, stall))
+      await blocked.wait()
+      task.cancel()
+      with self.assertRaises(asyncio.CancelledError):
+        await task
+      self.assertTrue(response._opened.closed)
+
+      response = await routes.get_board_media_for_owner("abcdef12", db=None, principal=self.principal)
+      opened = response._opened
+      del response
+      gc.collect()
+      self.assertTrue(opened.closed)
+
+  async def test_expired_cached_media_survives_refresh_replacement_and_offline_failure(self):
+    old, new = b"GIF89a-old", b"GIF89a-new"
+    with (
+      tempfile.TemporaryDirectory() as directory,
+      patch.object(routes, "_peer_board_media_dir", return_value=Path(directory)),
+      patch.object(routes, "_require_owner_or_common_app"),
+    ):
+      path = Path(directory) / f"{routes._peer_board_media_name(routes.COMMUNITY_HOST, 'abcdef12')}.gif"
+      path.write_bytes(old)
+      existing = await routes.get_board_media_for_owner("abcdef12", db=None, principal=self.principal)
+      expired = time.time() - routes.BOARD_MEDIA_CACHE_TTL_S - 10
+      os.utime(path, (expired, expired))
+      started, release = asyncio.Event(), asyncio.Event()
+      async def download(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return "image/gif", new
+      with patch.object(routes, "_download_board_media", side_effect=download):
+        task = asyncio.create_task(routes.get_board_media_for_owner("abcdef12", db=None, principal=self.principal))
+        await started.wait()
+        # A different cache writer replaces the path while this refresh waits.
+        path.unlink()
+        release.set()
+        refreshed = await task
+      self.assertEqual(b"".join(m.get("body", b"") for m in (await self.send_asgi(existing))[1:]), old)
+      self.assertEqual(b"".join(m.get("body", b"") for m in (await self.send_asgi(refreshed))[1:]), new)
+      self.assertTrue(existing._opened.closed)
+      self.assertTrue(refreshed._opened.closed)
+
+      os.utime(path, (expired, expired))
+      with patch.object(routes, "_download_board_media", side_effect=RuntimeError("offline")):
+        fallback = await routes.get_board_media_for_owner("abcdef12", db=None, principal=self.principal)
+      self.assertEqual(b"".join(m.get("body", b"") for m in (await self.send_asgi(fallback))[1:]), new)
+      self.assertTrue(fallback._opened.closed)
+
+      # A refreshed format replaces the old name without invalidating a
+      # response already opened on the previous format.
+      os.utime(path, None)
+      prior_format = await routes.get_board_media_for_owner("abcdef12", db=None, principal=self.principal)
+      os.utime(path, (expired, expired))
+      with patch.object(routes, "_download_board_media", new=AsyncMock(return_value=("image/png", b"png-new"))):
+        changed = await routes.get_board_media_for_owner("abcdef12", db=None, principal=self.principal)
+      self.assertFalse(path.exists())
+      self.assertEqual(b"".join(m.get("body", b"") for m in (await self.send_asgi(prior_format))[1:]), new)
+      self.assertEqual(b"".join(m.get("body", b"") for m in (await self.send_asgi(changed))[1:]), b"png-new")
+      self.assertTrue(prior_format._opened.closed)
+      self.assertTrue(changed._opened.closed)
 
   async def test_existing_reply_posters_above_new_output_budget_remain_readable(self):
     original = Image.frombytes("RGB", (640, 640), random.Random(1).randbytes(640 * 640 * 3))
