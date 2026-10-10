@@ -68,8 +68,10 @@ function normalizedIntent(kind, values = {}, legacyThumbnail = false) {
     // reading those exact drafts, but require the current 120 KiB limit for
     // anything newly created or saved.
     const thumbnailLimit = legacyThumbnail ? 1_050_000 : THUMBNAIL_MAX_BYTES
-    const thumbnails = values.thumbnails == null ? null : normalizedAttachments(values.thumbnails, thumbnailLimit)
-    if (values.thumbnails != null && !thumbnails) return null
+    const hasThumbnails = values.thumbnails != null
+      && !(Array.isArray(values.thumbnails) && values.thumbnails.length === 0)
+    const thumbnails = hasThumbnails ? normalizedAttachments(values.thumbnails, thumbnailLimit) : null
+    if (hasThumbnails && !thumbnails) return null
     if (thumbnails) intent.thumbnails = thumbnails
     const attachments = values.attachments == null ? null : normalizedAttachments(values.attachments)
     if (values.attachments != null && !attachments) return null
@@ -101,6 +103,13 @@ function normalizedIntent(kind, values = {}, legacyThumbnail = false) {
 
 export function createParticipationIntent(kind, values = {}) {
   return normalizedIntent(kind, values)
+}
+
+// Completion describes what was explicitly sent, including an accepted older
+// draft's local previews. It cannot create/save a new oversized preview, and
+// clearing still requires exact saved-intent matching and a conditional write.
+export function completedParticipationIntent(kind, values = {}) {
+  return normalizedIntent(kind, values, true)
 }
 
 export function parseParticipationIntent(value) {

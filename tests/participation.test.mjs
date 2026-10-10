@@ -3,10 +3,12 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 
 import { setToken, postReply } from '../api.js'
-import { GIF_MAX_BYTES, IMAGE_MAX_BYTES, THUMBNAIL_MAX_BYTES } from '../media_limits.js'
+import { attachmentBytes, galleryFitsMediaLimits, GIF_MAX_BYTES, IMAGE_MAX_BYTES, THUMBNAIL_MAX_BYTES } from '../media_limits.js'
+import { boardPostFitsWireLimit } from '../board_payload.js'
+import { upsertReplyAttempt } from '../reconciliation.js'
 import {
   PARTICIPATION_INTENT_PATH, accountHandoff, clearParticipationIntent,
-  createParticipationIntent, loadParticipationIntent, participationActionLabel, participationStep,
+  completedParticipationIntent, createParticipationIntent, loadParticipationIntent, participationActionLabel, participationStep,
   participationIntentMatches, saveParticipationIntent,
 } from '../participation.js'
 
@@ -35,6 +37,151 @@ function memoryStorage() {
 function media(mime, bytes) {
   return { mime, data_b64: Buffer.alloc(bytes, 65).toString('base64'), w: 40, h: 30 }
 }
+
+// Execute the real resume/submit/clear handlers without a network publication
+// or a copied implementation. The surrounding React state is fixture-owned.
+function handler(source, name, async = false) {
+  const start = source.indexOf(`  ${async ? 'async ' : ''}function ${name}(`)
+  assert.notEqual(start, -1)
+  return source.slice(start, source.indexOf('\n  }', start) + 4)
+}
+
+async function restoredBoard(saved, { fail = false } = {}) {
+  const storage = memoryStorage()
+  await storage.durableWrite(PARTICIPATION_INTENT_PATH, saved, { ifNoneMatch: true })
+  const loaded = await loadParticipationIntent(storage)
+  const board = readFileSync(new URL('../ui/Board.jsx', import.meta.url), 'utf8')
+  const app = readFileSync(new URL('../index.jsx', import.meta.url), 'utf8')
+  const sent = [], completions = [], errors = []
+  const env = {
+    participationIntent: loaded, canInteract: true, feed: [{ id: saved.post_id }],
+    draft: '', selectedImages: [], replyDraft: '', replyImage: null, replyPost: null,
+    replyMessageId: 'reply-id', replySending: false, handoffBusy: false, preparingReplyImage: false,
+    me: { host: 'test.invalid', handle: 'test' },
+    window: { mobius: { storage } }, crypto: { randomUUID: () => 'reply-id' },
+    galleryFitsMediaLimits, boardPostFitsWireLimit, attachmentBytes, THUMBNAIL_MAX_BYTES,
+    completedParticipationIntent, participationIntentMatches, clearParticipationIntent, loadParticipationIntent,
+    upsertReplyAttempt, replySendingRef: { current: false }, replyPostIdRef: { current: null },
+    replyDrafts: { current: new Map() }, replyCache: new Map(),
+    setDraft: value => { env.draft = value }, setSelectedImages: value => { env.selectedImages = value },
+    setReplyDraft: value => { env.replyDraft = value }, setReplyImage: value => { env.replyImage = value },
+    setReplyMessageId: value => { env.replyMessageId = value },
+    setParticipationIntent: value => { env.participationIntent = value },
+    setComposing() {}, markActivity() {}, setPosting() {}, setPending() {}, setReplies() {}, onPostConfirmed: undefined,
+    setReplySending() {}, rememberReplies() {}, onRefresh() {}, async loadReplies() {},
+    showToast: message => errors.push(message),
+    openReplies(post, { text, image }) {
+      env.replyPost = post; env.replyDraft = text; env.replyImage = image
+      env.replyPostIdRef.current = post.id
+    },
+    async prepareImage() { throw new Error('Restored original must not be recompressed') },
+    async publishPost(text, attachment, attachments, thumbnails) {
+      sent.push({ text, attachment, attachments, thumbnails })
+      for (const thumb of thumbnails || []) assert.ok(attachmentBytes(thumb) <= THUMBNAIL_MAX_BYTES)
+      if (fail) throw new Error('Publication failed')
+      return { id: 'post-id' }
+    },
+    async postReply(postId, text, { attachment, thumbnail }) {
+      sent.push({ postId, text, attachment, thumbnail })
+      if (thumbnail) assert.ok(attachmentBytes(thumbnail) <= THUMBNAIL_MAX_BYTES)
+      if (fail) throw new Error('Publication failed')
+      return { id: 'reply-id' }
+    },
+  }
+  const functions = [handler(board, 'resumeParticipation'), handler(board, 'collectImagePayloads', true),
+    handler(board, 'publish', true), handler(board, 'sendReply', true),
+    handler(app, 'completeParticipationIntent', true)].join('\n')
+  const actions = new Function('env', `with (env) { ${functions}; return {
+    resumeParticipation, publish, sendReply, completeParticipationIntent,
+  } }`)(env)
+  env.onCompleteParticipation = intent => { completions.push(actions.completeParticipationIntent(intent)) }
+  actions.resumeParticipation()
+  return { storage, env, sent, errors, actions, async submit() {
+    if (saved.kind === 'post') await actions.publish()
+    else await actions.sendReply({ preventDefault() {} })
+    await Promise.all(completions)
+  } }
+}
+
+test('restored originals without previews publish and clear the exact saved post', async () => {
+  for (const originals of [[media('image/gif', 1024)], [media('image/jpeg', 1024), media('image/png', 1024)]]) {
+    const saved = createParticipationIntent('post', { text: '  Saved caption  ',
+      ...(originals.length === 1 ? { attachment: originals[0] } : { attachments: originals }) })
+    const flow = await restoredBoard(saved)
+    await flow.submit()
+    assert.deepEqual(flow.errors, [])
+    assert.equal(flow.sent.length, 1)
+    assert.deepEqual(flow.sent[0].attachments || [flow.sent[0].attachment], originals)
+    assert.equal(flow.sent[0].thumbnails, undefined)
+    assert.equal(await loadParticipationIntent(flow.storage), null)
+    assert.equal(createParticipationIntent('post', { attachment: originals[0], thumbnails: [] }).thumbnails, undefined)
+    assert.equal(createParticipationIntent('post', { attachments: [] }), null)
+  }
+})
+
+test('accepted legacy previews resume, publish originals without oversized renditions and clear', async () => {
+  for (const kind of ['post', 'reply']) {
+    const original = media('image/png', 1024), thumbnail = media('image/webp', 200_000)
+    const saved = { version: 1, kind, text: 'Legacy caption', attachment: original,
+      ...(kind === 'reply' ? { post_id: 'post-1', thumbnail } : { thumbnails: [thumbnail] }) }
+    const flow = await restoredBoard(saved)
+    assert.deepEqual(flow.env.participationIntent, saved)
+    assert.equal(createParticipationIntent(kind, saved), null)
+    assert.equal(await saveParticipationIntent(flow.storage, saved), false)
+    await flow.submit()
+    assert.deepEqual(flow.errors, [])
+    assert.deepEqual(flow.sent[0].attachment, original)
+    assert.equal(flow.sent[0].thumbnail, undefined)
+    assert.equal(flow.sent[0].thumbnails, undefined)
+    assert.equal(await loadParticipationIntent(flow.storage), null)
+  }
+})
+
+test('failed restored publication keeps originals, caption and the durable draft', async () => {
+  for (const kind of ['post', 'reply']) {
+    const saved = createParticipationIntent(kind, { postId: 'post-1', text: 'Retry me', attachment: media('image/png', 100) })
+    const flow = await restoredBoard(saved, { fail: true })
+    await flow.submit()
+    assert.deepEqual(await loadParticipationIntent(flow.storage), saved)
+    assert.equal(kind === 'post' ? flow.env.draft : flow.env.replyDraft, saved.text)
+    assert.deepEqual(kind === 'post' ? flow.env.selectedImages[0].payload : flow.env.replyImage.payload, saved.attachment)
+    assert.deepEqual(flow.errors, ['Publication failed'])
+  }
+})
+
+test('restored current-budget previews stay on the wire and changed legacy previews do not consume the draft', async () => {
+  const attachment = media('image/png', 100)
+  for (const bytes of [THUMBNAIL_MAX_BYTES, 200_000]) {
+    const thumbnail = media('image/webp', bytes)
+    const saved = { version: 1, kind: 'post', text: 'Keep exact', attachment, thumbnails: [thumbnail] }
+    const flow = await restoredBoard(saved)
+    if (bytes > THUMBNAIL_MAX_BYTES) flow.env.selectedImages[0].thumbnailPayload = media('image/webp', bytes - 1)
+    await flow.submit()
+    if (bytes <= THUMBNAIL_MAX_BYTES) {
+      assert.deepEqual(flow.sent[0].thumbnails, [thumbnail])
+      assert.equal(await loadParticipationIntent(flow.storage), null)
+    } else {
+      assert.equal(flow.sent[0].thumbnails, undefined)
+      assert.deepEqual(await loadParticipationIntent(flow.storage), saved)
+    }
+  }
+})
+
+test('restored publication cannot clear changed content or a concurrent replacement draft', async () => {
+  const saved = createParticipationIntent('post', { text: 'Original', attachment: media('image/png', 100) })
+  for (const change of ['caption', 'image', 'storage']) {
+    const flow = await restoredBoard(saved)
+    let expected = saved
+    if (change === 'caption') flow.env.draft = 'Changed'
+    if (change === 'image') flow.env.selectedImages[0].payload = media('image/png', 101)
+    if (change === 'storage') {
+      expected = createParticipationIntent('post', { text: 'Another window' })
+      await flow.storage.durableWrite(PARTICIPATION_INTENT_PATH, expected, { ifMatch: 1 })
+    }
+    await flow.submit()
+    assert.deepEqual(await loadParticipationIntent(flow.storage), expected)
+  }
+})
 
 test('a maximum-size GIF and caption survive account handoff, reload and exact matching', async () => {
   const storage = memoryStorage()
