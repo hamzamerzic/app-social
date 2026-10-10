@@ -928,7 +928,7 @@ export default function Board({
       setPending((current) => current ? { ...current, phase: 'sending' } : current)
     } catch (error) {
       setPending(null)
-      setDraft(text)
+      setDraft(draftText)
       setSelectedImages(images)
       setComposing(true)
       setPosting(false)
@@ -973,7 +973,7 @@ export default function Board({
       }
     } catch (error) {
       setPending(null)
-      setDraft(text)
+      setDraft(draftText)
       setSelectedImages(images)
       setComposing(true)
       window.mobius?.signal?.('error', { message: error.message, source: 'publish' })

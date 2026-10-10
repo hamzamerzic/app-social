@@ -46,20 +46,25 @@ function handler(source, name, async = false) {
   return source.slice(start, source.indexOf('\n  }', start) + 4)
 }
 
-async function restoredBoard(saved, { fail = false } = {}) {
+async function restoredBoard(saved, { fail = false, failPreparation = false } = {}) {
   const storage = memoryStorage()
   await storage.durableWrite(PARTICIPATION_INTENT_PATH, saved, { ifNoneMatch: true })
   const loaded = await loadParticipationIntent(storage)
   const board = readFileSync(new URL('../ui/Board.jsx', import.meta.url), 'utf8')
   const app = readFileSync(new URL('../index.jsx', import.meta.url), 'utf8')
   const sent = [], completions = [], errors = []
+  let failedSends = 0, failedPreparations = 0
   const env = {
     participationIntent: loaded, canInteract: true, feed: [{ id: saved.post_id }],
     draft: '', selectedImages: [], replyDraft: '', replyImage: null, replyPost: null,
     replyMessageId: 'reply-id', replySending: false, handoffBusy: false, preparingReplyImage: false,
     me: { host: 'test.invalid', handle: 'test' },
     window: { mobius: { storage } }, crypto: { randomUUID: () => 'reply-id' },
-    galleryFitsMediaLimits, boardPostFitsWireLimit, attachmentBytes, THUMBNAIL_MAX_BYTES,
+    galleryFitsMediaLimits, attachmentBytes, THUMBNAIL_MAX_BYTES,
+    boardPostFitsWireLimit(values) {
+      if (failPreparation && failedPreparations++ === 0) throw new Error('Preparation failed')
+      return boardPostFitsWireLimit(values)
+    },
     completedParticipationIntent, participationIntentMatches, clearParticipationIntent, loadParticipationIntent,
     upsertReplyAttempt, replySendingRef: { current: false }, replyPostIdRef: { current: null },
     replyDrafts: { current: new Map() }, replyCache: new Map(),
@@ -78,13 +83,13 @@ async function restoredBoard(saved, { fail = false } = {}) {
     async publishPost(text, attachment, attachments, thumbnails) {
       sent.push({ text, attachment, attachments, thumbnails })
       for (const thumb of thumbnails || []) assert.ok(attachmentBytes(thumb) <= THUMBNAIL_MAX_BYTES)
-      if (fail) throw new Error('Publication failed')
+      if (fail && failedSends++ === 0) throw new Error('Publication failed')
       return { id: 'post-id' }
     },
     async postReply(postId, text, { attachment, thumbnail }) {
       sent.push({ postId, text, attachment, thumbnail })
       if (thumbnail) assert.ok(attachmentBytes(thumbnail) <= THUMBNAIL_MAX_BYTES)
-      if (fail) throw new Error('Publication failed')
+      if (fail && failedSends++ === 0) throw new Error('Publication failed')
       return { id: 'reply-id' }
     },
   }
@@ -146,6 +151,24 @@ test('failed restored publication keeps originals, caption and the durable draft
     assert.equal(kind === 'post' ? flow.env.draft : flow.env.replyDraft, saved.text)
     assert.deepEqual(kind === 'post' ? flow.env.selectedImages[0].payload : flow.env.replyImage.payload, saved.attachment)
     assert.deepEqual(flow.errors, ['Publication failed'])
+  }
+})
+
+test('preparation and send failures preserve the exact restored caption through a successful retry', async () => {
+  const saved = createParticipationIntent('post', {
+    text: '  Keep spaces  ', attachment: media('image/png', 100),
+  })
+  for (const failure of [{ failPreparation: true }, { fail: true }]) {
+    const flow = await restoredBoard(saved, failure)
+    await flow.submit()
+    assert.equal(flow.env.draft, saved.text)
+    assert.deepEqual(await loadParticipationIntent(flow.storage), saved)
+    assert.deepEqual(flow.env.selectedImages[0].payload, saved.attachment)
+    await flow.submit()
+    assert.equal(flow.sent.at(-1).text, saved.text.trim())
+    assert.deepEqual(flow.sent.at(-1).attachment, saved.attachment)
+    assert.equal(await loadParticipationIntent(flow.storage), null)
+    assert.equal(flow.errors.length, 1)
   }
 })
 
