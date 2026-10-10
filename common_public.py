@@ -31,17 +31,23 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, Response
+from fastapi.routing import APIRoute
+from starlette.middleware.errors import ServerErrorMiddleware
 from PIL import Image, ImageOps
 
 from common_protocol import (
   ATTACHMENT_MIME_EXT,
   CLOCK_SKEW_S,
   MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENT_ENVELOPE_BYTES,
+  MAX_STATIC_ATTACHMENT_BYTES,
+  MAX_THUMBNAIL_BYTES,
+  MAX_BOARD_TOTAL_ATTACHMENT_BYTES,
   MAX_ATTACHMENT_DIMENSION,
   MAX_AVATAR_BYTES,
   MAX_BOARD_ATTACHMENTS,
@@ -72,6 +78,13 @@ BOARD_PAGE_LIMIT = 50
 BOARD_REPLY_LIMIT = 200
 BOARD_LIKE_LIMIT = 2000
 DIRECTORY_LIMIT = 2000
+MAX_PUBLIC_CONTENT_REQUESTS = 2
+MAX_PUBLIC_CONTROL_REQUESTS = 8
+# Named-member verification can fetch five times when a key/handle changes and
+# the cache is full: two initial, one named-card refresh, two re-verification.
+# 12s receiving + five existing 10s fetch grants leaves 13s for bounded local
+# validation and response sending. Do not shorten any existing network grant.
+MAX_PUBLIC_REQUEST_SECONDS = 75.0
 # A member avatar URL is its content hash, so it never changes. A board image
 # never changes either, but its post can be deleted or moderated: a browser may
 # keep what it already showed for a day, while shared caches such as the site's
@@ -161,6 +174,15 @@ def image_thumbnail_bytes(
   a smaller cap). The same header/decompression-bomb guards run either way, so
   every caller re-encodes untrusted image bytes through one validated path.
   """
+  if data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
+    # Pillow concatenates comment metadata quadratically for a large legal
+    # comment chain. Validate the original, then render a comment-free view;
+    # the stored original and its signed bytes are never rewritten.
+    data = validate_gif_bytes({
+      "mime": "image/gif",
+      "w": int.from_bytes(data[6:8], "little"),
+      "h": int.from_bytes(data[8:10], "little"),
+    }, data)
   with _open_board_image(data) as opened:
     # Reject oversized inputs from their header before EXIF transposition or
     # decoding can allocate the full raster.
@@ -174,13 +196,23 @@ def image_thumbnail_bytes(
       image.mode == "P" and "transparency" in image.info
     )
     prepared = image.convert("RGBA" if has_alpha else "RGB")
-    output = io.BytesIO()
-    prepared.save(output, format="WEBP", quality=72, method=4)
-    return "image/webp", output.getvalue()
+    while True:
+      output = io.BytesIO()
+      prepared.save(output, format="WEBP", quality=72, method=4)
+      if output.tell() <= MAX_THUMBNAIL_BYTES:
+        return "image/webp", output.getvalue()
+      if max(prepared.size) <= 96:
+        raise ValueError("Board thumbnail is too detailed.")
+      prepared.thumbnail(
+        (max(1, int(prepared.width * 0.84)), max(1, int(prepared.height * 0.84))),
+        Image.Resampling.LANCZOS,
+      )
 
 
 def validate_thumbnail_bytes(wire: dict, data: bytes) -> None:
   """Verify a client-made thumbnail before it becomes served media."""
+  if len(data) > MAX_THUMBNAIL_BYTES:
+    raise HTTPException(status_code=413, detail="Board thumbnail is too large.")
   with _open_board_image(data) as image:
     _validate_image_header(image)
     if image.format == "GIF":
@@ -199,7 +231,7 @@ def validate_reply_original_bytes(wire: dict, data: bytes) -> None:
   if wire["mime"] == "image/gif":
     validate_gif_bytes(wire, data)
     return
-  if len(data) > MAX_ATTACHMENT_BYTES:
+  if len(data) > MAX_STATIC_ATTACHMENT_BYTES:
     raise HTTPException(status_code=413, detail="Reply photo is too large.")
   try:
     with _open_board_image(data) as image:
@@ -896,6 +928,10 @@ class CommonPublicStore:
     ``<id>.<ext>``. `attachments` also records a single `attachment` (its first
     image) so a reader that only understands one image still shows something.
     """
+    if attachment is not None and attachments and attachment[0] != attachments[0][0]:
+      raise HTTPException(status_code=400, detail="First post image does not match its gallery copy.")
+    if sum(len(data) for _, data in (attachments or ([attachment] if attachment else []))) > MAX_BOARD_TOTAL_ATTACHMENT_BYTES:
+      raise HTTPException(status_code=413, detail="Post images are too large together.")
     # Inspect all original headers before writing any media. Optional
     # thumbnail failures still preserve ordinary legacy image posts, but an
     # oversized raster must not leave an orphan image or become a fallback.
@@ -1398,6 +1434,14 @@ def read_board_page(
       next_cursor = _encode_board_cursor(*position)
   return {
     "capabilities": {"emoji_reactions": True, "reply_reactions": True, "image_thumbnails": True, "reply_attachments": True, "gif_attachments": True},
+    "media_limits": {
+      "gif_bytes": MAX_ATTACHMENT_BYTES,
+      "static_bytes": MAX_STATIC_ATTACHMENT_BYTES,
+      "combined_bytes": MAX_BOARD_TOTAL_ATTACHMENT_BYTES,
+      "thumbnail_bytes": MAX_THUMBNAIL_BYTES,
+      "max_images": MAX_BOARD_ATTACHMENTS,
+      "envelope_bytes": MAX_ATTACHMENT_ENVELOPE_BYTES,
+    },
     "posts": posts,
     "next_cursor": next_cursor,
   }
@@ -1474,6 +1518,51 @@ async def verify_named_member(
   return actor
 
 
+class _PublicEnvelopeAdmission:
+  """Reserve bounded wire capacity without queuing bodies awaiting identity.
+
+  Each public router owns two 60 MiB content reservations and eight independent
+  32 KiB control reservations. Hold the reservation through ASGI response send,
+  not merely decoding: peer verification can await while retaining the envelope.
+  A lock makes the nonwaiting accounting safe across threads and event loops.
+  """
+
+  def __init__(self):
+    self._lock = threading.Lock()
+    self._limits = {
+      MAX_ATTACHMENT_ENVELOPE_BYTES: MAX_PUBLIC_CONTENT_REQUESTS,
+      MAX_ENVELOPE_BYTES: MAX_PUBLIC_CONTROL_REQUESTS,
+    }
+    self._used = dict.fromkeys(self._limits, 0)
+
+  @asynccontextmanager
+  async def reserve(self, body_limit: int):
+    with self._lock:
+      if self._used[body_limit] >= self._limits[body_limit]:
+        raise HTTPException(
+          status_code=503, detail="Community request capacity is busy.",
+          headers={"Retry-After": "1"},
+        )
+      self._used[body_limit] += 1
+    lifetime = asyncio.timeout(MAX_PUBLIC_REQUEST_SECONDS)
+    try:
+      try:
+        async with lifetime:
+          yield
+      except TimeoutError:
+        if not lifetime.expired():
+          raise
+        # The absolute reservation budget is exhausted. Cancellation has already
+        # unwound the endpoint/response and freed its envelope. Return without
+        # another app error send or a media-retaining exception traceback.
+        # This bounds app data, not the server connection: Uvicorn may attempt
+        # its small fallback500 if response.start never completed. That server
+        # task holds neither our envelope nor a reservation; no app retry occurs.
+    finally:
+      with self._lock:
+        self._used[body_limit] -= 1
+
+
 def create_public_router(
   store: CommonPublicStore, verifier: ActorVerifier, *, prefix: str = "",
   on_activity=None, on_register=None,
@@ -1486,7 +1575,36 @@ def create_public_router(
   changes the peer-facing response. ``on_register(host)`` is likewise awaited
   after each directory registration (the host refreshes the member's avatar).
   """
-  router = APIRouter(prefix=prefix, tags=["common-public"])
+  admission = _PublicEnvelopeAdmission()
+  content_paths = {f"{prefix}/board", f"{prefix}/board/reply"}
+
+  class AdmittedEnvelopeRoute(APIRoute):
+    async def handle(self, scope, receive, send):
+      if scope["method"] != "POST" or "POST" not in (self.methods or ()):
+        return await super().handle(scope, receive, send)
+      body_limit = (MAX_ATTACHMENT_ENVELOPE_BYTES if self.path in content_paths
+                    else MAX_ENVELOPE_BYTES)
+      async with admission.reserve(body_limit):
+        state = scope.setdefault("state", {})
+        state["common_envelope_max_bytes"] = body_limit
+        try:
+          # Unhandled exceptions otherwise retain the decoded envelope in an
+          # outer 500-response traceback after releasing this reservation.
+          # Keep Community's default 500 send inside the reservation;
+          # Starlette re-raises after sending, so failures are not suppressed
+          # and the outer middleware will not send an already-started response.
+          # This host has no custom 500 hooks. Adding one requires moving the
+          # admission outside the app's outer error layer to avoid a second call.
+          # Native debug rendering is preserved, but outer HTML re-rendering
+          # after release is outside this frozen debug=False resource contract.
+          await ServerErrorMiddleware(
+            super().handle, debug=scope["app"].debug,
+          )(scope, receive, send)
+        finally:
+          state.pop("common_envelope_max_bytes", None)
+
+  router = APIRouter(prefix=prefix, tags=["common-public"],
+                     route_class=AdmittedEnvelopeRoute)
 
   @router.get("/directory")
   def reject_public_directory():
@@ -1673,12 +1791,12 @@ def create_public_router(
       raise HTTPException(status_code=400, detail="Post id is invalid.")
     if not valid_id(reply_id):
       raise HTTPException(status_code=400, detail="Reply id is invalid.")
-    text = envelope.get("text")
-    attachment = validate_attachment(envelope.get("attachment"))
-    thumbnail = validate_attachment(envelope.get("thumbnail"))
-    validate_text_or_attachment(text, attachment, "Reply text is invalid.", MAX_REPLY_TEXT_CHARS)
     validate_attachment_envelope_size(envelope)
     actor = await verify_named_member(store, verifier, envelope)
+    text = envelope.get("text")
+    attachment = validate_attachment(envelope.get("attachment"))
+    thumbnail = validate_attachment(envelope.get("thumbnail"), thumbnail=True)
+    validate_text_or_attachment(text, attachment, "Reply text is invalid.", MAX_REPLY_TEXT_CHARS)
     result = store.add_reply(
       post_id, reply_id, envelope["from"], actor["handle"],
       text, envelope["sent_at"], attachment, thumbnail,
@@ -1710,9 +1828,15 @@ def create_public_router(
     envelope = await read_envelope(request)
     if envelope.get("v") != 0 or envelope.get("type") != "board_post":
       raise HTTPException(status_code=400, detail="Unsupported envelope type.")
+    post_id = envelope.get("id")
+    if not valid_id(post_id):
+      raise HTTPException(status_code=400, detail="Post id is invalid.")
+    actor = await verify_named_member(store, verifier, envelope)
     attachment = validate_attachment(envelope.get("attachment"))
     attachments = validate_attachments(envelope.get("attachments"))
-    thumbnails = validate_attachments(envelope.get("thumbnails"))
+    if attachment is not None and attachments and attachment[0] != attachments[0][0]:
+      raise HTTPException(status_code=400, detail="First post image does not match its gallery copy.")
+    thumbnails = validate_attachments(envelope.get("thumbnails"), thumbnail=True)
     image_count = len(attachments) if attachments else (1 if attachment else 0)
     if thumbnails and len(thumbnails) != image_count:
       raise HTTPException(status_code=400, detail="Post thumbnails are invalid.")
@@ -1721,10 +1845,6 @@ def create_public_router(
     validate_text_or_attachment(
       text, first, "Post text is invalid.", MAX_POST_TEXT_CHARS,
     )
-    post_id = envelope.get("id")
-    if not valid_id(post_id):
-      raise HTTPException(status_code=400, detail="Post id is invalid.")
-    actor = await verify_named_member(store, verifier, envelope)
     store.store_post({
       "id": post_id,
       "host": envelope["from"],

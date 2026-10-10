@@ -1,17 +1,24 @@
 """Animation originals use one bounded validator across all Common content."""
 
+import asyncio
 import base64
+import gc
 import io
+import json
+import random
 import os
 import tempfile
 import time
+import tracemalloc
 import unittest
 import uuid
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
-from fastapi import HTTPException
+import httpx
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -57,6 +64,24 @@ def tiny_container(size=(1, 1), frames=1, *, broken_last=False):
   return bytes(header) + frame * (frames - 1) + bytes(last) + b";"
 
 
+def padded_gif(total_bytes, padding=b"x"):
+  """A fully framed, decodable GIF with legal comment sub-block padding."""
+  original = tiny_container()
+  overhead = 3  # extension introducer, comment label, terminator
+  room = total_bytes - len(original) - overhead
+  blocks = bytearray()
+  while room:
+    take = min(255, room - 1)
+    if room - take - 1 == 1:
+      take -= 1
+    if take <= 0:
+      raise ValueError("Cannot represent padding length")
+    blocks.append(take)
+    blocks.extend(padding * take)
+    room -= take + 1
+  return original[:-1] + b"\x21\xfe" + bytes(blocks) + b"\x00;"
+
+
 def invalid_gifs():
   small = tiny_container()
   # The first image descriptor follows this tiny global color table.
@@ -87,6 +112,803 @@ def invalid_gifs():
     )
     for mime in ("image/png", "image/jpeg", "image/webp")
   ] + [(wire(tiny_container(frames=2, broken_last=True), (1, 1)), 400)]
+
+
+def envelope_request(raw, chunk_size=64 * 1024):
+  position = 0
+
+  async def receive():
+    nonlocal position
+    chunk = raw[position:position + chunk_size]
+    position += len(chunk)
+    return {"type": "http.request", "body": chunk,
+            "more_body": position < len(raw)}
+
+  return Request({"type": "http", "method": "POST", "path": "/"}, receive)
+
+
+class EnvelopeAdmissionTests(unittest.IsolatedAsyncioTestCase):
+  async def assert_predecode_rejected(self, raw):
+    with patch.object(common_protocol.json, "loads") as decoded:
+      with self.assertRaises(HTTPException) as caught:
+        await common_protocol.read_envelope(envelope_request(raw))
+      self.assertEqual(caught.exception.status_code, 413)
+      self.assertEqual(caught.exception.detail, "Envelope JSON is too complex.")
+      decoded.assert_not_called()
+
+  async def test_dense_arrays_reject_before_decode_with_bounded_actual_read_memory(self):
+    # Allocate the original input before tracing, matching the reported attack.
+    raw = b'{"type":"board_post","extra":[' + b'[],' * 699999 + b'[]]}'
+    self.assertEqual(len(raw), 2_100_031)
+    tracemalloc.start()
+    try:
+      await self.assert_predecode_rejected(raw)
+      _, peak = tracemalloc.get_traced_memory()
+    finally:
+      tracemalloc.stop()
+    # Includes capped-body assembly and source decoding, not just the scanner.
+    # The old actual read materialized 700k lists and peaked at 49.3 MB.
+    self.assertLess(peak, 4 * len(raw) + 2 * 1024 * 1024)
+
+  async def test_entries_containers_and_duplicate_keys_all_spend_structure_budget(self):
+    for element in (b'[]', b'{}', b'0', b'1.25', b'true', b'null', b'"x"'):
+      raw = b'{"type":"board_post","extra":[' + (element + b',') * 33000 + element + b']}'
+      with self.subTest(element=element):
+        await self.assert_predecode_rejected(raw)
+    for entries in (
+      b'"duplicate":0,' * 17000,
+      b','.join(('"key%d":0' % n).encode() for n in range(17000)) + b',',
+    ):
+      await self.assert_predecode_rejected(b'{"type":"board_post","extra":{' + entries + b'"last":0}}')
+
+  async def test_exact_structure_and_depth_boundaries_are_inclusive(self):
+    # This wrapper uses seven punctuation characters; N scalars use N-1 commas.
+    count = common_protocol.MAX_ENVELOPE_STRUCTURE_TOKENS - 6
+    raw = b'{"type":"board_post","extra":[' + b'0,' * (count - 1) + b'0]}'
+    result = await common_protocol.read_envelope(envelope_request(raw))
+    self.assertEqual(len(result["extra"]), count)
+    await self.assert_predecode_rejected(raw[:-2] + b',0]}')
+    # The root object is container depth one.
+    for depth in (common_protocol.MAX_ENVELOPE_DEPTH, common_protocol.MAX_ENVELOPE_DEPTH + 1):
+      raw = b'{"type":"board_post","extra":' + b'[' * (depth - 1) + b'0' + b']' * (depth - 1) + b'}'
+      if depth == common_protocol.MAX_ENVELOPE_DEPTH:
+        await common_protocol.read_envelope(envelope_request(raw))
+      else:
+        await self.assert_predecode_rejected(raw)
+
+  async def test_admitted_dense_containers_have_a_small_allocation_ceiling(self):
+    count = (common_protocol.MAX_ENVELOPE_STRUCTURE_TOKENS - 6) // 3
+    raw = b'{"type":"board_post","extra":[' + b'[],' * (count - 1) + b'[]]}'
+    tracemalloc.start()
+    try:
+      result = await common_protocol.read_envelope(envelope_request(raw))
+      _, peak = tracemalloc.get_traced_memory()
+    finally:
+      tracemalloc.stop()
+    self.assertEqual(len(result["extra"]), count)
+    self.assertLess(peak, 3 * 1024 * 1024)
+
+  async def test_strings_escaping_unicode_and_stdlib_encodings_cannot_hide_structure(self):
+    value = {"type": "board_post", "extra": {
+      "escaped key \\\" {}[]:, 🪐": "{}[]:," * 6000 + '\\"\\\\🪐é\n\t',
+      "nested": [[], {}, [1, "\\\\\"", None]],
+    }}
+    for ensure_ascii in (True, False):
+      source = json.dumps(value, ensure_ascii=ensure_ascii)
+      for encoding in ("utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be",
+                       "utf-32", "utf-32-le", "utf-32-be"):
+        with self.subTest(ensure_ascii=ensure_ascii, encoding=encoding):
+          raw = source.encode(encoding)
+          self.assertEqual(await common_protocol.read_envelope(envelope_request(raw, 7)), value)
+    # Surrogate escapes and literal surrogate code units keep stdlib semantics.
+    for raw in (b'{"extra":"\\ud800"}', '{"extra":"\ud800"}'.encode("utf-16-le", "surrogatepass")):
+      self.assertEqual(await common_protocol.read_envelope(envelope_request(raw)), json.loads(raw))
+    attack = '{"type":"board_post","quoted":"\\\\\\\"[]{}:,","extra":[' + '[],' * 12000 + '[]]}'
+    for encoding in ("utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be",
+                     "utf-32", "utf-32-le", "utf-32-be"):
+      with self.subTest(attack_encoding=encoding):
+        await self.assert_predecode_rejected(attack.encode(encoding))
+
+  async def test_stdlib_remains_authoritative_for_malformed_and_compatible_json(self):
+    for raw in (b'', b'{', b'{"x":}', b'{"x":[}}', b'{"x":1,}', b'{} {}',
+                b'{"x":"unterminated}', b'{"x":"\\q"}', b'{"x":"\\u00xz"}',
+                b'{"x":"\x01"}', b'{"x":"\xff"}', b'{"x":01}', b'{"x":true false}',
+                b'[]', b'null', b'"scalar"'):
+      with self.subTest(raw=raw), self.assertRaises(HTTPException) as caught:
+        await common_protocol.read_envelope(envelope_request(raw))
+      self.assertEqual(caught.exception.status_code, 400)
+    for raw in (b'{"x":NaN,"y":Infinity,"z":-Infinity}',
+                b'{"type":"register","type":"board_post","extra":{}}',
+                b'{"\\u0074ype":"board_post","extra":[true,null,1.2e3]}'):
+      with patch.object(common_protocol.json, "loads", wraps=json.loads) as decoded:
+        result = await common_protocol.read_envelope(envelope_request(raw))
+        decoded.assert_called_once_with(raw.decode())
+      self.assertIsInstance(result, dict)
+    # A resource failure wins over later grammar errors; no unsafe fallback parse.
+    await self.assert_predecode_rejected(b'{"extra":[' + b'[],' * 12000 + b'bad JSON')
+
+  async def test_escape_dense_scalars_use_stdlib_string_work_not_python_per_escape(self):
+    # Inputs are prepared outside timing; each used to block the event loop for
+    # approximately 3.3-3.7s before any identity/content validation.
+    size = 16 * 1024 * 1024
+    for pair, value in ((b'\\n', '\n'), (b'\\"', '"'), (b'\\\\', '\\'), (b'\\/', '/')):
+      source = b'{"type":"board_post","extra":"' + pair * (size // 2) + b'"}'
+      with self.subTest(pair=pair), \
+           patch.object(json.decoder, "scanstring", wraps=json.decoder.scanstring) as strings, \
+           patch.object(json, "loads", wraps=json.loads) as decoded:
+        started = time.perf_counter()
+        result = await common_protocol.read_envelope(envelope_request(source))
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(strings.call_count, 4)  # Two keys and two values.
+        decoded.assert_called_once_with(source.decode())
+        self.assertEqual(len(result["extra"]), size // 2)
+        self.assertEqual(result["extra"][:3], value * 3)
+
+  async def test_maximum_text_and_slash_escaped_20_mib_gif_keep_signed_original(self):
+    # A legal comment filled with FF produces tens of millions of base64 '/'
+    # characters. JSON senders may legally escape each '/' without changing it.
+    data = padded_gif(common_protocol.MAX_ATTACHMENT_BYTES, padding=b'\xff')
+    key = common_protocol.new_signing_key()
+    value = {"v": 0, "type": "message", "from": "member.example", "id": "abcdef12",
+             "text": '🪐' * common_protocol.MAX_MESSAGE_TEXT_CHARS,
+             "sent_at": time.time(), "attachment": wire(data, (1, 1))}
+    signed = {**value, "sig": common_protocol.sign(value, key)}
+    source = json.dumps(signed, separators=(",", ":")).replace('/', '\\/')
+    self.assertGreater(source.count('\\/'), 20 * 1024 * 1024)
+    self.assertLessEqual(len(source.encode()), common_protocol.MAX_ATTACHMENT_ENVELOPE_BYTES)
+    with patch.object(json, "loads", wraps=json.loads) as decoded:
+      result = await common_protocol.read_envelope(envelope_request(source.encode()))
+      decoded.assert_called_once_with(source)
+    self.assertEqual(result, signed)
+    self.assertTrue(common_protocol.verify(
+      {k: v for k, v in result.items() if k != "sig"}, result["sig"],
+      common_protocol.signing_public_key(key)))
+    self.assertEqual(common_protocol.validate_attachment(result["attachment"])[1], data)
+
+  async def test_malformed_adjacent_strings_cannot_buy_unbounded_scanner_calls(self):
+    # Missing commas are malformed, but the preflight must not synchronously
+    # advance a million scalars before stdlib can report the first syntax error.
+    source = b'{"type":"board_post","extra":' + b'""' * (1024 * 1024) + b'}'
+    started = time.perf_counter()
+    await self.assert_predecode_rejected(source)
+    self.assertLess(time.perf_counter() - started, 1.0)
+    with self.assertRaises(HTTPException) as malformed:
+      await common_protocol.read_envelope(envelope_request(b'{"type":"board_post","extra":""""}'))
+    self.assertEqual(malformed.exception.status_code, 400)
+    for count in (common_protocol.MAX_ENVELOPE_STRUCTURE_TOKENS,
+                  common_protocol.MAX_ENVELOPE_STRUCTURE_TOKENS + 1):
+      with self.subTest(count=count), patch.object(json, "loads", wraps=json.loads) as decoded:
+        with self.assertRaises(HTTPException) as result:
+          await common_protocol.read_envelope(envelope_request(b'""' * count))
+        self.assertEqual(result.exception.status_code,
+                         400 if count == common_protocol.MAX_ENVELOPE_STRUCTURE_TOKENS else 413)
+        self.assertEqual(decoded.call_count, int(count == common_protocol.MAX_ENVELOPE_STRUCTURE_TOKENS))
+
+  async def test_control_byte_cap_remains_32_kib_even_for_large_scalars(self):
+    for size in (common_protocol.MAX_ENVELOPE_BYTES, common_protocol.MAX_ENVELOPE_BYTES + 1):
+      prefix, suffix = b'{"type":"register","extra":"', b'"}'
+      raw = prefix + b'x' * (size - len(prefix) - len(suffix)) + suffix
+      if size == common_protocol.MAX_ENVELOPE_BYTES:
+        await common_protocol.read_envelope(envelope_request(raw))
+      else:
+        with self.assertRaises(HTTPException) as caught:
+          await common_protocol.read_envelope(envelope_request(raw))
+        self.assertEqual(caught.exception.status_code, 413)
+
+  async def test_large_legal_scalar_and_signed_maximum_media_are_not_rewritten(self):
+    key = common_protocol.new_signing_key()
+
+    async def roundtrip(value):
+      value = {"v": 0, "id": "abcdef12", "from": "member.example",
+               "text": "x" * common_protocol.MAX_POST_TEXT_CHARS,
+               "sent_at": time.time(), **value}
+      signed = {**value, "sig": common_protocol.sign(value, key)}
+      source = json.dumps(signed, ensure_ascii=False, separators=(",", ":"))
+      self.assertLessEqual(len(source.encode()), common_protocol.MAX_ATTACHMENT_ENVELOPE_BYTES)
+      with patch.object(common_protocol.json, "loads", wraps=json.loads) as decoded:
+        result = await common_protocol.read_envelope(envelope_request(source.encode()))
+        decoded.assert_called_once_with(source)
+      self.assertEqual(result, signed)
+      self.assertTrue(common_protocol.verify(
+        {k: v for k, v in result.items() if k != "sig"}, result["sig"],
+        common_protocol.signing_public_key(key)))
+      return result
+
+    await roundtrip({"type": "message", "enc": {"ciphertext": "a" * (8 * 1024 * 1024)},
+                     "extra": "[]{}:,\\\"🪐" * 10000})
+    photo = io.BytesIO()
+    Image.new("RGB", (1, 1)).save(photo, format="JPEG")
+    thumbnail = {"mime": "image/jpeg", "w": 1, "h": 1,
+                 "data_b64": base64.b64encode(photo.getvalue().ljust(common_protocol.MAX_THUMBNAIL_BYTES, b'\0')).decode()}
+    original = padded_gif(common_protocol.MAX_ATTACHMENT_BYTES)
+    attachment = wire(original, (1, 1))
+    result = await roundtrip({"type": "board_post", "attachments": [attachment],
+                              "attachment": attachment, "thumbnails": [thumbnail]})
+    self.assertEqual(common_protocol.validate_attachment(result["attachment"])[1], original)
+    del result, original, attachment
+    data = photo.getvalue().ljust(common_protocol.MAX_STATIC_ATTACHMENT_BYTES, b'\0')
+    attachment = {"mime": "image/jpeg", "data_b64": base64.b64encode(data).decode(), "w": 1, "h": 1}
+    result = await roundtrip({"type": "board_post", "attachments": [attachment] * 4,
+                              "attachment": attachment, "thumbnails": [thumbnail] * 4})
+    self.assertEqual([decoded for _, decoded in common_protocol.validate_attachments(result["attachments"])], [data] * 4)
+
+
+class PublicEnvelopeAdmissionTests(unittest.TestCase):
+  def test_actual_public_handlers_reject_dense_json_before_auth_media_or_commit(self):
+    raw = b'{"type":"board_post","extra":[' + b'[],' * 699999 + b'[]]}'
+    with tempfile.TemporaryDirectory() as root, TestClient(community_host.create_app(root)) as client:
+      before = sorted(p.relative_to(root) for p in Path(root).rglob('*') if p.is_file())
+      for path in ("/api/common/board", "/api/common/board/reply", "/api/common/directory"):
+        with self.subTest(path=path), \
+             patch.object(common_protocol.json, "loads") as decoded, \
+             patch.object(common_protocol.ActorVerifier, "verify_envelope", new_callable=AsyncMock) as verified, \
+             patch("common_protocol.validate_gif_bytes") as gif:
+          tracemalloc.start()
+          try:
+            response = client.post(path, content=raw, headers={"Content-Type": "application/json"})
+            _, peak = tracemalloc.get_traced_memory()
+          finally:
+            tracemalloc.stop()
+          self.assertEqual(response.status_code, 413)
+          decoded.assert_not_called()
+          verified.assert_not_awaited()
+          gif.assert_not_called()
+          self.assertLess(peak, 6 * len(raw) + 2 * 1024 * 1024)
+        self.assertEqual(response.json()["detail"],
+                         "Request body is too large." if path == "/api/common/directory"
+                         else "Envelope JSON is too complex.")
+      self.assertEqual(sorted(p.relative_to(root) for p in Path(root).rglob('*') if p.is_file()), before)
+
+  def test_public_handler_keeps_malformed_400_and_signed_unknown_fields(self):
+    with tempfile.TemporaryDirectory() as root, TestClient(community_host.create_app(root)) as client:
+      store = CommonPublicStore(root)
+      store.register("member.example", "member", "")
+      key = _peer(Path(root), "member.example")
+      response = client.post("/api/common/board", content=b'{"type":"board_post","extra": [}')
+      self.assertEqual(response.status_code, 400)
+      body = {"v": 0, "type": "board_post", "from": "member.example", "id": str(uuid.uuid4()),
+              "text": "Caption", "sent_at": time.time(), "attachment": wire(animation()),
+              "extra": {"future": [{"key": "{}[]:,\\\"🪐"}] * 1000}}
+      response = client.post("/api/common/board", json=_signed(key, body))
+      self.assertEqual(response.status_code, 200, response.text)
+      self.assertEqual(store.board_image(body["id"])[0].read_bytes(), animation())
+
+
+class PublicRequestLifetimeTests(unittest.IsolatedAsyncioTestCase):
+  async def asyncSetUp(self):
+    fixture = tempfile.TemporaryDirectory()
+    self.addCleanup(fixture.cleanup)
+    self.root = Path(fixture.name)
+    self.store = CommonPublicStore(self.root)
+    self.keys = {}
+    self.actors = {}
+    for host in ("large-a.example", "large-b.example", "member.example"):
+      self.store.register(host, host.split('.')[0], "")
+      self.keys[host] = _peer(self.root, host)
+      self.actors[host] = common_protocol.ActorVerifier(self.root)._read_cached(host)
+    self.app = community_host.create_app(self.root)
+    self.post_id = str(uuid.uuid4())
+    self.store.store_post({"id": self.post_id, "host": "large-b.example",
+                           "text": "Parent", "created_at": time.time(), "replies": []})
+
+  def signed_raw(self, host="member.example", kind="board_post", **fields):
+    body = {"v": 0, "type": kind, "from": host, "id": str(uuid.uuid4()),
+            "text": "Caption", "sent_at": time.time(), **fields}
+    return json.dumps(_signed(self.keys[host], body), separators=(",", ":")).encode()
+
+  def observed_body(self, raw, chunk_size=None):
+    reads = []
+
+    async def stream():
+      size = chunk_size or len(raw)
+      for start in range(0, len(raw), size):
+        chunk = raw[start:start + size]
+        reads.append(len(chunk))
+        yield chunk
+
+    return stream(), reads
+
+  async def test_one_byte_stalls_expire_before_decode_for_content_and_control_slots(self):
+    import common_public
+    for path, capacity in (("/api/common/board", 2), ("/api/common/directory/search", 8)):
+      entered = 0
+      ready, stall = asyncio.Event(), asyncio.Event()
+
+      async def stream():
+        nonlocal entered
+        yield b'{'
+        entered += 1
+        if entered == capacity:
+          ready.set()
+        await stall.wait()
+
+      with patch.object(common_protocol, "MAX_ENVELOPE_RECEIVE_SECONDS", .15), \
+           patch.object(common_public, "MAX_PUBLIC_REQUEST_SECONDS", 2.0):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+          with patch.object(json, "loads") as decoded, \
+               patch.object(common_protocol.ActorVerifier, "verify_envelope", new_callable=AsyncMock) as verified:
+            tasks = [asyncio.create_task(client.post(path, content=stream())) for _ in range(capacity)]
+            try:
+              await asyncio.wait_for(ready.wait(), 1)
+              body, reads = self.observed_body(b'{}')
+              self.assertEqual((await client.post(path, content=body)).status_code, 503)
+              self.assertEqual(reads, [])
+              responses = await asyncio.wait_for(asyncio.gather(*tasks), 1)
+              self.assertTrue(all(response.status_code == 408 for response in responses))
+              self.assertTrue(all("Envelope receive deadline exceeded." in response.text for response in responses))
+              decoded.assert_not_called()
+              verified.assert_not_awaited()
+            finally:
+              for task in tasks:
+                task.cancel()
+              await asyncio.gather(*tasks, return_exceptions=True)
+          # No restart or modified identity/id/signature is needed after expiry.
+          raw = self.signed_raw() if path.endswith("board") else self.signed_raw(kind="directory_read", q="")
+          self.assertEqual((await client.post(path, content=raw)).status_code, 200)
+
+  async def test_receive_budget_is_absolute_even_when_each_chunk_keeps_arriving(self):
+    chunks = 0
+
+    async def drip():
+      nonlocal chunks
+      while True:
+        chunks += 1
+        yield b' '
+        await asyncio.sleep(.015)
+
+    with patch.object(common_protocol, "MAX_ENVELOPE_RECEIVE_SECONDS", .12):
+      async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+        with patch.object(json, "loads") as decoded:
+          response = await asyncio.wait_for(client.post("/api/common/board", content=drip()), 1)
+          self.assertEqual(response.status_code, 408)
+          self.assertGreater(chunks, 2)
+          self.assertLess(chunks, 20)
+          decoded.assert_not_called()
+
+  async def test_immediately_ready_chunks_cannot_run_past_receive_budget(self):
+    # No await inside this generator: deadline enforcement must not depend on
+    # another task/timer getting event-loop time between stream chunks.
+    async def ready():
+      yield b'{}'
+
+    with patch.object(common_protocol, "MAX_ENVELOPE_RECEIVE_SECONDS", 0.0):
+      async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+        with patch.object(json, "loads") as decoded:
+          self.assertEqual((await client.post("/api/common/board", content=ready())).status_code, 408)
+          decoded.assert_not_called()
+
+  async def test_reservation_expiry_unwinds_identity_before_capacity_is_reused(self):
+    import common_public
+    entered = 0
+    cancelled = 0
+    ready, stall = asyncio.Event(), asyncio.Event()
+
+    async def fetch(host, **kwargs):
+      nonlocal entered, cancelled
+      entered += 1
+      if entered == 2:
+        ready.set()
+      try:
+        await stall.wait()
+      finally:
+        cancelled += 1
+
+    raw = self.signed_raw(extra="a" * (1024 * 1024))
+    with patch.object(common_public, "MAX_PUBLIC_REQUEST_SECONDS", .3):
+      async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+        with patch.object(common_protocol.ActorVerifier, "fetch_actor", side_effect=fetch):
+          tasks = [asyncio.create_task(client.post("/api/common/board", content=raw)) for _ in range(2)]
+          try:
+            await asyncio.wait_for(ready.wait(), 1)
+            stream, reads = self.observed_body(raw)
+            self.assertEqual((await client.post("/api/common/board", content=stream)).status_code, 503)
+            self.assertEqual(reads, [])
+            results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 1)
+            self.assertTrue(all(isinstance(result, AssertionError) for result in results))
+            self.assertEqual(cancelled, 2)
+          finally:
+            for task in tasks:
+              task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertEqual((await client.post("/api/common/board", content=raw)).status_code, 200)
+
+  async def test_reservation_expiry_unwinds_stalled_app_send_then_allows_unchanged_retry(self):
+    import common_public
+    entered = 0
+    ready, stall = asyncio.Event(), asyncio.Event()
+    cancelled = 0
+    sent = []
+
+    async def app(scope, receive, send):
+      async def blocked_send(message):
+        nonlocal entered, cancelled
+        if message["type"] == "http.response.start" and (b'x-stall-send', b'yes') in scope["headers"]:
+          sent.append(message["status"])
+          entered += 1
+          if entered == 2:
+            ready.set()
+          try:
+            await stall.wait()
+          except asyncio.CancelledError:
+            cancelled += 1
+            raise
+        await send(message)
+      await self.app(scope, receive, blocked_send)
+
+    raw = self.signed_raw(extra="a" * (1024 * 1024))
+    with patch.object(common_public, "MAX_PUBLIC_REQUEST_SECONDS", .3):
+      async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        tasks = [asyncio.create_task(client.post("/api/common/board", content=raw,
+                                                headers={"x-stall-send": "yes"})) for _ in range(2)]
+        try:
+          await asyncio.wait_for(ready.wait(), 1)
+          stream, reads = self.observed_body(raw)
+          self.assertEqual((await client.post("/api/common/board", content=stream)).status_code, 503)
+          self.assertEqual(reads, [])
+          # ASGITransport reports the incomplete app response as an assertion.
+          # Unlike Uvicorn it has no server-owned fallback500 (tested below).
+          results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 1)
+          self.assertTrue(all(isinstance(result, AssertionError) for result in results))
+          self.assertEqual(cancelled, 2)
+          self.assertEqual(sent, [200, 200])
+          self.assertEqual((await client.post("/api/common/board", content=raw)).status_code, 200)
+        finally:
+          for task in tasks:
+            task.cancel()
+          await asyncio.gather(*tasks, return_exceptions=True)
+
+  async def test_escape_dense_public_post_preserves_caption_without_event_loop_starvation(self):
+    post_id = str(uuid.uuid4())
+    raw = self.signed_raw(id=post_id, text='Caption 🪐 "kept"', extra='\n' * (8 * 1024 * 1024))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+      started = time.perf_counter()
+      response = await client.post("/api/common/board", content=raw)
+      elapsed = time.perf_counter() - started
+    self.assertEqual(response.status_code, 200, response.text)
+    self.assertLess(elapsed, 1.0)
+    record = json.loads((self.store.board_dir() / f"{post_id}.json").read_text())
+    self.assertEqual(record["text"], 'Caption 🪐 "kept"')
+
+  async def test_uvicorn_fallback_after_expiry_retains_no_envelope_traceback_or_slot(self):
+    import common_public
+    import h11
+    import inspect
+    from uvicorn.protocols.http.h11_impl import RequestResponseCycle
+
+    class TrackedEnvelope(dict):
+      pass
+
+    class TrackedFailure(RuntimeError):
+      pass
+
+    original_read = common_public.read_envelope
+    original_fetch = common_protocol.ActorVerifier.fetch_actor
+    original_store = CommonPublicStore.store_post
+    # FastAPI can retain an included router rather than flatten its routes.
+    routes = [child for route in self.app.routes
+              for child in (getattr(route.original_router, "routes", ())
+                            if hasattr(route, "original_router") else (route,))]
+    route = next(route for route in routes if getattr(route, "path", None) == "/api/common/board"
+                 and "POST" in (getattr(route, "methods", None) or ()))
+    admission = inspect.getclosurevars(type(route).handle).nonlocals["admission"]
+    # Exercise expiry while verifying, sending200, and sending an unhandled500.
+    # The latter's exception traceback used to retain the endpoint's media.
+    for phase in ("identity", "success", "failure"):
+      with self.subTest(phase=phase):
+        envelope_refs, error_refs = [], []
+        fallback_started, unblock = asyncio.Event(), asyncio.Event()
+        drain_calls = 0
+
+        async def tracked_read(request):
+          envelope = TrackedEnvelope(await original_read(request))
+          envelope_refs.append(weakref.ref(envelope))
+          return envelope
+
+        async def identity(host, **kwargs):
+          await asyncio.Event().wait()
+
+        def failure(*args, **kwargs):
+          error = TrackedFailure("fixture failure")
+          error_refs.append(weakref.ref(error))
+          raise error
+
+        class BlockedFlow:
+          write_paused = True
+
+          def resume_reading(self):
+            pass
+
+          async def drain(self):
+            nonlocal drain_calls
+            drain_calls += 1
+            if phase == "identity" or drain_calls == 2:
+              fallback_started.set()
+            await unblock.wait()
+
+        raw = self.signed_raw(extra="a" * (1024 * 1024))
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+                 "method": "POST", "scheme": "http", "path": "/api/common/board",
+                 "raw_path": b"/api/common/board", "root_path": "", "query_string": b"",
+                 "headers": [], "client": ("127.0.0.1", 1), "server": ("test", 80)}
+        conn = h11.Connection(h11.SERVER)
+        conn.receive_data(b'POST /api/common/board HTTP/1.1\r\nHost: test\r\nContent-Length: '
+                          + str(len(raw)).encode() + b'\r\n\r\n')
+        conn.next_event()
+        message_event = asyncio.Event()
+        message_event.set()
+        transport = Mock()
+        cycle = RequestResponseCycle(
+          scope=scope, conn=conn, transport=transport, flow=BlockedFlow(),
+          logger=Mock(), access_logger=Mock(), access_log=False,
+          default_headers=[], message_event=message_event, on_response=lambda: None,
+        )
+        cycle.body = bytearray(raw)
+        cycle.more_body = False
+        with patch.object(common_public, "MAX_PUBLIC_REQUEST_SECONDS", .2), \
+             patch.object(common_public, "read_envelope", side_effect=tracked_read):
+          phase_patch = (patch.object(common_protocol.ActorVerifier, "fetch_actor", side_effect=identity)
+                         if phase == "identity" else
+                         patch.object(CommonPublicStore, "store_post", side_effect=failure)
+                         if phase == "failure" else patch.object(self.app, "debug", False))
+          with phase_patch:
+            task = asyncio.create_task(cycle.run_asgi(self.app))
+            try:
+              await asyncio.wait_for(fallback_started.wait(), 1)
+              gc.collect()
+              self.assertFalse(task.done())  # Native server fallback still waits.
+              self.assertEqual(drain_calls, 1 if phase == "identity" else 2)
+              self.assertEqual(len(envelope_refs), 1)
+              self.assertIsNone(envelope_refs[0]())
+              self.assertTrue(all(ref() is None for ref in error_refs))
+              if phase == "failure":
+                self.assertEqual(len(error_refs), 1)
+              self.assertEqual(len(cycle.body), 0)
+              self.assertNotIn("common_envelope_max_bytes", scope.get("state", {}))
+              # Inspect the actual suspended coroutine chain, not just HTTPX's
+              # incomplete-response assertion: only Uvicorn's small500 remains.
+              current, frames = task.get_coro(), []
+              while current is not None:
+                frame = getattr(current, "cr_frame", None)
+                if frame is not None:
+                  frames.append((frame.f_code.co_name, frame.f_locals))
+                current = getattr(current, "cr_await", None)
+              self.assertTrue(any(name == "send_500_response" for name, _ in frames))
+              self.assertFalse(any(name in ("read_envelope", "post_to_board", "handle", "reserve")
+                                   for name, _ in frames))
+              self.assertFalse(any(isinstance(value, (TrackedEnvelope, TrackedFailure))
+                                   for _, local in frames for value in local.values()))
+              self.assertEqual(list(admission._used.values()), [0, 0])
+              # Retry while the native fallback is STILL flow-control blocked,
+              # not only after the socket task has completed. Restore only our
+              # induced fixture stall/failure for these real signed requests.
+              with patch.object(common_protocol.ActorVerifier, "fetch_actor", original_fetch), \
+                   patch.object(CommonPublicStore, "store_post", original_store):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+                  self.assertEqual((await client.post("/api/common/board", content=raw)).status_code, 200)
+                  self.assertEqual((await client.post("/api/common/directory/search", content=self.signed_raw(
+                    kind="directory_read", q=""))).status_code, 200)
+              self.assertFalse(task.done())
+              self.assertEqual(list(admission._used.values()), [0, 0])
+            finally:
+              unblock.set()
+              await asyncio.wait_for(task, 1)
+          self.assertTrue(cycle.response_complete)
+          self.assertTrue(cycle.response_started)
+          self.assertIn(b'Internal Server Error', b''.join(
+            call.args[0] for call in transport.write.call_args_list))
+
+  async def test_two_identity_waits_do_not_queue_third_body_or_block_small_controls(self):
+    entered = set()
+    ready = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetch(host, **kwargs):
+      if host.startswith("large-"):
+        entered.add(host)
+        if len(entered) == 2:
+          ready.set()
+        await release.wait()
+      return self.actors[host]
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+      with patch.object(common_protocol.ActorVerifier, "fetch_actor", side_effect=fetch):
+        first = self.signed_raw("large-a.example", extra="a" * (1024 * 1024))
+        second = self.signed_raw("large-b.example", "board_reply", post_id=self.post_id,
+                                 extra="b" * (1024 * 1024))
+        tasks = [asyncio.create_task(client.post("/api/common/board", content=first)),
+                 asyncio.create_task(client.post("/api/common/board/reply", content=second))]
+        try:
+          await asyncio.wait_for(ready.wait(), 5)
+          raw = self.signed_raw(extra="c" * (1024 * 1024))
+          stream, reads = self.observed_body(raw)
+          response = await client.post("/api/common/board", content=stream)
+          self.assertEqual(response.status_code, 503)
+          self.assertEqual(response.headers["Retry-After"], "1")
+          self.assertEqual(reads, [])
+          # Method mismatches must not become an admission503 or inner-error500.
+          for path in ("/api/common/board/media/abcdef12.gif", "/api/common/directory/avatars/a"):
+            stream, reads = self.observed_body(raw)
+            mismatch = await client.post(path, content=stream)
+            self.assertEqual(mismatch.status_code, 405)
+            self.assertIn("GET", mismatch.headers["Allow"])
+            self.assertEqual(reads, [])
+          control = await client.post("/api/common/directory/search", content=self.signed_raw(
+            kind="directory_read", q=""))
+          self.assertEqual(control.status_code, 200)
+          self.assertEqual((await client.get("/api/common/board")).status_code, 200)
+          self.assertEqual((await client.get("/api/common/board/media/abcdef12.gif")).status_code, 404)
+          # Claimed content type and Content-Length cannot widen a control route.
+          oversize = b'{"type":"board_post","extra":"' + b'a' * (1024 * 1024) + b'"}'
+          for chunk_size in (4096, len(oversize)):
+            stream, reads = self.observed_body(oversize, chunk_size)
+            with patch.object(common_protocol.json, "loads") as decoded:
+              tracemalloc.start()
+              try:
+                rejected = await client.post("/api/common/directory/search", content=stream,
+                                             headers={"Content-Length": "2"})
+                _, peak = tracemalloc.get_traced_memory()
+              finally:
+                tracemalloc.stop()
+              self.assertEqual(rejected.status_code, 413)
+              decoded.assert_not_called()
+            self.assertLess(peak, 512 * 1024)  # Never copy the oversized chunk.
+            self.assertLessEqual(len(reads), 9)
+          tasks[0].cancel()
+          await asyncio.gather(tasks[0], return_exceptions=True)
+          stream, reads = self.observed_body(raw)
+          retried = await client.post("/api/common/board", content=stream)
+          self.assertEqual(retried.status_code, 200, retried.text)
+          self.assertEqual(sum(reads), len(raw))
+          release.set()
+          self.assertEqual((await tasks[1]).status_code, 200)
+        finally:
+          release.set()
+          for task in tasks:
+            task.cancel()
+          await asyncio.gather(*tasks, return_exceptions=True)
+
+  async def test_control_budget_is_finite_and_independent_of_content_reservations(self):
+    import common_public
+    entered = 0
+    ready, release = asyncio.Event(), asyncio.Event()
+
+    async def fetch(host, **kwargs):
+      nonlocal entered
+      if host == "large-a.example":
+        entered += 1
+        if entered == common_public.MAX_PUBLIC_CONTROL_REQUESTS:
+          ready.set()
+        await release.wait()
+      return self.actors[host]
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
+      with patch.object(common_protocol.ActorVerifier, "fetch_actor", side_effect=fetch):
+        raw = self.signed_raw("large-a.example", "directory_read", q="")
+        tasks = [asyncio.create_task(client.post("/api/common/directory/search", content=raw))
+                 for _ in range(common_public.MAX_PUBLIC_CONTROL_REQUESTS)]
+        try:
+          await asyncio.wait_for(ready.wait(), 5)
+          stream, reads = self.observed_body(raw)
+          rejected = await client.post("/api/common/directory/search", content=stream)
+          self.assertEqual(rejected.status_code, 503)
+          self.assertEqual(reads, [])
+          response = await client.post("/api/common/board", content=self.signed_raw())
+          self.assertEqual(response.status_code, 200)
+          tasks[0].cancel()
+          await asyncio.gather(tasks[0], return_exceptions=True)
+          release.set()
+          retried = await client.post("/api/common/directory/search", content=raw)
+          self.assertEqual(retried.status_code, 200)
+          self.assertTrue(all(response.status_code == 200 for response in await asyncio.gather(*tasks[1:])))
+        finally:
+          release.set()
+          for task in tasks:
+            task.cancel()
+          await asyncio.gather(*tasks, return_exceptions=True)
+
+  async def test_success_error_and_cancelled_response_sends_hold_then_release_capacity(self):
+    entered = 0
+    statuses = []
+    ready, release = asyncio.Event(), asyncio.Event()
+
+    async def app(scope, receive, send):
+      async def observed_send(message):
+        nonlocal entered
+        if message["type"] == "http.response.start" and (b'x-hold-send', b'yes') in scope["headers"]:
+          statuses.append(message["status"])
+          entered += 1
+          if entered == 2:
+            ready.set()
+          await release.wait()
+        await send(message)
+      await self.app(scope, receive, observed_send)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      tasks = [asyncio.create_task(client.post("/api/common/board", content=self.signed_raw(),
+                                               headers={"x-hold-send": "yes"})),
+               asyncio.create_task(client.post("/api/common/board", content=b'{',
+                                               headers={"x-hold-send": "yes"}))]
+      try:
+        await asyncio.wait_for(ready.wait(), 5)
+        self.assertEqual(sorted(statuses), [200, 400])
+        raw = self.signed_raw()
+        stream, reads = self.observed_body(raw)
+        self.assertEqual((await client.post("/api/common/board", content=stream)).status_code, 503)
+        self.assertEqual(reads, [])
+        tasks[0].cancel()
+        await asyncio.gather(tasks[0], return_exceptions=True)
+        self.assertEqual((await client.post("/api/common/board", content=raw)).status_code, 200)
+        release.set()
+        self.assertEqual((await tasks[1]).status_code, 400)
+        # An unexpected handler exception must release too, without suppressing it.
+        with patch.object(CommonPublicStore, "store_post", side_effect=RuntimeError("fixture failure")):
+          with self.assertRaisesRegex(RuntimeError, "fixture failure"):
+            await client.post("/api/common/board", content=self.signed_raw())
+        self.assertEqual((await client.post("/api/common/board", content=self.signed_raw())).status_code, 200)
+      finally:
+        release.set()
+        for task in tasks:
+          task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+  async def test_unhandled_failure_tracebacks_remain_admitted_until_500_is_sent(self):
+    await self.check_unhandled_failure_response_lifetime(debug=False)
+
+  async def test_debug_failure_tracebacks_remain_admitted_until_500_is_sent(self):
+    await self.check_unhandled_failure_response_lifetime(debug=True)
+
+  async def check_unhandled_failure_response_lifetime(self, *, debug):
+    self.app.debug = debug
+    entered = 0
+    ready, release = asyncio.Event(), asyncio.Event()
+
+    async def app(scope, receive, send):
+      async def blocked_send(message):
+        nonlocal entered
+        if message["type"] == "http.response.start" and (b'x-hold-send', b'yes') in scope["headers"]:
+          self.assertEqual(message["status"], 500)
+          entered += 1
+          if entered == 2:
+            ready.set()
+          await release.wait()
+        await send(message)
+      await self.app(scope, receive, blocked_send)
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+      raw = self.signed_raw(extra="a" * (1024 * 1024))
+      with patch.object(CommonPublicStore, "store_post", side_effect=RuntimeError("fixture failure")):
+        tasks = [asyncio.create_task(client.post("/api/common/board", content=raw,
+                                                headers={"x-hold-send": "yes"})) for _ in range(2)]
+        try:
+          await asyncio.wait_for(ready.wait(), 5)
+          stream, reads = self.observed_body(raw)
+          rejected = await client.post("/api/common/board", content=stream)
+          self.assertEqual(rejected.status_code, 503)
+          self.assertEqual(reads, [])
+          tasks[0].cancel()
+          await asyncio.gather(tasks[0], return_exceptions=True)
+          # A cancelled 500 send also releases its held reservation.
+          retry = await client.post("/api/common/board", content=raw)
+          self.assertEqual(retry.status_code, 500)
+          if debug:
+            self.assertIn("fixture failure", retry.text)
+          else:
+            self.assertEqual(retry.text, "Internal Server Error")
+          release.set()
+          response = await tasks[1]
+          self.assertEqual(response.status_code, 500)
+          if debug:
+            self.assertIn("fixture failure", response.text)
+          else:
+            self.assertEqual(response.text, "Internal Server Error")
+        finally:
+          release.set()
+          for task in tasks:
+            task.cancel()
+          await asyncio.gather(*tasks, return_exceptions=True)
+      self.assertEqual((await client.post("/api/common/board", content=raw)).status_code, 200)
 
 
 class CanonicalGifTests(unittest.TestCase):
@@ -132,7 +954,7 @@ class CanonicalGifTests(unittest.TestCase):
     value = wire(data)
     cases = [({**value, "frames": 2}, 400), ({**value, "w": True}, 400),
              ({**value, "h": 0}, 400), ({**value, "data_b64": "!"}, 400),
-             (wire(b"x" * (1024 * 1024 + 1)), 413)]
+             (wire(b"x" * (20 * 1024 * 1024 + 1)), 413)]
     output = io.BytesIO()
     Image.new("RGB", (24, 16)).save(output, format="PNG")
     cases.append((wire(output.getvalue()), 400))
@@ -141,8 +963,65 @@ class CanonicalGifTests(unittest.TestCase):
         common_protocol.validate_attachment(malformed)
       self.assertEqual(caught.exception.status_code, status)
     with self.assertRaises(HTTPException) as caught:
-      common_protocol.validate_attachment_envelope_size({"text": "x" * (2 * 1024 * 1024)})
+      common_protocol.validate_attachment_envelope_size({"text": "x" * (60 * 1024 * 1024)})
     self.assertEqual(caught.exception.status_code, 413)
+
+  def test_large_gif_and_static_boundaries_and_gallery_total(self):
+    mb = 1024 * 1024
+    for size in (mb + 1, 20 * mb):
+      data = padded_gif(size)
+      self.assertEqual(len(data), size)
+      self.assertEqual(common_protocol.validate_attachment(wire(data, (1, 1)))[1], data)
+    mime, poster = image_thumbnail_bytes(data)
+    self.assertEqual(mime, "image/webp")
+    self.assertLessEqual(len(poster), common_protocol.MAX_THUMBNAIL_BYTES)
+    with self.assertRaises(HTTPException) as caught:
+      common_protocol.validate_attachment(wire(padded_gif(20 * mb + 1), (1, 1)))
+    self.assertEqual(caught.exception.status_code, 413)
+    static = lambda size: {"mime": "image/jpeg", "data_b64": base64.b64encode(b"a" * size).decode(), "w": 1, "h": 1}
+    common_protocol.validate_attachment(static(5 * mb))
+    with self.assertRaises(HTTPException) as caught:
+      common_protocol.validate_attachment(static(5 * mb + 1))
+    self.assertEqual(caught.exception.status_code, 413)
+    common_protocol.validate_attachments([static(5 * mb)] * 4)
+    with self.assertRaises(HTTPException) as caught:
+      common_protocol.validate_attachments([static(5 * mb)] * 4 + [static(1)])
+    self.assertEqual(caught.exception.status_code, 400)  # four-image cap
+    with self.assertRaises(HTTPException) as caught:
+      common_protocol.validate_attachments([wire(data, (1, 1)), static(1)])
+    self.assertEqual(caught.exception.status_code, 413)
+    with self.assertRaises(HTTPException) as caught:
+      common_protocol.validate_attachment(static(120 * 1024 + 1), thumbnail=True)
+    self.assertEqual(caught.exception.status_code, 413)
+
+  def test_large_original_fits_signed_plaintext_and_encrypted_transport(self):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    import social_routes
+    original = wire(padded_gif(1024 * 1024 + 1), (1, 1))
+    key = common_protocol.new_signing_key()
+    plain = {"v": 0, "type": "message", "id": "abcdef12", "from": "a.example",
+             "to": "b.example", "text": "", "sent_at": time.time(),
+             "attachment": original}
+    plain["sig"] = common_protocol.sign(plain, key)
+    common_protocol.validate_attachment_envelope_size(plain)
+    self.assertTrue(common_protocol.verify(
+      {k: v for k, v in plain.items() if k != "sig"}, plain["sig"],
+      common_protocol.signing_public_key(key)))
+    recipient = X25519PrivateKey.generate()
+    private = base64.b64encode(recipient.private_bytes(
+      serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+      serialization.NoEncryption())).decode()
+    public = base64.b64encode(recipient.public_key().public_bytes(
+      serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+    sealed = social_routes._seal_dm("abcdef12", public, text="", attachment=original, reply_to=None)
+    encrypted = {k: v for k, v in plain.items() if k not in ("attachment", "sig")}
+    encrypted["enc"] = sealed
+    encrypted["sig"] = common_protocol.sign(encrypted, key)
+    common_protocol.validate_attachment_envelope_size(encrypted)
+    opened = social_routes._open_dm("abcdef12", sealed, private)
+    self.assertEqual(common_protocol.validate_attachment(opened["attachment"])[1],
+                     base64.b64decode(original["data_b64"]))
 
   def test_first_frame_thumbnail_is_a_static_transparent_poster(self):
     data = animation()
@@ -158,6 +1037,36 @@ class CanonicalGifTests(unittest.TestCase):
 
 
 class CommunityGifTests(unittest.TestCase):
+  def test_public_media_decoding_requires_signed_named_membership(self):
+    with tempfile.TemporaryDirectory() as root:
+      store = CommonPublicStore(root)
+      store.register("member.example", "member", "")
+      member_key = _peer(Path(root), "member.example")
+      outsider_key = _peer(Path(root), "outsider.example")
+      post_id = str(uuid.uuid4())
+      store.store_post({"id": post_id, "host": "member.example", "text": "Post",
+                        "created_at": time.time(), "replies": []})
+      with TestClient(community_host.create_app(root)) as client:
+        for kind, path in (("board_post", "/api/common/board"),
+                           ("board_reply", "/api/common/board/reply")):
+          body = {"v": 0, "type": kind, "from": "member.example", "id": str(uuid.uuid4()),
+                  "post_id": post_id, "text": "Caption", "sent_at": time.time(),
+                  "attachment": wire(animation())}
+          if kind == "board_post":
+            body["attachments"] = [body["attachment"]]
+          invalid_signature = _signed(member_key, body)
+          invalid_signature["text"] = "Tampered caption"
+          outsider = _signed(outsider_key, {**body, "from": "outsider.example"})
+          for rejected in (body, invalid_signature, outsider):
+            with self.subTest(kind=kind, sender=rejected["from"], signed="sig" in rejected), \
+                 patch("common_protocol.validate_gif_bytes",
+                       wraps=common_protocol.validate_gif_bytes) as decoded:
+              response = client.post(path, json=rejected)
+              self.assertIn(response.status_code, (400, 401, 403), response.text)
+              self.assertEqual(decoded.call_count, 0)
+        self.assertEqual(store.get_replies(post_id)["replies"], [])
+        self.assertEqual(list(store.board_media_dir().iterdir()), [])
+
   def test_failed_reply_commit_cannot_reuse_a_different_gif_original_or_poster(self):
     from common_public import atomic_write
 
@@ -387,6 +1296,18 @@ class MessageGifSeamTests(unittest.IsolatedAsyncioTestCase):
         dm_app.assert_not_called()
         commit.assert_not_called()
         store.assert_not_called()
+
+
+class GeneratedPosterBudgetTests(unittest.TestCase):
+  def test_high_detail_generated_poster_fits_media_download_budget(self):
+    original = io.BytesIO()
+    Image.frombytes('RGB', (640, 640), random.Random(1).randbytes(640 * 640 * 3)).save(original, format='PNG')
+    mime, poster = image_thumbnail_bytes(original.getvalue())
+    self.assertEqual(mime, 'image/webp')
+    self.assertLessEqual(len(poster), common_protocol.MAX_THUMBNAIL_BYTES)
+    with Image.open(io.BytesIO(poster)) as image:
+      self.assertLessEqual(max(image.size), 640)
+      image.load()
 
 
 if __name__ == "__main__":
