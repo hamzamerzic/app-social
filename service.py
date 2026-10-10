@@ -10,7 +10,9 @@ import sys
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
+from starlette.exceptions import HTTPException
 
 from service_runtime import migrate_legacy_state, reconcile_badge, reset_actor, set_actor
 from social_groups import router as groups_router
@@ -22,6 +24,22 @@ app = FastAPI()
 app.include_router(social_router)
 app.include_router(groups_router)
 app.include_router(objects_router)
+
+
+def _record_failure(diagnostics: dict, exc: Exception) -> None:
+  cause = exc.__cause__ or exc
+  diagnostics["error_type"] = type(cause).__name__
+  if isinstance(cause, httpx.HTTPStatusError):
+    diagnostics["upstream_status"] = cause.response.status_code
+
+
+@app.exception_handler(HTTPException)
+async def handled_failure(request: Request, exc: HTTPException):
+  diagnostics = request.scope.get("mobius_diagnostics")
+  if exc.status_code >= 500 and diagnostics is not None:
+    _record_failure(diagnostics, exc)
+  return await http_exception_handler(request, exc)
+
 
 # Möbius may run everything above once and fork each request from it, which
 # removes ~0.9 s of imports per request. Module setup therefore reads only
@@ -38,9 +56,23 @@ async def dispatch(request: dict) -> dict:
     suffix += "?" + urlencode(query, doseq=True)
   headers = request.get("headers") if isinstance(request.get("headers"), dict) else {}
   token = set_actor(request.get("actor") or {})
+  diagnostics = {}
+
+  async def diagnosed_app(scope, receive, send):
+    scope["mobius_diagnostics"] = diagnostics
+    try:
+      await app(scope, receive, send)
+    except Exception as exc:
+      _record_failure(diagnostics, exc)
+      raise
+    finally:
+      route = scope.get("route")
+      if route is not None:
+        diagnostics["route"] = route.path
+
   try:
     async with httpx.AsyncClient(
-      transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+      transport=httpx.ASGITransport(app=diagnosed_app, raise_app_exceptions=False),
       base_url="http://social.service",
     ) as client:
       response = await client.request(
@@ -61,12 +93,13 @@ async def dispatch(request: dict) -> dict:
       body = response.json()
     except ValueError:
       body = {"detail": "Social returned invalid JSON."}
-    return {"status": response.status_code, "body": body, "headers": forwarded}
+    return {"status": response.status_code, "body": body, "headers": forwarded, "diagnostics": diagnostics}
   return {
     "status": response.status_code,
     "body_base64": base64.b64encode(response.content).decode(),
     "media_type": media_type or "application/octet-stream",
     "headers": forwarded,
+    "diagnostics": diagnostics,
   }
 
 
