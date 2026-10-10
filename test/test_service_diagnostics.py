@@ -9,6 +9,28 @@ import unittest
 
 
 class ServiceDiagnosticsTests(unittest.TestCase):
+    def test_manifest_declares_every_code_authored_service_route(self):
+        source = '''
+import json, service
+print(json.dumps(sorted({
+    route.path
+    for router in (service.social_router, service.groups_router, service.objects_router)
+    for route in router.routes
+})))
+'''
+        root = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            env = {**os.environ, 'APP_ID': '9', 'APP_SLUG': 'social',
+                   'APP_STORAGE_DIR': directory, 'INSTANCE_DOMAIN': 'self.example',
+                   'INSTANCE_ORIGIN': 'https://self.example',
+                   'API_BASE_URL': 'http://127.0.0.1:1', 'APP_TOKEN': 'fixture-not-a-credential'}
+            result = subprocess.run([sys.executable, '-c', source], cwd=root, env=env,
+                                    capture_output=True, text=True, check=True)
+        declared = json.loads((root / 'mobius.json').read_text())['service']['diagnostics_routes']
+        self.assertEqual(declared, json.loads(result.stdout))
+        self.assertIn('/replies/{post_id}', declared)
+        self.assertNotIn('/replies/private-id', declared)
+
     def test_routes_failures_and_concurrent_requests(self):
         source = r'''
 import asyncio,json
