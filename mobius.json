@@ -21,6 +21,10 @@
     "aliases": [
       "common"
     ],
+    "diagnostics_error_types": [
+      "HTTPStatusError",
+      "ValueError"
+    ],
     "diagnostics_routes": [
       "/activity",
       "/actor",

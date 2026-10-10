@@ -84,6 +84,12 @@ asyncio.run(main())
             'route':'/replies/{post_id}', 'error_type':'HTTPStatusError','upstream_status':404})
         self.assertEqual(boom['status'],500)
         self.assertEqual(boom['diagnostics'], {'route':'/boom/{item_id}','error_type':'ValueError'})
+        declared = json.loads((Path(__file__).parents[1] / 'mobius.json').read_text())['service']['diagnostics_error_types']
+        self.assertEqual(declared, ['HTTPStatusError', 'ValueError'])
+        self.assertEqual(
+            {response['diagnostics']['error_type'] for response in [replies, boom]},
+            set(declared),
+        )
         self.assertEqual(okay['diagnostics'], {'route':'/okay'})
         self.assertEqual(okay['body'], {'ok':True})
         self.assertNotIn('private', json.dumps([r['diagnostics'] for r in [replies,boom,okay]]))
